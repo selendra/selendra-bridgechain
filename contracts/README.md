@@ -44,27 +44,24 @@ The original SPDX-FileCopyrightText headers are preserved. Snowbridge owns the
 correctness of those files; this project owns `Gateway.sol`,
 `interfaces/IGateway.sol`, and the tests.
 
-## Outstanding alignment work
+## Leaf encoding
 
-The Substrate side currently types the BEEFY-MMR `leaf_extra` as `Vec<u8>`,
-which SCALE-encodes with a compact-length prefix. `Gateway.hashMmrLeaf`
-assumes a flat `bytes32`. Pick one before integration:
+Both ends of the bridge agree on two keccak Merkle leaves:
 
-- **Substrate-side fix (recommended):** change
-  `BeefyDataProvider<Vec<u8>>` to `BeefyDataProvider<H256>` in
-  `bridgechain/pallets/bridge-outbound/src/lib.rs`, set
-  `pallet_beefy_mmr::Config::LeafExtra = H256` in the runtime config, and
-  return `H256::zero()` (not `Vec::new()`) for empty blocks.
+- **BEEFY-MMR leaf** — SCALE encoding of `MmrLeaf { version: u8,
+  parent_number_and_hash: (u32, H256), beefy_next_authority_set: (u64, u32,
+  H256), leaf_extra: H256 }`. The Substrate side now types `leaf_extra` as
+  `H256` so the wire format is a flat 32-byte tail with no compact-length
+  prefix. `Gateway.hashMmrLeaf` mirrors this layout.
 
-- **Solidity-side fix:** extend `Gateway.hashMmrLeaf` to compact-encode the
-  leaf_extra length before the bytes. Slightly more code here and any other
-  consumer of the MMR-leaf shape would have to mirror it.
-
-The per-message leaf encoding `keccak256(SCALE(nonce ‖ destination ‖
-payload))` is exercised end-to-end by
-`test_hashMessageLeafMatchesScaleEncoding` and matches what
-`pallet-bridge-outbound::commitment_root_for` produces. No alignment work
-needed there.
+- **Per-message leaf** — `keccak256(SCALE(nonce ‖ destination ‖ payload))`.
+  Substrate computes this via `Message::encode()` followed by
+  `binary_merkle_tree::merkle_root::<Keccak256, _>`. The Solidity side
+  reproduces it in `Gateway.hashMessageLeaf` using `ScaleCodec.encodeU64`,
+  the destination bytes, and `ScaleCodec.checkedEncodeCompactU32` for the
+  payload length. Cross-checked by
+  `test_hashMessageLeafMatchesScaleEncoding`, including the compact-length
+  boundary at 64.
 
 ## Next steps for this directory
 

@@ -37,25 +37,12 @@ import {IGateway, OutboundMessage, InboundMessage} from "./interfaces/IGateway.s
  *         witnesses the log on a finalized Ethereum block, hands it to the
  *         `bridge-inbound` pallet, which verifies via its beacon client.
  *
- *         ## Alignment notes (READ ME)
+ *         ## Leaf encoding
  *
- *         This MVP assumes the BEEFY-MMR leaf's `leaf_extra` is a flat
- *         `bytes32` (the keccak root over messages). The current bridgechain
- *         outbound pallet types it as `Vec<u8>`, which SCALE-encodes with a
- *         compact length prefix and so will not match {hashMmrLeaf} below.
- *
- *         Pick one before integration:
- *
- *           a) On bridgechain: change `BeefyDataProvider<Vec<u8>>` to
- *              `BeefyDataProvider<H256>` and `pallet_beefy_mmr::Config::
- *              LeafExtra = H256`. Recommended — cleanest match for
- *              snowbridge's leaf wire format.
- *
- *           b) Here: extend {hashMmrLeaf} to compact-encode the leaf_extra
- *              length before the bytes. Self-contained but means every
- *              consumer of the MMR leaf shape has to mirror it.
- *
- *         The per-message leaf is `keccak256(SCALE(nonce ++ destination ++
+ *         The BEEFY-MMR leaf's `leaf_extra` is typed as `H256` on the
+ *         Substrate side, so its SCALE encoding is a flat 32-byte tail with
+ *         no compact-length prefix. {hashMmrLeaf} mirrors this layout. The
+ *         per-message leaf is `keccak256(SCALE(nonce ++ destination ++
  *         payload))` and {hashMessageLeaf} implements that encoding inline.
  */
 contract Gateway is IGateway {
@@ -176,8 +163,8 @@ contract Gateway is IGateway {
 
     /**
      * @notice keccak256 of the SCALE encoding of the BEEFY-MMR leaf. Mirrors
-     *         the layout produced by `pallet-beefy-mmr` once `leaf_extra` is
-     *         typed as H256 (see contract NatSpec for the alignment note).
+     *         the layout produced by `pallet-beefy-mmr` with `leaf_extra`
+     *         typed as H256 on the Substrate side.
      */
     function hashMmrLeaf(MmrLeaf calldata leaf) public pure returns (bytes32) {
         return keccak256(

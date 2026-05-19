@@ -61,6 +61,44 @@ contract GatewayTest is Test {
         assertEq(_call_hashMessageLeaf(m), expectedHash);
     }
 
+    /// @notice Cross-checks {hashMmrLeaf} against a manually constructed
+    ///         SCALE encoding of `MmrLeaf<u32, H256, H256, H256>`. If this
+    ///         diverges from what `pallet-beefy-mmr` emits, MMR proofs from
+    ///         the relayer will not verify.
+    function test_hashMmrLeafMatchesScaleEncoding() public view {
+        Gateway.MmrLeaf memory leaf = Gateway.MmrLeaf({
+            version: 0,
+            parentNumber: 42,
+            parentHash: bytes32(uint256(0xaa)),
+            nextAuthoritySetID: 7,
+            nextAuthoritySetLen: 4,
+            nextAuthoritySetRoot: bytes32(uint256(0xbb)),
+            leafExtra: bytes32(uint256(0xcc))
+        });
+
+        // SCALE: u8(version) ++ u32(parentNumber, LE) ++ 32(parentHash)
+        //        ++ u64(nextAuthoritySetID, LE) ++ u32(nextAuthoritySetLen, LE)
+        //        ++ 32(nextAuthoritySetRoot) ++ 32(leafExtra)
+        bytes memory expected = bytes.concat(
+            hex"00",                                                                       // version
+            hex"2a000000",                                                                 // parentNumber = 42
+            bytes32(uint256(0xaa)),                                                        // parentHash
+            hex"0700000000000000",                                                         // nextAuthoritySetID = 7
+            hex"04000000",                                                                 // nextAuthoritySetLen = 4
+            bytes32(uint256(0xbb)),                                                        // nextAuthoritySetRoot
+            bytes32(uint256(0xcc))                                                         // leafExtra (flat bytes32)
+        );
+        assertEq(_call_hashMmrLeaf(leaf), keccak256(expected));
+    }
+
+    function _call_hashMmrLeaf(Gateway.MmrLeaf memory leaf) internal view returns (bytes32) {
+        return this.callHashMmrLeaf(leaf);
+    }
+
+    function callHashMmrLeaf(Gateway.MmrLeaf calldata leaf) external view returns (bytes32) {
+        return gateway.hashMmrLeaf(leaf);
+    }
+
     function test_hashMessageLeafCompactBoundary() public view {
         // Compact-encoded length crosses the 1-byte → 2-byte boundary at 64.
         bytes memory payload = new bytes(64);

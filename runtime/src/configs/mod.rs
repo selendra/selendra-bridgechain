@@ -240,7 +240,11 @@ impl pallet_beefy_mmr::Config for Runtime {
 	// Merkle root of the messages submitted in the parent block. Verifying a
 	// message on Ethereum becomes (MMR proof of leaf) + (Merkle proof under
 	// `leaf_extra`).
-	type LeafExtra = alloc::vec::Vec<u8>;
+	//
+	// Typed as H256 (not Vec<u8>) so the SCALE wire format is a flat 32 bytes
+	// without a compact-length prefix — matches what `Gateway.hashMmrLeaf` on
+	// the Ethereum side expects.
+	type LeafExtra = sp_core::H256;
 	type BeefyDataProvider = BridgeOutbound;
 	type WeightInfo = ();
 }

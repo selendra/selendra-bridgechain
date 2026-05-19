@@ -239,15 +239,20 @@ sp_api::decl_runtime_apis! {
 /// leaf describes block N-1 — so we return the commitment for the parent. The
 /// caching write into `CommitmentRoot` is idempotent: any extra calls within
 /// the block recompute the same root.
-impl<T: Config> sp_consensus_beefy::mmr::BeefyDataProvider<Vec<u8>> for Pallet<T> {
-	fn extra_data() -> Vec<u8> {
+///
+/// Typed as `H256` (32-byte fixed) so the SCALE encoding of the MMR leaf has a
+/// flat 32-byte tail with no compact-length prefix. The Ethereum-side
+/// `Gateway.hashMmrLeaf` mirrors that layout. Empty blocks emit `H256::zero()`
+/// so the leaf is still well-formed for downstream verification.
+impl<T: Config> sp_consensus_beefy::mmr::BeefyDataProvider<H256> for Pallet<T> {
+	fn extra_data() -> H256 {
 		let parent = frame_system::Pallet::<T>::block_number().saturating_sub(One::one());
 		match Pallet::<T>::commitment_root_for(parent) {
 			Some(root) => {
 				CommitmentRoot::<T>::insert(parent, root);
-				root.as_bytes().to_vec()
+				root
 			},
-			None => Vec::new(),
+			None => H256::zero(),
 		}
 	}
 }
