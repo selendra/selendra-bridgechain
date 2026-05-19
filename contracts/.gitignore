@@ -1,0 +1,7 @@
+# Foundry artifacts
+out/
+cache/
+broadcast/
+
+# Foundry deps — installed via `forge install` after clone.
+lib/
