@@ -56,8 +56,13 @@ func TestDecodeLeaves_vec(t *testing.T) {
 	a := buildLeaf(0, 1, repeatByte(0x11), 0, 4, repeatByte(0x22), repeatByte(0x33))
 	b := buildLeaf(0, 2, repeatByte(0x44), 0, 4, repeatByte(0x55), repeatByte(0x66))
 
-	// compact(2) ++ a ++ b
-	encoded := append([]byte{0x08}, a...)
+	// `mmr_generateProof` returns Vec<EncodableOpaqueLeaf>, where each
+	// EncodableOpaqueLeaf is itself a length-prefixed Vec<u8>. So the wire
+	// form is: compact(2) ++ compact(len(a)) ++ a ++ compact(len(b)) ++ b.
+	encoded := []byte{0x08}
+	encoded = append(encoded, compactEncode(uint64(len(a)))...)
+	encoded = append(encoded, a...)
+	encoded = append(encoded, compactEncode(uint64(len(b)))...)
 	encoded = append(encoded, b...)
 
 	leaves, err := DecodeLeaves(encoded)
@@ -70,6 +75,20 @@ func TestDecodeLeaves_vec(t *testing.T) {
 	if leaves[0].ParentNumber != 1 || leaves[1].ParentNumber != 2 {
 		t.Errorf("parent numbers: %v", []uint32{leaves[0].ParentNumber, leaves[1].ParentNumber})
 	}
+}
+
+func compactEncode(v uint64) []byte {
+	switch {
+	case v < 1<<6:
+		return []byte{byte(v << 2)}
+	case v < 1<<14:
+		x := uint16(v<<2) | 1
+		return []byte{byte(x), byte(x >> 8)}
+	case v < 1<<30:
+		x := uint32(v<<2) | 2
+		return []byte{byte(x), byte(x >> 8), byte(x >> 16), byte(x >> 24)}
+	}
+	panic("compactEncode: value too large for test helper")
 }
 
 func TestDecodeProof(t *testing.T) {

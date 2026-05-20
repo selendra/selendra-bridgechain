@@ -85,8 +85,12 @@ func DecodeLeaf(r *scale.Reader) (*Leaf, error) {
 	return &leaf, nil
 }
 
-// DecodeLeaves reads `Vec<Leaf>` (compact length-prefixed). Used for the
-// leaves field of `mmr_generateProof` responses.
+// DecodeLeaves reads the `leaves` field returned by `mmr_generateProof`.
+//
+// The wire format is `Vec<EncodableOpaqueLeaf>` where `EncodableOpaqueLeaf`
+// is `Vec<u8>` wrapping a *separately* SCALE-encoded `MmrLeaf`. So we have
+// two layers of length prefixes: outer compact for the Vec, inner compact
+// for each opaque leaf's byte length.
 func DecodeLeaves(buf []byte) ([]Leaf, error) {
 	r := scale.NewReader(buf)
 	n, err := r.Compact()
@@ -95,7 +99,15 @@ func DecodeLeaves(buf []byte) ([]Leaf, error) {
 	}
 	out := make([]Leaf, 0, n)
 	for i := uint64(0); i < n; i++ {
-		leaf, err := DecodeLeaf(r)
+		innerLen, err := r.Compact()
+		if err != nil {
+			return nil, fmt.Errorf("leaves[%d] opaque length: %w", i, err)
+		}
+		inner := make([]byte, innerLen)
+		if _, err := r.Read(inner); err != nil {
+			return nil, fmt.Errorf("leaves[%d] opaque bytes: %w", i, err)
+		}
+		leaf, err := DecodeLeaf(scale.NewReader(inner))
 		if err != nil {
 			return nil, fmt.Errorf("leaves[%d]: %w", i, err)
 		}
@@ -161,21 +173,6 @@ func (l *Leaf) LeafHash() [32]byte {
 	copy(out[:], h.Sum(nil))
 	return out
 }
-
-// TODO: proof-order computation.
-//
-// `MMRProof.verifyLeafProof` in BeefyClient.sol takes a `proofOrder` bitfield
-// describing, at each step, whether the proof item sits on the left or the
-// right of the accumulator. mmr-lib (Rust) derives it from `leaf_index` +
-// `leaf_count` via `gen_proof_positions`. Porting that algorithm here is
-// straightforward but easy to subtly mis-implement — wrong order bits will
-// produce a wrong root, which the contract rejects as `InvalidMmrLeafProof`.
-//
-// Plan: cover this with a runtime-API helper on the Substrate side
-// (`BridgeOutboundApi::mmr_proof_order(leaf_index, leaf_count) -> u256`) so
-// both ends share the same Rust implementation. Until then, treat
-// `MmrProofOrder` as not-yet-implemented; the relayer can decode the proof
-// structure but cannot submit it for verification.
 
 func leUint32(dst []byte, v uint32) {
 	dst[0] = byte(v)

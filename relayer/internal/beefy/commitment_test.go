@@ -18,7 +18,7 @@ func TestDecodeSignedCommitment_roundtrip(t *testing.T) {
 		mmrRoot[i] = 0xab
 	}
 
-	encoded := []byte{0x00} // version
+	encoded := []byte{0x01} // VersionedFinalityProof::V1 tag = 1
 	// Payload: 1 item
 	encoded = append(encoded, 0x04)             // compact(1) = (1 << 2) | 0 = 0x04
 	encoded = append(encoded, 'm', 'h')         // payload id
@@ -32,11 +32,13 @@ func TestDecodeSignedCommitment_roundtrip(t *testing.T) {
 	vsid := make([]byte, 8)
 	binary.LittleEndian.PutUint64(vsid, 7)
 	encoded = append(encoded, vsid...)
-	// signatures: 2 slots, [Some(sig), None]
-	encoded = append(encoded, 0x08) // compact(2) = (2 << 2) | 0 = 0x08
-	encoded = append(encoded, 0x01)
+	// signatures: CompactSignedCommitment over 2 slots, [Some(sig), None]
+	// signatures_from: one byte, MSB-first, bit[0]=1 bit[1]=0 → 0b10000000
+	encoded = append(encoded, 0x04)               // compact(1) for Vec<u8> len
+	encoded = append(encoded, 0x80)               // bitfield byte
+	encoded = append(encoded, 0x02, 0, 0, 0)      // validator_set_len = 2 (u32 LE)
+	encoded = append(encoded, 0x04)               // compact(1) for signatures_compact
 	encoded = append(encoded, sig[:]...)
-	encoded = append(encoded, 0x00)
 
 	got, err := DecodeSignedCommitment(encoded)
 	if err != nil {
@@ -72,7 +74,7 @@ func TestDecodeSignedCommitment_roundtrip(t *testing.T) {
 }
 
 func TestDecodeSignedCommitment_rejectsBadVersion(t *testing.T) {
-	_, err := DecodeSignedCommitment([]byte{0x01})
+	_, err := DecodeSignedCommitment([]byte{0x07})
 	if err == nil {
 		t.Fatal("expected error on unsupported version")
 	}

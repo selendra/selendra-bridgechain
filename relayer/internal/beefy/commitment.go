@@ -54,15 +54,21 @@ func (s *SignedCommitment) SignatureCount() int {
 // `EncodedVersionedFinalityProof` (the over-the-wire form of a BEEFY
 // justification).
 //
-// Wire format:
+// Wire format (see `CompactSignedCommitment` in
+// substrate/primitives/consensus/beefy/src/commitment.rs — SignedCommitment's
+// custom Encode/Decode packs Vec<Option<Signature>> into a bitfield +
+// only the present signatures):
 //
-//	u8 version (must be 0 for V1)
+//	u8 variant tag (must be 1 for V1 — `#[codec(index = 1)]`)
 //	Commitment {
-//	    Vec<(PayloadID, Vec<u8>)>  // compact length-prefixed
+//	    Vec<(PayloadID, Vec<u8>)>     // compact length-prefixed
 //	    u32 block_number (LE)
 //	    u64 validator_set_id (LE)
 //	}
-//	Vec<Option<[u8;65]>>  // compact length-prefixed
+//	Vec<u8> signatures_from          // compact-prefixed bitfield, one bit
+//	                                  // per validator, MSB-first within byte
+//	u32     validator_set_len (LE)   // significant bit count
+//	Vec<Signature> signatures_compact // compact-prefixed, only present sigs
 func DecodeSignedCommitment(buf []byte) (*SignedCommitment, error) {
 	r := newReader(buf)
 
@@ -70,7 +76,7 @@ func DecodeSignedCommitment(buf []byte) (*SignedCommitment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("version: %w", err)
 	}
-	if version != 0 {
+	if version != 1 {
 		return nil, fmt.Errorf("unsupported VersionedFinalityProof variant %d", version)
 	}
 
@@ -104,28 +110,54 @@ func DecodeSignedCommitment(buf []byte) (*SignedCommitment, error) {
 		return nil, fmt.Errorf("validator_set_id: %w", err)
 	}
 
-	sigCount, err := r.readCompact()
+	bitfieldLen, err := r.readCompact()
 	if err != nil {
-		return nil, fmt.Errorf("signatures length: %w", err)
+		return nil, fmt.Errorf("signatures_from length: %w", err)
 	}
-	signatures := make([]*Signature, sigCount)
-	for i := uint64(0); i < sigCount; i++ {
-		flag, err := r.readU8()
-		if err != nil {
-			return nil, fmt.Errorf("signature[%d] tag: %w", i, err)
+	bitfield := make([]byte, bitfieldLen)
+	if _, err := r.read(bitfield); err != nil {
+		return nil, fmt.Errorf("signatures_from: %w", err)
+	}
+
+	validatorSetLen, err := r.readU32()
+	if err != nil {
+		return nil, fmt.Errorf("validator_set_len: %w", err)
+	}
+
+	compactCount, err := r.readCompact()
+	if err != nil {
+		return nil, fmt.Errorf("signatures_compact length: %w", err)
+	}
+	compactSigs := make([]Signature, compactCount)
+	for i := uint64(0); i < compactCount; i++ {
+		if _, err := r.read(compactSigs[i][:]); err != nil {
+			return nil, fmt.Errorf("signatures_compact[%d]: %w", i, err)
 		}
-		switch flag {
-		case 0:
-			signatures[i] = nil
-		case 1:
-			var sig Signature
-			if _, err := r.read(sig[:]); err != nil {
-				return nil, fmt.Errorf("signature[%d]: %w", i, err)
+	}
+
+	// Reconstruct Vec<Option<Signature>>: walk the bitfield MSB-first, and
+	// each set bit consumes the next signature from signatures_compact.
+	signatures := make([]*Signature, validatorSetLen)
+	sigIdx := 0
+	for i := uint32(0); i < validatorSetLen; i++ {
+		byteIdx := int(i / 8)
+		bitOff := i % 8
+		if byteIdx >= len(bitfield) {
+			return nil, fmt.Errorf("signatures_from: bitfield too short for validator %d", i)
+		}
+		bit := (bitfield[byteIdx] >> (7 - bitOff)) & 1
+		if bit == 1 {
+			if sigIdx >= len(compactSigs) {
+				return nil, fmt.Errorf("signatures_compact: ran out at validator %d", i)
 			}
+			sig := compactSigs[sigIdx]
 			signatures[i] = &sig
-		default:
-			return nil, fmt.Errorf("signature[%d]: invalid Option tag %d", i, flag)
+			sigIdx++
 		}
+	}
+	if sigIdx != len(compactSigs) {
+		return nil, fmt.Errorf("signatures_compact: %d unused (consumed %d / %d)",
+			len(compactSigs)-sigIdx, sigIdx, len(compactSigs))
 	}
 
 	return &SignedCommitment{

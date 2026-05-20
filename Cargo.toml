@@ -41,6 +41,7 @@ frame-metadata-hash-extension = { version = "0.8.0", default-features = false }
 frame-system = { version = "40.1.0", default-features = false }
 futures = { version = "0.3.31" }
 jsonrpsee = { version = "0.24.3" }
+mmr-rpc = { version = "40.0.0", default-features = false }
 pallet-transaction-payment = { version = "40.0.0", default-features = false }
 pallet-transaction-payment-rpc = { version = "43.0.0", default-features = false }
 sc-basic-authorship = { version = "0.49.0", default-features = false }
