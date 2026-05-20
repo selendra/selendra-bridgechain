@@ -270,6 +270,7 @@ pub fn new_full<
 	let rpc_extensions_builder = {
 		let client = client.clone();
 		let pool = transaction_pool.clone();
+		let rpc_backend = backend.clone();
 		let beefy_justif_stream = beefy_rpc_links.from_voter_justif_stream.clone();
 		let beefy_best_block_stream = beefy_rpc_links.from_voter_best_beefy_stream.clone();
 
@@ -277,6 +278,7 @@ pub fn new_full<
 			let deps = crate::rpc::FullDeps {
 				client: client.clone(),
 				pool: pool.clone(),
+				backend: rpc_backend.clone(),
 				beefy: crate::rpc::BeefyDeps {
 					beefy_finality_proof_stream: beefy_justif_stream.clone(),
 					beefy_best_block_stream: beefy_best_block_stream.clone(),
