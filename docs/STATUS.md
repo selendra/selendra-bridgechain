@@ -17,7 +17,7 @@ Last updated: 2026-05-20.
 | `pallet-bridge-inbound` (stub verifier) | ✅ accepts proofs, replay-checks, dispatches via trait |
 | `contracts/BeefyClient.sol` (Snowfork port) | ✅ compiles, deployment smoke tests pass |
 | `contracts/Gateway.sol` (custom) | ✅ compiles, SCALE-leaf encoding cross-checked |
-| Go relayer (`relayer/`) | 🟡 skeleton; decodes commitments, **doesn't submit yet** |
+| Go relayer (`relayer/`) | 🟡 decodes commitments and fetches submission bundles, **doesn't submit yet** |
 | Real Ethereum beacon-client verifier | ❌ parked in `vendor/snowbridge/`, not built |
 | End-to-end Substrate → Ethereum integration | ❌ relayer can't generate MMR-leaf proofs yet |
 | End-to-end Ethereum → Substrate integration | ❌ inbound is on `MockVerifier` |
@@ -132,19 +132,29 @@ Suggested order — each item builds on the previous.
 
 ### 1. Build the MMR-proof fetcher in the relayer
 
-Currently the relayer decodes commitments and stops. To submit anything to
-`BeefyClient.sol` we need:
+**Mostly done** (see commits after `64dafc6`). Three new Go packages:
 
-- A wrapper around the node's `mmr_generateProof(block_numbers, best_known_block)`
-  RPC. Returns the BEEFY-MMR leaf (SCALE-encoded) + a proof against the MMR
-  root for some block.
-- A wrapper around our `BridgeOutboundApi::message_proof(block, index)`
-  runtime API call (via `state_call` JSON-RPC).
-- Helpers to decode the SCALE-encoded leaf into the Solidity-friendly
-  `MmrLeaf` struct shape.
+- `internal/scale` — shared SCALE reader (compact, LE primitives, byte
+  slices, fixed 32-byte reads). Unit-tested across all compact-int modes.
+- `internal/mmr` — `Leaf` (bridgechain shape with H256 leaf_extra),
+  `Proof`, decoders for `mmr_generateProof`'s SCALE-encoded leaves and
+  proof fields, and `Leaf.LeafHash()` that produces the keccak hash the
+  Solidity Gateway expects (cross-checked against Foundry test fixture).
+- `internal/outbound` — `FetchMessageBundle(block, index, ...)` that calls
+  `BridgeOutboundApi::message_proof` and `messages_at` via `state_call`,
+  plus `mmr_generateProof` for the leaf inclusion. Returns a `Bundle` with
+  everything `Gateway.submitInbound` wants — the message, the per-block
+  Merkle proof, the BEEFY-MMR leaf, and the MMR proof.
 
-Lives in `relayer/internal/beefy/` (proof.go) and `relayer/internal/outbound/`
-(new package, mirroring the substrate-side outbound pallet).
+**Still open — proof-order computation.** `MMRProof.verifyLeafProof` in
+BeefyClient.sol takes a `proofOrder` bitfield. mmr-lib (Rust) derives it
+from `leaf_index + leaf_count` via `gen_proof_positions`. Porting that to
+Go is straightforward but easy to subtly mis-implement — wrong order bits
+produce a wrong root, which the contract rejects as
+`InvalidMmrLeafProof`. Plan: add a runtime-API helper on the Substrate
+side (`BridgeOutboundApi::mmr_proof_order(leaf_index, leaf_count)`) so
+both ends share the same Rust implementation. Tracked in
+`relayer/internal/mmr/types.go`.
 
 ### 2. Wire up the commit-reveal driver
 
