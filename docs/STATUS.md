@@ -146,15 +146,15 @@ Suggested order — each item builds on the previous.
   everything `Gateway.submitInbound` wants — the message, the per-block
   Merkle proof, the BEEFY-MMR leaf, and the MMR proof.
 
-**Still open — proof-order computation.** `MMRProof.verifyLeafProof` in
-BeefyClient.sol takes a `proofOrder` bitfield. mmr-lib (Rust) derives it
-from `leaf_index + leaf_count` via `gen_proof_positions`. Porting that to
-Go is straightforward but easy to subtly mis-implement — wrong order bits
-produce a wrong root, which the contract rejects as
-`InvalidMmrLeafProof`. Plan: add a runtime-API helper on the Substrate
-side (`BridgeOutboundApi::mmr_proof_order(leaf_index, leaf_count)`) so
-both ends share the same Rust implementation. Tracked in
-`relayer/internal/mmr/types.go`.
+**Done — proof-order computation.** `internal/mmr/simplified.go` ports
+Snowfork's `simplified_mmr_proof.go` (Apache-2.0, attribution preserved).
+Converts the multi-peak proof from `mmr_generateProof` into the linear
+form `BeefyClient.MMRProof.verifyLeafProof` consumes — flattens local
+tree walk + right-bagged peak + left peaks, packs the side bits into a
+single `uint64`. `Bundle.MmrProofSimplified` exposes it.
+`VerifyMerkleRoot` (in the same package) re-derives the root from the
+simplified proof; used by tests + future relayer sanity checks before
+on-chain submission. Three new mmr tests pass.
 
 ### 2. Wire up the commit-reveal driver
 

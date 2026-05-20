@@ -49,10 +49,15 @@ type Bundle struct {
 	// against the on-chain MMRProof verifier.
 	MmrLeafBytes []byte
 
-	// MMR proof of the leaf in the MMR root currently trusted by the
-	// BeefyClient. `Order` is left unset — see `internal/mmr/types.go` for
-	// the open TODO around proof-order derivation.
+	// Raw MMR proof of the leaf in the MMR root currently trusted by the
+	// BeefyClient. Preserved alongside `MmrProofSimplified` mostly for
+	// diagnostics — production callers should use the simplified form.
 	MmrProof mmr.Proof
+
+	// Linearized MMR proof — what Gateway.submitInbound consumes. Computed
+	// from the raw proof + leaf_index + leaf_count via the Snowfork port at
+	// internal/mmr/simplified.go.
+	MmrProofSimplified mmr.SimplifiedProof
 }
 
 // FetchMessageBundle pulls everything needed to submit message `index` from
@@ -118,12 +123,24 @@ func FetchMessageBundle(ctx context.Context, sub *substrate.Client,
 		return nil, fmt.Errorf("outbound: decode proof: %w", err)
 	}
 
+	// `mmr_generateProof` only handles single-leaf proofs for the bridge use
+	// case. Anything else means our caller asked for a batch we don't know
+	// how to flatten.
+	if len(proof.LeafIndices) != 1 {
+		return nil, fmt.Errorf("outbound: expected 1 leaf index in MMR proof, got %d", len(proof.LeafIndices))
+	}
+	simplified, err := mmr.Simplify(proof.LeafIndices[0], proof.LeafCount, proof.Items)
+	if err != nil {
+		return nil, fmt.Errorf("outbound: simplify MMR proof: %w", err)
+	}
+
 	return &Bundle{
-		Message:      messages[index],
-		MessageProof: *mp,
-		MmrLeaf:      leaves[0],
-		MmrLeafBytes: encodeLeaf(&leaves[0]),
-		MmrProof:     *proof,
+		Message:            messages[index],
+		MessageProof:       *mp,
+		MmrLeaf:            leaves[0],
+		MmrLeafBytes:       encodeLeaf(&leaves[0]),
+		MmrProof:           *proof,
+		MmrProofSimplified: simplified,
 	}, nil
 }
 
