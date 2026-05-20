@@ -65,4 +65,51 @@ contract BeefyClientTest is Test {
         vm.expectRevert("invalid-constructor-params");
         new BeefyClient(8, 100, 3, 3, 0, initial, next);
     }
+
+    /// @notice Cross-checks `computeCommitmentHash` against the Go relayer's
+    ///         `proof.CommitmentHash` for the same fixture (see
+    ///         relayer/internal/proof/proof_test.go::referenceCommitment).
+    ///         If these ever diverge the on-chain signature recovery for the
+    ///         relayer's submitted ValidatorProofs will fail.
+    /// @notice Cross-checks the Go relayer's `bitfield.From` against the
+    ///         contract's own `createInitialBitfield`. Same input set →
+    ///         same uint256[] words. If these ever drift, `submitInitial`
+    ///         rejects with `InvalidBitfieldPadding` or wrong validators
+    ///         are selected during the reveal phase.
+    function test_initialBitfieldMatchesGoRelayer() public view {
+        uint256[] memory bitsToSet = new uint256[](8);
+        bitsToSet[0] = 0;
+        bitsToSet[1] = 1;
+        bitsToSet[2] = 7;
+        bitsToSet[3] = 8;
+        bitsToSet[4] = 255;
+        bitsToSet[5] = 256;
+        bitsToSet[6] = 257;
+        bitsToSet[7] = 511;
+
+        uint256[] memory bf = client.createInitialBitfield(bitsToSet, 512);
+        assertEq(bf.length, 2);
+        // Computed by Go fixture in relayer/internal/bitfield/bitfield_test.go.
+        assertEq(bf[0], 0x8000000000000000000000000000000000000000000000000000000000000183);
+        assertEq(bf[1], 0x8000000000000000000000000000000000000000000000000000000000000003);
+    }
+
+    function test_computeCommitmentHashMatchesGoRelayer() public view {
+        bytes memory mmrRoot = new bytes(32);
+        for (uint256 i = 0; i < 32; i++) {
+            mmrRoot[i] = 0xab;
+        }
+        BeefyClient.PayloadItem[] memory payload = new BeefyClient.PayloadItem[](1);
+        payload[0] = BeefyClient.PayloadItem({payloadID: bytes2("mh"), data: mmrRoot});
+        BeefyClient.Commitment memory c = BeefyClient.Commitment({
+            blockNumber: 42,
+            validatorSetID: 7,
+            payload: payload
+        });
+
+        // Value computed by the Go relayer against the same fixture in
+        // proof_test.go::referenceCommitment.
+        bytes32 expected = 0xed1608fc4c09deed8144d310da1aacc4cb3ab6b123ac1697374d52d720a5ead4;
+        assertEq(client.computeCommitmentHash(c), expected);
+    }
 }
