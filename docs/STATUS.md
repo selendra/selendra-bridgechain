@@ -158,34 +158,35 @@ on-chain submission. Three new mmr tests pass.
 
 ### 2. Wire up the commit-reveal driver
 
-The BeefyClient flow is:
+**Partly done — foundations in place, state machine still TODO.**
 
-1. `submitInitial(commitment, bitfield, oneSignerProof)` — open a ticket.
-2. Wait `randaoCommitDelay` Ethereum blocks.
-3. `commitPrevRandao(ticketID)` — capture the randomness for sampling.
-4. `createFinalBitfield(ticketID, bitfield)` — get the validator subset.
-5. `submitFinal(ticketID, commitment, bitfield, validatorProofs[],
-   leaf, leafProof, leafProofOrder)` — close the ticket, publish the new
-   MMR root.
+Shipped:
 
-Each step needs:
+- `relayer/internal/bindings/` — abigen output for BeefyClient.sol (1,288
+  lines) and Gateway.sol (717 lines). Regenerable via
+  `relayer/scripts/regen-bindings.sh` after every `forge build`.
+- `relayer/internal/validators/` — Substrate binary-merkle-tree
+  (keccak256, odd-one-out *promotion* semantics matching upstream
+  `binary-merkle-tree` v16). `Tree.New(addrs) → *Tree`, `Tree.Root()`,
+  `Tree.Proof(i)`. Tests cross-check against the Solidity
+  `SubstrateMerkleProof.computeRoot` algorithm for sizes 1, 2, 5 (odd),
+  and 8 (power of two).
+- `relayer/internal/ethereum/transactor.go` — wraps
+  `bind.NewKeyedTransactorWithChainID`, captures the operator address,
+  exposes `WithContext` so per-call cancellation propagates.
 
-- An ECDSA-signed transaction (use go-ethereum's `bind.NewKeyedTransactor`).
-- The validator set merkle tree from the runtime API
-  `pallet_beefy_mmr::Pallet::authority_set_root`, so we can build the
-  inclusion proofs `BeefyClient.isValidatorInSet` expects.
-- The full `ValidatorProof` structs (v/r/s + leaf index + leaf hash +
-  inclusion proof) for each sampled validator.
+Still TODO:
 
-Bind this to the contracts via `abigen`:
-
-```bash
-forge build --extra-output-files abi
-abigen --abi out/BeefyClient.sol/BeefyClient.json --pkg bindings \
-       --out relayer/internal/bindings/beefy_client.go --type BeefyClient
-abigen --abi out/Gateway.sol/Gateway.json --pkg bindings \
-       --out relayer/internal/bindings/gateway.go --type Gateway
-```
+- The state machine itself (`submitInitial → wait → commitPrevRandao →
+  createFinalBitfield → submitFinal`), with retries and idempotency on
+  reorg.
+- Signature aggregation: pull `Signatures []*Signature` out of the
+  decoded `SignedCommitment`, project onto a packed bitfield + per-
+  validator `ValidatorProof{v, r, s, index, account, proof}` struct
+  array.
+- Operator key loading. `Transactor` takes a hex-encoded private key
+  string; production should grow a keystore/HW-wallet path before any
+  mainnet deployment.
 
 ### 3. End-to-end smoke test
 
