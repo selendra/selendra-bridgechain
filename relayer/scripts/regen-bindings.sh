@@ -18,18 +18,23 @@ mkdir -p "$OUT_DIR"
 (cd "$CONTRACTS_DIR" && forge build)
 
 # Forge emits a combined JSON with `abi`, `bytecode`, `metadata`, …
-# abigen wants just the ABI as a JSON array.
+# abigen wants the ABI as a JSON array and bytecode as a plain hex string.
+# The bytecode lets abigen generate a `Deploy<Name>` function so the e2e
+# tests can spin up fresh contracts against Anvil from pure Go.
 for contract in BeefyClient Gateway; do
     python3 -c "
 import json
 data = json.load(open('$CONTRACTS_DIR/out/${contract}.sol/${contract}.json'))
 open('$TMP/${contract}.abi.json', 'w').write(json.dumps(data['abi']))
+bin = data['bytecode']['object']
+if bin.startswith('0x'): bin = bin[2:]
+open('$TMP/${contract}.bin', 'w').write(bin)
 "
 done
 
-abigen --abi "$TMP/BeefyClient.abi.json" --pkg bindings --type BeefyClient \
-    --out "$OUT_DIR/beefy_client.go"
-abigen --abi "$TMP/Gateway.abi.json" --pkg bindings --type Gateway \
-    --out "$OUT_DIR/gateway.go"
+abigen --abi "$TMP/BeefyClient.abi.json" --bin "$TMP/BeefyClient.bin" \
+    --pkg bindings --type BeefyClient --out "$OUT_DIR/beefy_client.go"
+abigen --abi "$TMP/Gateway.abi.json" --bin "$TMP/Gateway.bin" \
+    --pkg bindings --type Gateway --out "$OUT_DIR/gateway.go"
 
 echo "regen-bindings: wrote $OUT_DIR/{beefy_client.go,gateway.go}"

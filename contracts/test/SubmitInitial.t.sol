@@ -62,7 +62,9 @@ contract SubmitInitialTest is Test {
             mmrRoot[i] = 0xab;
         }
         BeefyClient.PayloadItem[] memory payload = new BeefyClient.PayloadItem[](1);
-        payload[0] = BeefyClient.PayloadItem({payloadID: bytes2("mh"), data: mmrRoot});
+        // 0x6d68 == "mh" — written as a numeric literal so the compiler
+        // doesn't flag this as a potentially-truncating string→bytes2 cast.
+        payload[0] = BeefyClient.PayloadItem({payloadID: bytes2(0x6d68), data: mmrRoot});
         return BeefyClient.Commitment({blockNumber: 42, validatorSetID: 0, payload: payload});
     }
 

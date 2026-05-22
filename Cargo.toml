@@ -26,6 +26,9 @@ exclude = [
     "vendor/snowbridge/primitives/merkle-tree",
     "vendor/snowbridge/primitives/verification",
     "vendor/snowbridge/pallets/ethereum-client",
+    # Standalone helper for the relayer's e2e harness; uses subxt 0.50 which
+    # has its own (newer) substrate dep tree we don't want in the workspace.
+    "tools/inject-msg",
 ]
 resolver = "2"
 

@@ -100,7 +100,8 @@ contract BeefyClientTest is Test {
             mmrRoot[i] = 0xab;
         }
         BeefyClient.PayloadItem[] memory payload = new BeefyClient.PayloadItem[](1);
-        payload[0] = BeefyClient.PayloadItem({payloadID: bytes2("mh"), data: mmrRoot});
+        // 0x6d68 == "mh"; numeric literal avoids the unsafe-typecast lint.
+        payload[0] = BeefyClient.PayloadItem({payloadID: bytes2(0x6d68), data: mmrRoot});
         BeefyClient.Commitment memory c = BeefyClient.Commitment({
             blockNumber: 42,
             validatorSetID: 7,
