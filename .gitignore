@@ -20,3 +20,5 @@ debridge_node/bundlr_wallet.json
 
 .cache
 .local
+.claude
+target

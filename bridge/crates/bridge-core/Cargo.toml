@@ -1,0 +1,18 @@
+[package]
+name = "bridge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Pulls in alloy for the on-chain Gate bindings (used by validator/keeper).
+abi = ["dep:alloy"]
+
+[dependencies]
+alloy-primitives = { workspace = true }
+alloy = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

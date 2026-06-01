@@ -1,0 +1,22 @@
+[package]
+name = "validator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bridge-core = { workspace = true, features = ["abi"] }
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }

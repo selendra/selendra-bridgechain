@@ -1,0 +1,16 @@
+# rust
+/target
+
+# foundry
+contracts/out
+contracts/cache
+contracts/broadcast
+
+# generated at runtime by scripts/e2e.sh
+/sig-store-data
+/.e2e-logs
+/validator.toml
+/keeper.toml
+
+# deps are vendored by forge install; keep lib out of git
+contracts/lib
