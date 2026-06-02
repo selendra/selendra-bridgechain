@@ -113,6 +113,7 @@ cast send "$TOKEN_DST" "mint(address,uint256)" "$GATE_DST" $AMOUNT --rpc-url $DS
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
 echo "=== writing configs ==="
+rm -f "$LOGS/validator-state.json"
 cat > "$ROOT/validator.toml" <<EOF
 [source]
 chain_id = $SRC_CHAIN
@@ -122,6 +123,7 @@ start_block = 0
 block_confirmation = 0
 poll_interval_ms = 500
 max_block_range = 1000
+state_file = "$LOGS/validator-state.json"
 
 [signer]
 private_key = "$VALIDATOR_KEY"
