@@ -22,9 +22,14 @@ pub struct Keeper {
     pub private_key: String,
 }
 
+/// Where the keeper reads signatures: a local directory (`dir`) or the HTTP
+/// sig-store (`url`). `url` wins when both are set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Store {
-    pub dir: String,
+    #[serde(default)]
+    pub dir: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 fn default_interval() -> u64 {

@@ -1,0 +1,13 @@
+# Keeper — anvil account [4], funded on the target chain, pays claim() gas.
+# Gate is the same deterministic address as on the source chain.
+[target]
+chain_id = 1338
+rpc = "http://anvil-dst:8545"
+gate = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+poll_interval_ms = 500
+
+[keeper]
+private_key = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a"
+
+[store]
+url = "http://sig-store:8080"

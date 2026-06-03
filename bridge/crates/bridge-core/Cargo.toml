@@ -8,6 +8,8 @@ license.workspace = true
 default = []
 # Pulls in alloy for the on-chain Gate bindings (used by validator/keeper).
 abi = ["dep:alloy"]
+# HTTP client for the sig-store service (used by validator/keeper in Phase 7).
+http = ["dep:reqwest"]
 
 [dependencies]
 alloy-primitives = { workspace = true }
@@ -16,3 +18,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+reqwest = { workspace = true, optional = true }
