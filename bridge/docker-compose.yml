@@ -1,0 +1,70 @@
+# Phase 7 — the off-chain bridge stack, dockerized.
+#
+#   sig-store + 3 independent validators + 1 keeper, plus two anvil chains for
+#   local bring-up. The gate addresses in docker/configs/*.toml are anvil's
+#   DETERMINISTIC deploy addresses (account #0 deploys TestToken then Gate, so
+#   token=0x5FbD..., gate=0xe7f1...). Deploy + wire with docker/deploy.sh.
+#
+# Bring-up:
+#   docker compose up -d anvil-src anvil-dst sig-store
+#   bash docker/deploy.sh                       # deploys + wires on both chains
+#   docker compose up -d validator1 validator2 validator3 keeper
+#   # then `cast send ... send(...)` on localhost:8545 and watch the keeper claim.
+
+services:
+  anvil-src:
+    image: ghcr.io/foundry-rs/foundry:latest
+    # foundry image entrypoint wraps the command in a shell, hence one string.
+    command: ["anvil --host 0.0.0.0 --chain-id 1337"]
+    ports: ["8545:8545"]
+
+  anvil-dst:
+    image: ghcr.io/foundry-rs/foundry:latest
+    command: ["anvil --host 0.0.0.0 --chain-id 1338"]
+    ports: ["8546:8545"]
+
+  sig-store:
+    build: .
+    command: ["sig-store"]
+    environment:
+      SIG_STORE_BIND: "0.0.0.0:8080"
+      SIG_STORE_DIR: "/data"
+      RUST_LOG: "sig_store=info"
+    volumes:
+      - sigstore-data:/data
+    ports: ["8080:8080"]
+
+  validator1:
+    build: .
+    command: ["validator", "/configs/val1.toml"]
+    volumes:
+      - ./docker/configs:/configs:ro
+      - val-state:/data
+    depends_on: [sig-store, anvil-src]
+
+  validator2:
+    build: .
+    command: ["validator", "/configs/val2.toml"]
+    volumes:
+      - ./docker/configs:/configs:ro
+      - val-state:/data
+    depends_on: [sig-store, anvil-src]
+
+  validator3:
+    build: .
+    command: ["validator", "/configs/val3.toml"]
+    volumes:
+      - ./docker/configs:/configs:ro
+      - val-state:/data
+    depends_on: [sig-store, anvil-src]
+
+  keeper:
+    build: .
+    command: ["keeper", "/configs/keeper.toml"]
+    volumes:
+      - ./docker/configs:/configs:ro
+    depends_on: [sig-store, anvil-dst]
+
+volumes:
+  sigstore-data:
+  val-state:

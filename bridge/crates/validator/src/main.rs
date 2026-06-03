@@ -14,6 +14,7 @@
 mod api;
 mod config;
 mod provider;
+mod sink;
 mod state;
 
 use std::path::PathBuf;
@@ -27,9 +28,10 @@ use alloy::signers::Signer;
 use alloy_sol_types::{SolEvent, SolValue};
 use anyhow::Context;
 use bridge_core::abi::{AutoParamsTo, Gate};
-use bridge_core::store::{self, SignerSig, SubmissionRecord};
+use bridge_core::store::{SignerSig, SubmissionRecord};
 use bridge_core::{AutoParams, Submission};
 use config::Config;
+use sink::Sink;
 use state::{NonceDecision, PauseReason, Runtime};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -49,8 +51,7 @@ async fn main() -> anyhow::Result<()> {
     let signer: PrivateKeySigner = cfg.signer.private_key.parse().context("bad private_key")?;
     let signer_addr = signer.address();
     let gate: Address = cfg.source.gate.parse().context("bad gate address")?;
-    let store_dir = PathBuf::from(&cfg.store.dir);
-    store::ensure_dir(&store_dir)?;
+    let sink = Sink::from_config(&cfg.store)?;
 
     // Multi-RPC failover, with a chainId guard per endpoint.
     let endpoints = cfg.source.endpoints()?;
@@ -82,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         chain_id = cfg.source.chain_id,
         rpc = %failover.active_url(),
         endpoints = endpoints.len(),
+        sink = %sink.describe(),
         resume_from = { runtime.lock().await.next_block() },
         "validator started"
     );
@@ -120,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
             let mut paused = false;
             for log in &logs {
-                match handle_log(&signer, signer_addr, &store_dir, &runtime, log).await {
+                match handle_log(&signer, signer_addr, &sink, &runtime, log).await {
                     Ok(true) => {} // processed
                     Ok(false) => {
                         // a nonce anomaly paused the scanner; stop this batch
@@ -150,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
 async fn handle_log(
     signer: &PrivateKeySigner,
     signer_addr: Address,
-    store_dir: &std::path::Path,
+    sink: &Sink,
     runtime: &Arc<Mutex<Runtime>>,
     log: &alloy::rpc::types::Log,
 ) -> anyhow::Result<bool> {
@@ -215,11 +217,8 @@ async fn handle_log(
         signatures: vec![],
     };
 
-    store::upsert_signature(
-        store_dir,
-        record,
-        SignerSig { signer: format!("{signer_addr:#x}"), signature: sig_hex },
-    )?;
+    sink.upsert(record, SignerSig { signer: format!("{signer_addr:#x}"), signature: sig_hex })
+        .await?;
 
     // Record the accepted nonce only after a successful sign+store.
     runtime.lock().await.accept_nonce(chain_to, nonce);

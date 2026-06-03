@@ -54,9 +54,14 @@ pub struct Signer {
     pub private_key: String,
 }
 
+/// Where signatures go. Either a local directory (`dir`) or the HTTP sig-store
+/// (`url`). `url` wins when both are set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Store {
-    pub dir: String,
+    #[serde(default)]
+    pub dir: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -15,6 +15,9 @@ pub mod store;
 #[cfg(feature = "abi")]
 pub mod abi;
 
+#[cfg(feature = "http")]
+pub mod remote;
+
 /// Domain-separating prefix, matching `BridgeHash.SUBMISSION_PREFIX` in Solidity.
 pub const SUBMISSION_PREFIX: u64 = 1;
 

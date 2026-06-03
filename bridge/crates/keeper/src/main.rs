@@ -5,6 +5,7 @@
 //! submit `claim()` (signatures sorted by signer ascending, as the Gate requires).
 
 mod config;
+mod source;
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -15,8 +16,9 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use bridge_core::abi::Gate;
-use bridge_core::store::{self, SubmissionRecord};
+use bridge_core::store::SubmissionRecord;
 use config::Config;
+use source::Source;
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -34,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let signer: PrivateKeySigner = cfg.keeper.private_key.parse().context("bad private_key")?;
     let wallet = EthereumWallet::from(signer.clone());
     let gate_addr: Address = cfg.target.gate.parse().context("bad gate address")?;
-    let store_dir = std::path::PathBuf::from(&cfg.store.dir);
+    let source = Source::from_config(&cfg.store)?;
 
     let provider = ProviderBuilder::new()
         .wallet(wallet)
@@ -55,11 +57,12 @@ async fn main() -> anyhow::Result<()> {
         gate = %gate_addr,
         chain_id = cfg.target.chain_id,
         threshold,
+        source = %source.describe(),
         "keeper started"
     );
 
     loop {
-        let records = store::load_all(&store_dir).unwrap_or_default();
+        let records = source.load_all().await.unwrap_or_default();
         for rec in records {
             if rec.chain_id_to != cfg.target.chain_id {
                 continue;

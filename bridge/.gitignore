@@ -6,13 +6,18 @@ contracts/out
 contracts/cache
 contracts/broadcast
 
-# generated at runtime by scripts/e2e.sh + scripts/phase6.sh
+# generated at runtime by scripts/*.sh
 /sig-store-data
 /sig-store-data-p6
+/sig-store-data-p7
 /.e2e-logs
 /validator.toml
 /validator-p6.toml
+/val1-p7.toml
+/val2-p7.toml
+/val3-p7.toml
 /keeper.toml
+/keeper-p7.toml
 /validator-state.json
 *.json.tmp
 
