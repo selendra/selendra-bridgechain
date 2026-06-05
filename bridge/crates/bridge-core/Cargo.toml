@@ -7,7 +7,9 @@ license.workspace = true
 [features]
 default = []
 # Pulls in alloy for the on-chain Gate bindings (used by validator/keeper).
-abi = ["dep:alloy"]
+# `alloy-primitives/k256` enables ECDSA recovery so the store can authenticate
+# signatures (recover signer) and recompute submissionIds at the trust boundary.
+abi = ["dep:alloy", "alloy-primitives/k256"]
 # HTTP client for the sig-store service (used by validator/keeper in Phase 7).
 http = ["dep:reqwest"]
 
