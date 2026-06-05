@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import {Test} from "forge-std/Test.sol";
+import {Gate} from "../src/Gate.sol";
+import {TestToken} from "../src/TestToken.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+/// @dev A token whose transferFrom reenters `Gate.send` exactly once, to probe
+///      the source-side nonce sequencing under reentrancy (finding C2).
+contract ReentrantToken is ERC20 {
+    Gate public gate;
+    uint256 public chainTo;
+    bool public entered;
+
+    constructor() ERC20("Re", "RE") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    /// Arm the hook and self-fund so the reentrant send has something to pull.
+    function arm(Gate g, uint256 c) external {
+        gate = g;
+        chainTo = c;
+        _mint(address(this), 1 ether);
+        _approve(address(this), address(g), type(uint256).max);
+    }
+
+    function transferFrom(address from, address to, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        bool ok = super.transferFrom(from, to, amount);
+        if (!entered && address(gate) != address(0)) {
+            entered = true;
+            // reenter the gate from inside the token transfer
+            gate.send(address(this), 1, chainTo, abi.encodePacked(address(0xCAFE)), "");
+        }
+        return ok;
+    }
+}
+
+contract SecurityTest is Test {
+    Gate gate;
+    TestToken token;
+
+    address v1 = address(0xA11CE);
+    address v2 = address(0xB0B);
+    address v3 = address(0xC0FFEE);
+    address attacker = address(0xBAD);
+    uint256 constant CHAIN_TO = 1338;
+
+    function _validators(uint256 n) internal view returns (address[] memory vs) {
+        vs = new address[](n);
+        if (n > 0) vs[0] = v1;
+        if (n > 1) vs[1] = v2;
+        if (n > 2) vs[2] = v3;
+    }
+
+    function setUp() public {
+        gate = new Gate(_validators(3), 2);
+        token = new TestToken("Test", "TST");
+    }
+
+    // ---- C1: threshold bounds ----
+
+    function test_Constructor_RevertsZeroThreshold() public {
+        vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 0, 3));
+        new Gate(_validators(3), 0);
+    }
+
+    function test_Constructor_RevertsThresholdAboveValidatorCount() public {
+        vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 4, 3));
+        new Gate(_validators(3), 4);
+    }
+
+    function test_Constructor_RevertsZeroValidator() public {
+        address[] memory vs = new address[](1);
+        vs[0] = address(0);
+        vm.expectRevert(Gate.ZeroValidator.selector);
+        new Gate(vs, 1);
+    }
+
+    function test_SetThreshold_RevertsZero() public {
+        vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 0, 3));
+        gate.setThreshold(0);
+    }
+
+    function test_SetThreshold_RevertsAboveValidatorCount() public {
+        vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 5, 3));
+        gate.setThreshold(5);
+    }
+
+    function test_SetValidator_CannotDropBelowThreshold() public {
+        // threshold 2, validatorCount 3 -> remove one is fine (count 2)
+        gate.setValidator(v3, false);
+        assertEq(gate.validatorCount(), 2);
+        // removing another would make count 1 < threshold 2 -> revert
+        vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 2, 1));
+        gate.setValidator(v2, false);
+    }
+
+    // ---- C1 (impact): a zero threshold would have allowed a no-signature drain ----
+
+    function test_NoZeroThresholdDrainPossible() public {
+        // There is simply no way to reach threshold == 0, so claim() can never
+        // pass with an empty signature set. Both entry points revert:
+        vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 0, 3));
+        gate.setThreshold(0);
+        vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 0, 1));
+        new Gate(_validators(1), 0);
+    }
+
+    // ---- C2: send() reentrancy keeps nonces sequential ----
+
+    function test_Send_ReentrancyKeepsNoncesSequential() public {
+        ReentrantToken rt = new ReentrantToken();
+        rt.mint(attacker, 10 ether);
+        rt.arm(gate, CHAIN_TO);
+
+        vm.startPrank(attacker);
+        rt.approve(address(gate), type(uint256).max);
+        gate.send(address(rt), 1 ether, CHAIN_TO, abi.encodePacked(address(0xCAFE)), "");
+        vm.stopPrank();
+
+        // outer reserved nonce 0; the reentrant inner send reserved nonce 1.
+        // With the pre-fix (transfer before increment) both would read 0 and the
+        // final nonce would be 1. CEI ordering makes it a clean 2.
+        assertEq(gate.nonceTo(CHAIN_TO), 2, "nonces must stay sequential under reentrancy");
+    }
+
+    // ---- C3: receiver must be exactly 20 bytes ----
+
+    function test_Send_RevertsReceiverTooLong() public {
+        token.mint(attacker, 10 ether);
+        vm.startPrank(attacker);
+        token.approve(address(gate), type(uint256).max);
+        // 32-byte left-padded address — the classic mis-encoding
+        vm.expectRevert(Gate.BadReceiver.selector);
+        gate.send(address(token), 1 ether, CHAIN_TO, abi.encode(address(0xCAFE)), "");
+        vm.stopPrank();
+    }
+
+    function test_Send_RevertsReceiverTooShort() public {
+        token.mint(attacker, 10 ether);
+        vm.startPrank(attacker);
+        token.approve(address(gate), type(uint256).max);
+        vm.expectRevert(Gate.BadReceiver.selector);
+        gate.send(address(token), 1 ether, CHAIN_TO, hex"1234", "");
+        vm.stopPrank();
+    }
+
+    // ---- C4: two-step ownership + access control ----
+
+    function test_TransferOwnership_TwoStep() public {
+        address newOwner = address(0xBEEF);
+        gate.transferOwnership(newOwner);
+        // not transferred until accepted
+        assertEq(gate.owner(), address(this));
+        assertEq(gate.pendingOwner(), newOwner);
+
+        vm.prank(newOwner);
+        gate.acceptOwnership();
+        assertEq(gate.owner(), newOwner);
+        assertEq(gate.pendingOwner(), address(0));
+    }
+
+    function test_AcceptOwnership_OnlyPending() public {
+        gate.transferOwnership(address(0xBEEF));
+        vm.prank(attacker);
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.acceptOwnership();
+    }
+
+    function test_TransferOwnership_RejectsZero() public {
+        vm.expectRevert(Gate.ZeroAddress.selector);
+        gate.transferOwnership(address(0));
+    }
+
+    function test_Setters_OnlyOwner() public {
+        vm.startPrank(attacker);
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.setThreshold(1);
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.setValidator(attacker, true);
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.setLocalToken(bytes32(0), address(token));
+        vm.stopPrank();
+    }
+}

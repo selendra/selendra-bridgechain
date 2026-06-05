@@ -27,6 +27,7 @@ contract Gate {
 
     // --- validator set / governance ---
     address public owner;
+    address public pendingOwner;
     mapping(address => bool) public isValidator;
     uint256 public validatorCount;
     uint256 public threshold;
@@ -60,6 +61,13 @@ contract Gate {
         uint256 amount
     );
 
+    // --- governance events (auditability) ---
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event ValidatorSet(address indexed validator, bool active);
+    event ThresholdSet(uint256 threshold);
+    event LocalTokenSet(bytes32 indexed debridgeId, address indexed localToken);
+
     error NotOwner();
     error ZeroAmount();
     error AlreadyExecuted();
@@ -67,6 +75,10 @@ contract Gate {
     error InvalidSignerOrder();
     error UnknownAsset(bytes32 debridgeId);
     error BadReceiver();
+    error ZeroValidator();
+    error ZeroAddress();
+    /// @dev threshold must always satisfy 0 < threshold <= validatorCount
+    error InvalidThreshold(uint256 threshold, uint256 validatorCount);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -75,36 +87,73 @@ contract Gate {
 
     constructor(address[] memory validators, uint256 threshold_) {
         owner = msg.sender;
-        threshold = threshold_;
+        emit OwnershipTransferred(address(0), msg.sender);
+
         for (uint256 i = 0; i < validators.length; i++) {
-            if (!isValidator[validators[i]]) {
-                isValidator[validators[i]] = true;
+            address v = validators[i];
+            if (v == address(0)) revert ZeroValidator();
+            if (!isValidator[v]) {
+                isValidator[v] = true;
                 validatorCount++;
+                emit ValidatorSet(v, true);
             }
         }
+
+        // A zero (or unreachable) threshold is fatal: threshold == 0 would let
+        // claim() pass with NO signatures; threshold > validatorCount freezes funds.
+        if (threshold_ == 0 || threshold_ > validatorCount) {
+            revert InvalidThreshold(threshold_, validatorCount);
+        }
+        threshold = threshold_;
+        emit ThresholdSet(threshold_);
     }
 
     // ---------------------------------------------------------------------
     // Governance
     // ---------------------------------------------------------------------
 
+    /// @notice Begin a two-step ownership handover (the new owner must accept).
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    /// @notice Complete an ownership handover. Two-step so a typo'd address can't
+    ///         brick governance.
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotOwner();
+        emit OwnershipTransferred(owner, pendingOwner);
+        owner = pendingOwner;
+        pendingOwner = address(0);
+    }
+
     function setValidator(address v, bool active) external onlyOwner {
+        if (v == address(0)) revert ZeroValidator();
         if (active && !isValidator[v]) {
             isValidator[v] = true;
             validatorCount++;
         } else if (!active && isValidator[v]) {
             isValidator[v] = false;
             validatorCount--;
+            // never let the active set fall below the threshold (liveness)
+            if (validatorCount < threshold) revert InvalidThreshold(threshold, validatorCount);
+        } else {
+            return; // no-op: no state change, no event
         }
+        emit ValidatorSet(v, active);
     }
 
     function setThreshold(uint256 t) external onlyOwner {
+        if (t == 0 || t > validatorCount) revert InvalidThreshold(t, validatorCount);
         threshold = t;
+        emit ThresholdSet(t);
     }
 
     /// @notice Register the local ERC-20 that backs `debridgeId` on this chain.
     function setLocalToken(bytes32 debridgeId, address localToken) external onlyOwner {
         tokenOf[debridgeId] = localToken;
+        emit LocalTokenSet(debridgeId, localToken);
     }
 
     // ---------------------------------------------------------------------
@@ -115,7 +164,7 @@ contract Gate {
     /// @param token      the ERC-20 to lock on this (source) chain
     /// @param amount     amount to bridge
     /// @param chainIdTo  destination chain id
-    /// @param receiver   destination recipient, abi-packed (20 bytes for EVM)
+    /// @param receiver   destination recipient — exactly 20 bytes (packed EVM address)
     /// @param autoParams empty bytes for none, or abi.encode(AutoParamsTo) for an
     ///                   execution payload
     function send(
@@ -126,8 +175,9 @@ contract Gate {
         bytes calldata autoParams
     ) external returns (bytes32 submissionId) {
         if (amount == 0) revert ZeroAmount();
-
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        // EVM <-> EVM: the recipient must be a bare 20-byte address, else funds
+        // would lock here and be misrouted by _toAddress on the target.
+        if (receiver.length != 20) revert BadReceiver();
 
         uint256 nonce = nonceTo[chainIdTo];
         bytes32 debridgeId = BridgeHash.getDebridgeId(block.chainid, token);
@@ -137,6 +187,11 @@ contract Gate {
             debridgeId, amount, block.chainid, chainIdTo, nonce, receiver, autoParams, nativeSender
         );
 
+        // Effects BEFORE the external transfer (checks-effects-interactions):
+        // reserve the nonce and emit before calling into `token`. Otherwise a
+        // token with a transfer hook could reenter send(), read the same nonce,
+        // and emit a colliding `Sent` — desyncing the off-chain nonce sequence.
+        nonceTo[chainIdTo] = nonce + 1;
         emit Sent(
             submissionId,
             debridgeId,
@@ -149,7 +204,7 @@ contract Gate {
             nativeSender
         );
 
-        nonceTo[chainIdTo] = nonce + 1;
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
     }
 
     // ---------------------------------------------------------------------
