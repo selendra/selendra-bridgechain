@@ -1,15 +1,24 @@
 //! Operator HTTP API (mirrors this repo's `AppController`).
 //!
+//! Single source (back-compat, what phase6.sh drives):
 //!   GET  /status              -> scanner cursor, pause state, nonce map
 //!   POST /pause               -> pause scanning
 //!   POST /resume              -> clear pause
 //!   POST /rescan {from_block} -> reset cursor and re-scan from a block
 //!
-//! State is shared with the scan loop via `Arc<Mutex<Runtime>>`.
+//! Multiple sources: the bare routes still work when exactly one source is
+//! configured; otherwise address a specific chain:
+//!   GET  /status              -> array of every source's status
+//!   GET  /status/{chain_id}
+//!   POST /pause/{chain_id}  /resume/{chain_id}  /rescan/{chain_id}
+//!
+//! Each source's state is shared with its scan loop via `Arc<Mutex<Runtime>>`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -21,9 +30,9 @@ use crate::state::Runtime;
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub runtime: Arc<Mutex<Runtime>>,
+    /// One runtime per watched source chain, keyed by chain_id.
+    pub sources: Arc<BTreeMap<u64, Arc<Mutex<Runtime>>>>,
     pub validator: String,
-    pub chain_id: u64,
 }
 
 #[derive(Serialize)]
@@ -34,7 +43,7 @@ struct StatusResponse {
     pause_reason: Option<String>,
     last_block: u64,
     next_block: u64,
-    nonces: std::collections::BTreeMap<u64, u64>,
+    nonces: BTreeMap<u64, u64>,
 }
 
 #[derive(Deserialize)]
@@ -44,10 +53,14 @@ struct RescanRequest {
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
-        .route("/status", get(status))
-        .route("/pause", post(pause))
-        .route("/resume", post(resume))
-        .route("/rescan", post(rescan))
+        .route("/status", get(status_all))
+        .route("/status/:chain_id", get(status_one))
+        .route("/pause", post(pause_bare))
+        .route("/pause/:chain_id", post(pause_one))
+        .route("/resume", post(resume_bare))
+        .route("/resume/:chain_id", post(resume_one))
+        .route("/rescan", post(rescan_bare))
+        .route("/rescan/:chain_id", post(rescan_one))
         .with_state(state)
 }
 
@@ -59,38 +72,126 @@ pub async fn serve(bind: &str, state: ApiState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn status(State(s): State<ApiState>) -> Json<StatusResponse> {
-    let rt = s.runtime.lock().await;
-    Json(StatusResponse {
-        validator: s.validator.clone(),
-        chain_id: s.chain_id,
+/// The single configured chain_id, or an error if there are several (used to make
+/// the bare routes unambiguous in the back-compat single-source case).
+fn only_chain(s: &ApiState) -> Result<u64, (StatusCode, Json<Value>)> {
+    if s.sources.len() == 1 {
+        Ok(*s.sources.keys().next().unwrap())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "multiple sources configured; address one with /{action}/{chain_id}",
+                "chains": s.sources.keys().copied().collect::<Vec<_>>(),
+            })),
+        ))
+    }
+}
+
+fn runtime_of<'a>(
+    s: &'a ApiState,
+    chain_id: u64,
+) -> Result<&'a Arc<Mutex<Runtime>>, (StatusCode, Json<Value>)> {
+    s.sources.get(&chain_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("no source for chain_id {chain_id}") })),
+        )
+    })
+}
+
+async fn status_for(validator: &str, chain_id: u64, rt: &Arc<Mutex<Runtime>>) -> StatusResponse {
+    let rt = rt.lock().await;
+    StatusResponse {
+        validator: validator.to_string(),
+        chain_id,
         paused: rt.paused,
         pause_reason: rt.pause_reason.as_ref().map(|r| r.as_str()),
         last_block: rt.persist.last_block,
         next_block: rt.next_block(),
         nonces: rt.persist.nonces.clone(),
-    })
+    }
 }
 
-async fn pause(State(s): State<ApiState>) -> Json<Value> {
-    let mut rt = s.runtime.lock().await;
-    rt.pause(crate::state::PauseReason::Operator);
-    info!("scanner paused via operator API");
-    Json(json!({ "ok": true, "paused": true }))
+/// One source -> the legacy single object (keeps phase6.sh working). Several ->
+/// an array, one entry per chain.
+async fn status_all(State(s): State<ApiState>) -> Json<Value> {
+    if s.sources.len() == 1 {
+        let (cid, rt) = s.sources.iter().next().unwrap();
+        return Json(json!(status_for(&s.validator, *cid, rt).await));
+    }
+    let mut out = Vec::with_capacity(s.sources.len());
+    for (cid, rt) in s.sources.iter() {
+        out.push(status_for(&s.validator, *cid, rt).await);
+    }
+    Json(json!(out))
 }
 
-async fn resume(State(s): State<ApiState>) -> Json<Value> {
-    let mut rt = s.runtime.lock().await;
-    rt.resume();
-    let _ = rt.save();
-    info!("scanner resumed via operator API");
-    Json(json!({ "ok": true, "paused": false }))
+async fn status_one(
+    State(s): State<ApiState>,
+    Path(chain_id): Path<u64>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<Value>)> {
+    let rt = runtime_of(&s, chain_id)?;
+    Ok(Json(status_for(&s.validator, chain_id, rt).await))
 }
 
-async fn rescan(State(s): State<ApiState>, Json(req): Json<RescanRequest>) -> Json<Value> {
-    let mut rt = s.runtime.lock().await;
-    rt.rescan_from(req.from_block);
-    let _ = rt.save();
-    info!(from_block = req.from_block, "rescan requested via operator API");
-    Json(json!({ "ok": true, "rescan_from": req.from_block, "next_block": rt.next_block() }))
+async fn pause_one(
+    State(s): State<ApiState>,
+    Path(chain_id): Path<u64>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rt = runtime_of(&s, chain_id)?;
+    rt.lock().await.pause(crate::state::PauseReason::Operator);
+    info!(chain_id, "scanner paused via operator API");
+    Ok(Json(json!({ "ok": true, "chain_id": chain_id, "paused": true })))
+}
+
+async fn pause_bare(State(s): State<ApiState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cid = only_chain(&s)?;
+    pause_one(State(s), Path(cid)).await
+}
+
+async fn resume_one(
+    State(s): State<ApiState>,
+    Path(chain_id): Path<u64>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rt = runtime_of(&s, chain_id)?;
+    {
+        let mut rt = rt.lock().await;
+        rt.resume();
+        let _ = rt.save();
+    }
+    info!(chain_id, "scanner resumed via operator API");
+    Ok(Json(json!({ "ok": true, "chain_id": chain_id, "paused": false })))
+}
+
+async fn resume_bare(State(s): State<ApiState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cid = only_chain(&s)?;
+    resume_one(State(s), Path(cid)).await
+}
+
+async fn rescan_one(
+    State(s): State<ApiState>,
+    Path(chain_id): Path<u64>,
+    Json(req): Json<RescanRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rt = runtime_of(&s, chain_id)?;
+    let next_block = {
+        let mut rt = rt.lock().await;
+        rt.rescan_from(req.from_block);
+        let _ = rt.save();
+        rt.next_block()
+    };
+    info!(chain_id, from_block = req.from_block, "rescan requested via operator API");
+    Ok(Json(
+        json!({ "ok": true, "chain_id": chain_id, "rescan_from": req.from_block, "next_block": next_block }),
+    ))
+}
+
+async fn rescan_bare(
+    State(s): State<ApiState>,
+    body: Json<RescanRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cid = only_chain(&s)?;
+    rescan_one(State(s), Path(cid), body).await
 }

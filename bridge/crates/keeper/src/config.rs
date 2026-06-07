@@ -2,7 +2,13 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub target: TargetChain,
+    /// Legacy single-target form: `[target]`. Folded into `targets` on load.
+    #[serde(default)]
+    pub target: Option<TargetChain>,
+    /// Multi-target form: one `[[targets]]` block per destination chain the
+    /// keeper should deliver claims to (e.g. chainB *and* chainC).
+    #[serde(default)]
+    pub targets: Vec<TargetChain>,
     pub keeper: Keeper,
     pub store: Store,
 }
@@ -40,6 +46,28 @@ impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {path}: {e}"))?;
-        Ok(toml::from_str(&raw)?)
+        let mut cfg: Config = toml::from_str(&raw)?;
+
+        // Backward compatibility: a single `[target]` is just a one-element list.
+        if let Some(t) = cfg.target.take() {
+            cfg.targets.insert(0, t);
+        }
+        if cfg.targets.is_empty() {
+            anyhow::bail!("config needs at least one [[targets]] block (or a legacy [target])");
+        }
+
+        // Guard against two blocks claiming the same destination chain.
+        for i in 0..cfg.targets.len() {
+            for j in (i + 1)..cfg.targets.len() {
+                if cfg.targets[i].chain_id == cfg.targets[j].chain_id {
+                    anyhow::bail!(
+                        "duplicate target chain_id {} in config",
+                        cfg.targets[i].chain_id
+                    );
+                }
+            }
+        }
+
+        Ok(cfg)
     }
 }
