@@ -17,6 +17,7 @@ mod provider;
 mod sink;
 mod state;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +31,7 @@ use anyhow::Context;
 use bridge_core::abi::{AutoParamsTo, Gate};
 use bridge_core::store::{SignerSig, SubmissionRecord};
 use bridge_core::{AutoParams, Submission};
-use config::Config;
+use config::{Config, SourceChain};
 use sink::Sink;
 use state::{NonceDecision, PauseReason, Runtime};
 use tokio::sync::Mutex;
@@ -50,24 +51,30 @@ async fn main() -> anyhow::Result<()> {
 
     let signer: PrivateKeySigner = cfg.signer.private_key.parse().context("bad private_key")?;
     let signer_addr = signer.address();
-    let gate: Address = cfg.source.gate.parse().context("bad gate address")?;
-    let sink = Sink::from_config(&cfg.store)?;
+    // One sink, shared across every per-source scan loop.
+    let sink = Arc::new(Sink::from_config(&cfg.store)?);
 
-    // Multi-RPC failover, with a chainId guard per endpoint.
-    let endpoints = cfg.source.endpoints()?;
-    let mut failover = provider::Failover::connect(&endpoints, cfg.source.chain_id)
-        .await
-        .context("connecting RPC endpoints")?;
+    info!(
+        validator = %signer_addr,
+        sources = cfg.sources.len(),
+        sink = %sink.describe(),
+        "validator started"
+    );
 
-    // Resumable cursor + nonce state, shared with the operator API.
-    let state_path = PathBuf::from(&cfg.source.state_file);
-    let runtime = Arc::new(Mutex::new(Runtime::load_or_init(&state_path, cfg.source.start_block)?));
+    // Build a runtime per source up front so the operator API can address each by
+    // chain_id, then spawn one scan loop per source sharing those runtimes.
+    let mut runtimes: BTreeMap<u64, Arc<Mutex<Runtime>>> = BTreeMap::new();
+    for source in &cfg.sources {
+        let state_path = PathBuf::from(&source.state_file);
+        let runtime = Arc::new(Mutex::new(Runtime::load_or_init(&state_path, source.start_block)?));
+        runtimes.insert(source.chain_id, runtime);
+    }
+    let runtimes = Arc::new(runtimes);
 
     if let Some(api) = &cfg.api {
         let api_state = api::ApiState {
-            runtime: runtime.clone(),
+            sources: runtimes.clone(),
             validator: format!("{signer_addr:#x}"),
-            chain_id: cfg.source.chain_id,
         };
         let bind = api.bind.clone();
         tokio::spawn(async move {
@@ -77,15 +84,61 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let mut tasks = tokio::task::JoinSet::new();
+    for source in cfg.sources {
+        let signer = signer.clone();
+        let sink = sink.clone();
+        let runtime = runtimes.get(&source.chain_id).unwrap().clone();
+        tasks.spawn(async move { scan_source(source, signer, signer_addr, sink, runtime).await });
+    }
+
+    // Isolate a dead source loop so one bad chain can't stop the validator from
+    // signing transfers on the others. Only error out once every loop has exited.
+    let total = tasks.len();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => warn!("a source scan loop exited on its own (other chains keep running)"),
+            Ok(Err(e)) => warn!(error = %e, "a source scan loop failed (other chains keep running)"),
+            Err(e) => warn!(error = %e, "a source task panicked (other chains keep running)"),
+        }
+    }
+    anyhow::bail!("all {total} source scan loops have exited");
+}
+
+/// Scan one source chain forever: poll for `Sent`, verify, sign, store.
+async fn scan_source(
+    source: SourceChain,
+    signer: PrivateKeySigner,
+    signer_addr: Address,
+    sink: Arc<Sink>,
+    runtime: Arc<Mutex<Runtime>>,
+) -> anyhow::Result<()> {
+    let gate: Address = source.gate.parse().context("bad gate address")?;
+    let retry = Duration::from_millis(source.poll_interval_ms.max(1000));
+
+    // Multi-RPC failover, with a chainId guard per endpoint. Connecting can fail
+    // if every endpoint is momentarily down/wrong-chain; retry rather than kill
+    // this loop (and, with the isolation in main, never the sibling chains).
+    let endpoints = source.endpoints()?;
+    let mut failover = loop {
+        match provider::Failover::connect(&endpoints, source.chain_id).await {
+            Ok(f) => break f,
+            Err(e) => {
+                warn!(chain_id = source.chain_id, error = %e, "connecting RPC endpoints failed; retrying");
+                tokio::time::sleep(retry).await;
+            }
+        }
+    };
+
+    let resume_from = runtime.lock().await.next_block();
     info!(
         validator = %signer_addr,
         gate = %gate,
-        chain_id = cfg.source.chain_id,
+        chain_id = source.chain_id,
         rpc = %failover.active_url(),
         endpoints = endpoints.len(),
-        sink = %sink.describe(),
-        resume_from = { runtime.lock().await.next_block() },
-        "validator started"
+        resume_from,
+        "source scan loop started"
     );
 
     let sent_sig = Gate::Sent::SIGNATURE_HASH;
@@ -97,18 +150,27 @@ async fn main() -> anyhow::Result<()> {
             if rt.paused {
                 let reason = rt.pause_reason.as_ref().map(|r| r.as_str()).unwrap_or_default();
                 drop(rt);
-                warn!(%reason, "scanner PAUSED — not processing (resume via operator API)");
-                tokio::time::sleep(Duration::from_millis(cfg.source.poll_interval_ms.max(1000))).await;
+                warn!(chain_id = source.chain_id, %reason, "scanner PAUSED — not processing (resume via operator API)");
+                tokio::time::sleep(Duration::from_millis(source.poll_interval_ms.max(1000))).await;
                 continue;
             }
         }
 
         let from_block = runtime.lock().await.next_block();
-        let latest = failover.get_block_number().await.context("get_block_number")?;
-        let confirmed = latest.saturating_sub(cfg.source.block_confirmation);
+        // Transient RPC failures must not kill the loop (which, pre-fix, also took
+        // down every sibling chain). Log, back off, and try again next tick.
+        let latest = match failover.get_block_number().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(chain_id = source.chain_id, error = %e, "get_block_number failed; retrying");
+                tokio::time::sleep(retry).await;
+                continue;
+            }
+        };
+        let confirmed = latest.saturating_sub(source.block_confirmation);
 
         if confirmed >= from_block {
-            let to_block = confirmed.min(from_block + cfg.source.max_block_range - 1);
+            let to_block = confirmed.min(from_block + source.max_block_range - 1);
 
             let filter = Filter::new()
                 .address(gate)
@@ -116,7 +178,14 @@ async fn main() -> anyhow::Result<()> {
                 .from_block(from_block)
                 .to_block(to_block);
 
-            let mut logs = failover.get_logs(&filter).await.context("get_logs")?;
+            let mut logs = match failover.get_logs(&filter).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(chain_id = source.chain_id, error = %e, "get_logs failed; retrying");
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
+            };
             // Process in chain order so nonce sequencing is meaningful.
             logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
 
@@ -129,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
                         paused = true;
                         break;
                     }
-                    Err(e) => warn!(error = %e, "failed handling log"),
+                    Err(e) => warn!(chain_id = source.chain_id, error = %e, "failed handling log"),
                 }
             }
 
@@ -138,12 +207,12 @@ async fn main() -> anyhow::Result<()> {
                 let mut rt = runtime.lock().await;
                 rt.persist.last_block = to_block;
                 if let Err(e) = rt.save() {
-                    warn!(error = %e, "failed to persist cursor");
+                    warn!(chain_id = source.chain_id, error = %e, "failed to persist cursor");
                 }
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(cfg.source.poll_interval_ms)).await;
+        tokio::time::sleep(Duration::from_millis(source.poll_interval_ms)).await;
     }
 }
 

@@ -1,0 +1,69 @@
+//! Optional on-chain execution lookups for destination gates.
+//!
+//! The signature store only knows what validators have *signed*; it cannot say
+//! whether the keeper has actually delivered a transfer. Given a destination
+//! `chainId -> (rpc, gate)` mapping, this asks the gate's `executed(submissionId)`
+//! so the API can distinguish "enough signatures" (READY) from "claimed on-chain"
+//! (EXECUTED). Chains the API wasn't configured with simply report `null`.
+
+use std::collections::BTreeMap;
+use std::str::FromStr;
+
+use alloy::primitives::{Address, B256};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use anyhow::Context;
+use bridge_core::abi::Gate;
+
+/// Destination gates the API can read execution status from. Cheap to clone
+/// (each `DynProvider` is an `Arc` internally); share freely across resolvers.
+#[derive(Clone, Default)]
+pub struct Chains {
+    gates: BTreeMap<u64, (DynProvider, Address)>,
+}
+
+impl Chains {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a destination from a `CHAINID=RPC,GATE` spec, e.g.
+    /// `1338=http://127.0.0.1:8546,0xabc...`. The HTTP provider is built eagerly
+    /// (no network I/O yet); the first `executed()` call is what hits the chain.
+    pub fn add_spec(&mut self, spec: &str) -> anyhow::Result<u64> {
+        let (id_s, rest) = spec
+            .split_once('=')
+            .with_context(|| format!("--gate must be CHAINID=RPC,GATE, got {spec:?}"))?;
+        let (rpc, gate_s) = rest
+            .split_once(',')
+            .with_context(|| format!("--gate must be CHAINID=RPC,GATE, got {spec:?}"))?;
+        let chain_id: u64 = id_s
+            .trim()
+            .parse()
+            .with_context(|| format!("bad chainId in --gate {spec:?}"))?;
+        let gate: Address = gate_s
+            .trim()
+            .parse()
+            .with_context(|| format!("bad gate address in --gate {spec:?}"))?;
+        let url = rpc
+            .trim()
+            .parse()
+            .with_context(|| format!("bad rpc url in --gate {spec:?}"))?;
+        let provider = ProviderBuilder::new().connect_http(url).erased();
+        self.gates.insert(chain_id, (provider, gate));
+        Ok(chain_id)
+    }
+
+    /// The destination chainIds this API can report execution status for.
+    pub fn configured(&self) -> Vec<u64> {
+        self.gates.keys().copied().collect()
+    }
+
+    /// `executed(submissionId)` on the destination gate. `None` when `chain_id_to`
+    /// isn't configured, the id is malformed, or the RPC call fails — a flaky RPC
+    /// must never fail the whole GraphQL query, only leave status unknown.
+    pub async fn executed(&self, chain_id_to: u64, submission_id: &str) -> Option<bool> {
+        let (provider, gate) = self.gates.get(&chain_id_to)?;
+        let id = B256::from_str(submission_id).ok()?;
+        Gate::new(*gate, provider).executed(id).call().await.ok()
+    }
+}

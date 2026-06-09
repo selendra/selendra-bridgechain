@@ -1,13 +1,16 @@
 //! Minimal keeper / executor (Phase 5).
 //!
-//! Loop: read the signature store, and for every record destined for our target
-//! chain that has >= threshold signatures and isn't yet executed, build and
-//! submit `claim()` (signatures sorted by signer ascending, as the Gate requires).
+//! One claim loop *per configured target chain*: read the signature store, and
+//! for every record destined for that chain that has >= threshold signatures and
+//! isn't yet executed, build and submit `claim()` (signatures sorted by signer
+//! ascending, as the Gate requires). Configuring several `[[targets]]` lets a
+//! single keeper deliver A->B and A->C transfers from the same source.
 
 mod config;
 mod source;
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::network::EthereumWallet;
@@ -17,7 +20,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use bridge_core::abi::Gate;
 use bridge_core::store::SubmissionRecord;
-use config::Config;
+use config::{Config, TargetChain};
 use source::Source;
 use tracing::{info, warn};
 
@@ -34,47 +37,107 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::load(&cfg_path)?;
 
     let signer: PrivateKeySigner = cfg.keeper.private_key.parse().context("bad private_key")?;
+    // Shared across every per-target loop (one HTTP client / one dir handle).
+    let source = Arc::new(Source::from_config(&cfg.store)?);
+
+    info!(
+        keeper = %signer.address(),
+        targets = cfg.targets.len(),
+        source = %source.describe(),
+        "keeper started"
+    );
+
+    // Spawn one independent claim loop per destination chain. A loop only returns
+    // on a permanent misconfig (e.g. wrong chainId); transient RPC failures are
+    // retried inside it. We isolate a dead loop so one bad chain can't take down
+    // delivery to the others — only when EVERY loop has exited do we error out.
+    let mut tasks = tokio::task::JoinSet::new();
+    for target in cfg.targets {
+        let signer = signer.clone();
+        let source = source.clone();
+        tasks.spawn(async move { run_target(target, signer, source).await });
+    }
+
+    let total = tasks.len();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => warn!("a target loop exited on its own (other chains keep running)"),
+            Ok(Err(e)) => warn!(error = %e, "a target loop failed (other chains keep running)"),
+            Err(e) => warn!(error = %e, "a target task panicked (other chains keep running)"),
+        }
+    }
+    anyhow::bail!("all {total} target loops have exited");
+}
+
+/// Claim loop for a single destination chain.
+async fn run_target(
+    target: TargetChain,
+    signer: PrivateKeySigner,
+    source: Arc<Source>,
+) -> anyhow::Result<()> {
     let wallet = EthereumWallet::from(signer.clone());
-    let gate_addr: Address = cfg.target.gate.parse().context("bad gate address")?;
-    let source = Source::from_config(&cfg.store)?;
+    let gate_addr: Address = target.gate.parse().context("bad gate address")?;
+    let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
 
     let provider = ProviderBuilder::new()
         .wallet(wallet)
-        .connect_http(cfg.target.rpc.parse()?);
+        .connect_http(target.rpc.parse()?);
 
-    let rpc_chain_id = provider.get_chain_id().await.context("get_chain_id")?;
-    anyhow::ensure!(
-        rpc_chain_id == cfg.target.chain_id,
-        "RPC chainId {rpc_chain_id} != configured {}",
-        cfg.target.chain_id
-    );
+    // Verify the RPC is on the expected chain. Unreachable => transient, retry.
+    // Wrong chainId => permanent misconfig, return Err (isolated; siblings live).
+    loop {
+        match provider.get_chain_id().await {
+            Ok(id) if id == target.chain_id => break,
+            Ok(id) => anyhow::bail!(
+                "RPC chainId {id} != configured {} for {}",
+                target.chain_id,
+                target.rpc
+            ),
+            Err(e) => {
+                warn!(chain_id = target.chain_id, error = %e, "get_chain_id failed; retrying");
+                tokio::time::sleep(retry).await;
+            }
+        }
+    }
 
     let gate = Gate::new(gate_addr, &provider);
-    let threshold: u64 = gate.threshold().call().await.context("read threshold")?.try_into().unwrap_or(u64::MAX);
+    let threshold: u64 = loop {
+        match gate.threshold().call().await {
+            Ok(t) => break t.try_into().unwrap_or(u64::MAX),
+            Err(e) => {
+                warn!(chain_id = target.chain_id, error = %e, "read threshold failed; retrying");
+                tokio::time::sleep(retry).await;
+            }
+        }
+    };
 
     info!(
         keeper = %signer.address(),
         gate = %gate_addr,
-        chain_id = cfg.target.chain_id,
+        chain_id = target.chain_id,
         threshold,
-        source = %source.describe(),
-        "keeper started"
+        "target loop started"
     );
 
     loop {
         let records = source.load_all().await.unwrap_or_default();
         for rec in records {
-            if rec.chain_id_to != cfg.target.chain_id {
+            if rec.chain_id_to != target.chain_id {
                 continue;
             }
             if (rec.signatures.len() as u64) < threshold {
                 continue;
             }
             if let Err(e) = try_claim(&gate, &rec).await {
-                warn!(submission_id = %rec.submission_id, error = %e, "claim failed");
+                warn!(
+                    chain_id = target.chain_id,
+                    submission_id = %rec.submission_id,
+                    error = %e,
+                    "claim failed"
+                );
             }
         }
-        tokio::time::sleep(Duration::from_millis(cfg.target.poll_interval_ms)).await;
+        tokio::time::sleep(Duration::from_millis(target.poll_interval_ms)).await;
     }
 }
 

@@ -75,6 +75,19 @@ pub enum StoreError {
     SignerMismatch { claimed: String, recovered: String },
 }
 
+/// True iff `s` is a well-formed submissionId: an optional `0x` followed by
+/// exactly 64 hex digits (a 32-byte hash).
+///
+/// **Security:** the submissionId is used to build a filesystem path
+/// (`file_path`) and a sig-store URL (`remote`). Both `load` and
+/// `upsert_signature` guard with this *before* touching the filesystem, so an
+/// untrusted id like `../../etc/foo` can never escape the store directory (path
+/// traversal). Callers that forward ids to a remote store should guard too.
+pub fn is_valid_submission_id(s: &str) -> bool {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn file_path(dir: &Path, submission_id: &str) -> PathBuf {
     let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
     dir.join(format!("{id}.json"))
@@ -182,6 +195,12 @@ pub fn upsert_signature(
     mut record: SubmissionRecord,
     sig: SignerSig,
 ) -> Result<SubmissionRecord, StoreError> {
+    // Guard the id BEFORE it becomes a file path (path-traversal defense). With
+    // the `abi` feature the canonical-id check below would also catch a non-hash
+    // id, but this protects the non-abi build and fails fast with a clear error.
+    if !is_valid_submission_id(&record.submission_id) {
+        return Err(StoreError::BadField("submission_id"));
+    }
     ensure_dir(dir)?;
 
     // (1) Bind id <-> params, and (3) authenticate the incoming signature.
@@ -226,6 +245,11 @@ pub fn upsert_signature(
 
 /// Load a single record by submissionId, if present.
 pub fn load(dir: &Path, submission_id: &str) -> Result<Option<SubmissionRecord>, StoreError> {
+    // A malformed id can't name a real record; reject it before it ever becomes a
+    // file path, so `../foo`-style ids can't read outside the store (traversal).
+    if !is_valid_submission_id(submission_id) {
+        return Ok(None);
+    }
     let path = file_path(dir, submission_id);
     if !path.exists() {
         return Ok(None);

@@ -7,6 +7,8 @@ use bridge_core::store::{self, SubmissionRecord};
 
 use crate::config::Store;
 
+/// A read source for signature records. Cheap to share across the per-target
+/// claim loops (wrap in an `Arc`); `RemoteStore` holds a reusable HTTP client.
 pub enum Source {
     File(PathBuf),
     Remote(RemoteStore),

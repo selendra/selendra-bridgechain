@@ -5,6 +5,7 @@ members = [
     "crates/validator",
     "crates/keeper",
     "crates/sig-store",
+    "crates/graphql-api",
 ]
 
 [workspace.package]

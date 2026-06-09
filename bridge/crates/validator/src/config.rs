@@ -2,7 +2,13 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub source: SourceChain,
+    /// Legacy single-source form: `[source]`. Folded into `sources` on load.
+    #[serde(default)]
+    pub source: Option<SourceChain>,
+    /// Multi-source form: one `[[sources]]` block per chain to watch, so a single
+    /// validator process can sign transfers originating on B *and* C.
+    #[serde(default)]
+    pub sources: Vec<SourceChain>,
     pub signer: Signer,
     pub store: Store,
     /// Optional operator HTTP API (pause/resume/rescan/status).
@@ -84,7 +90,34 @@ impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {path}: {e}"))?;
-        let cfg: Config = toml::from_str(&raw)?;
+        let mut cfg: Config = toml::from_str(&raw)?;
+
+        // Backward compatibility: a single `[source]` is a one-element list.
+        if let Some(s) = cfg.source.take() {
+            cfg.sources.insert(0, s);
+        }
+        if cfg.sources.is_empty() {
+            anyhow::bail!("config needs at least one [[sources]] block (or a legacy [source])");
+        }
+
+        // Each source must be a distinct chain and own a distinct state file,
+        // otherwise two scan loops would clobber each other's cursor.
+        for i in 0..cfg.sources.len() {
+            for j in (i + 1)..cfg.sources.len() {
+                if cfg.sources[i].chain_id == cfg.sources[j].chain_id {
+                    anyhow::bail!("duplicate source chain_id {} in config", cfg.sources[i].chain_id);
+                }
+                if cfg.sources[i].state_file == cfg.sources[j].state_file {
+                    anyhow::bail!(
+                        "sources for chains {} and {} share state_file {:?}; give each its own",
+                        cfg.sources[i].chain_id,
+                        cfg.sources[j].chain_id,
+                        cfg.sources[i].state_file
+                    );
+                }
+            }
+        }
+
         Ok(cfg)
     }
 }
