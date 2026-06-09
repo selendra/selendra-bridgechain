@@ -10,14 +10,18 @@ contracts/broadcast
 /sig-store-data
 /sig-store-data-p6
 /sig-store-data-p7
+/sig-store-data-gql
 /.e2e-logs
 /validator.toml
 /validator-p6.toml
 /val1-p7.toml
 /val2-p7.toml
 /val3-p7.toml
+/val1-gql.toml
+/val2-gql.toml
 /keeper.toml
 /keeper-p7.toml
+/keeper-gql.toml
 /validator-state.json
 *.json.tmp
 

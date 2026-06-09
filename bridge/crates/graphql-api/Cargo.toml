@@ -1,0 +1,22 @@
+[package]
+name = "graphql-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `abi` lets a dir-backed mutation reuse the store trust boundary (id<->params +
+# signature auth); `http` lets us front the remote sig-store instead of a dir.
+bridge-core = { workspace = true, features = ["abi", "http"] }
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+async-graphql = "7"
+async-graphql-axum = "7"
