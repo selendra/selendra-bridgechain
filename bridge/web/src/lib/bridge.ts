@@ -7,6 +7,7 @@ import {
   type ContractRunner,
   type ContractTransactionResponse,
   JsonRpcProvider,
+  formatUnits,
   getAddress,
   hexlify,
   parseUnits,
@@ -22,6 +23,7 @@ interface Erc20 {
   balanceOf(owner: string): Promise<bigint>;
   allowance(owner: string, spender: string): Promise<bigint>;
   approve(spender: string, amount: bigint): Promise<ContractTransactionResponse>;
+  mint(to: string, amount: bigint): Promise<ContractTransactionResponse>;
 }
 
 interface GateContract {
@@ -55,6 +57,8 @@ export const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
   "function allowance(address owner, address spender) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
+  // present on the local TestToken (permissionless) — used by the faucet button
+  "function mint(address to, uint256 amount)",
 ];
 
 export interface SendParams {
@@ -87,6 +91,20 @@ export interface TokenMeta {
   balance: bigint;
 }
 
+async function readTokenWith(
+  runner: ContractRunner,
+  token: string,
+  account: string,
+): Promise<TokenMeta> {
+  const erc20 = erc20At(token, runner);
+  const [decimals, symbol, balance] = await Promise.all([
+    erc20.decimals(),
+    erc20.symbol().catch(() => "TOKEN"),
+    erc20.balanceOf(account),
+  ]);
+  return { decimals: Number(decimals), symbol, balance };
+}
+
 /** Read decimals/symbol/balance for the connected account, off the wallet
  *  provider (the wallet is on the source chain when bridging). */
 export async function readToken(
@@ -94,13 +112,41 @@ export async function readToken(
   token: string,
   account: string,
 ): Promise<TokenMeta> {
-  const erc20 = erc20At(token, provider);
-  const [decimals, symbol, balance] = await Promise.all([
-    erc20.decimals(),
-    erc20.symbol().catch(() => "TOKEN"),
-    erc20.balanceOf(account),
-  ]);
-  return { decimals: Number(decimals), symbol, balance };
+  return readTokenWith(provider, token, account);
+}
+
+/** Read a balance straight from a chain's RPC — independent of the wallet's
+ *  selected network or MetaMask's (often stale) cached token balance. Used to
+ *  show the receiver's real balance on the DESTINATION chain after a bridge. */
+export async function readBalanceAt(
+  rpcUrl: string,
+  token: string,
+  account: string,
+): Promise<TokenMeta> {
+  return readTokenWith(new JsonRpcProvider(rpcUrl), token, account);
+}
+
+/** Format a raw token amount for display, trimming trailing zeros. */
+export function formatTokenAmount(raw: bigint, decimals: number): string {
+  const s = formatUnits(raw, decimals);
+  return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
+}
+
+/** Mint `amount` (human units) of the local TestToken to `to`. Only works on
+ *  the permissionless TestToken used for local testing. */
+export async function mintTokens(
+  provider: BrowserProvider,
+  token: string,
+  to: string,
+  amount: string,
+): Promise<string> {
+  const signer = await provider.getSigner();
+  const erc20 = erc20At(token, signer);
+  const decimals = Number(await erc20.decimals());
+  const raw = parseUnits(amount.trim(), decimals);
+  const tx = await erc20.mint(getAddress(to), raw);
+  await tx.wait();
+  return tx.hash;
 }
 
 export type SendProgress = (stage: "approving" | "sending" | "confirming") => void;
@@ -130,7 +176,9 @@ export async function bridgeSend(
   const balance = await erc20.balanceOf(account);
   if (balance < rawAmount) {
     throw new Error(
-      `Insufficient ${symbol}: balance is ${balance} but ${rawAmount} required (raw units).`,
+      `Insufficient ${symbol}: you have ${formatUnits(balance, decimals)} but need ` +
+        `${params.amount.trim()}. Use “Mint test tokens” to fund this account, or ` +
+        `switch to one that holds ${symbol}.`,
     );
   }
 

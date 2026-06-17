@@ -6,8 +6,18 @@ import {
   loadChains,
   saveChains,
 } from "../lib/chains";
-import { bridgeSend, type SendResult } from "../lib/bridge";
+import {
+  bridgeSend,
+  formatTokenAmount,
+  mintTokens,
+  readBalanceAt,
+  readToken,
+  type SendResult,
+  type TokenMeta,
+} from "../lib/bridge";
 import { shortHex } from "../lib/format";
+
+const FAUCET_AMOUNT = "1000";
 
 type Stage = "idle" | "approving" | "sending" | "confirming" | "done" | "error";
 
@@ -34,6 +44,50 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
   const [stage, setStage] = useState<Stage>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SendResult | null>(null);
+  const [meta, setMeta] = useState<TokenMeta | null>(null);
+  const [minting, setMinting] = useState(false);
+  const [destNote, setDestNote] = useState<string | null>(null);
+
+  // Load the connected account's balance/symbol for the chosen token.
+  // Prefer the configured chain RPC over the wallet provider: MetaMask serves
+  // stale/cached ERC-20 balances on local chains, which made this read wrong.
+  const tokenAddr = token.trim();
+  async function refreshBalance() {
+    if (!wallet.account || tokenAddr === "") {
+      setMeta(null);
+      return;
+    }
+    try {
+      if (sourceChain?.rpcUrl) {
+        setMeta(await readBalanceAt(sourceChain.rpcUrl, tokenAddr, wallet.account));
+      } else if (wallet.provider) {
+        setMeta(await readToken(wallet.provider, tokenAddr, wallet.account));
+      } else {
+        setMeta(null);
+      }
+    } catch {
+      setMeta(null); // not a valid token address (yet)
+    }
+  }
+  useEffect(() => {
+    void refreshBalance();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokenAddr, wallet.account, wallet.chainId]);
+
+  async function handleMint() {
+    if (!wallet.provider || !wallet.account || tokenAddr === "") return;
+    setError(null);
+    setMinting(true);
+    try {
+      await mintTokens(wallet.provider, tokenAddr, wallet.account, FAUCET_AMOUNT);
+      await refreshBalance();
+    } catch (e) {
+      const msg = (e as { shortMessage?: string })?.shortMessage;
+      setError(msg ?? (e instanceof Error ? e.message : "Mint failed (is this the local TestToken?)."));
+    } finally {
+      setMinting(false);
+    }
+  }
 
   // Prefill gate/token from the registry when the wallet's chain changes.
   useEffect(() => {
@@ -51,10 +105,14 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
     () => chains.filter((c) => c.chainId !== wallet.chainId),
     [chains, wallet.chainId],
   );
+  // Keep the destination valid: never equal to the source, always a configured
+  // chain. Re-runs when the source network changes (e.g. user switches "From").
   useEffect(() => {
-    if (chainIdTo === "" && destOptions[0]) setChainIdTo(destOptions[0].chainId);
+    const valid = chainIdTo !== "" && destOptions.some((c) => c.chainId === chainIdTo);
+    if (!valid) setChainIdTo(destOptions[0]?.chainId ?? "");
   }, [destOptions, chainIdTo]);
 
+  const sameChain = chainIdTo !== "" && chainIdTo === wallet.chainId;
   const busy = stage === "approving" || stage === "sending" || stage === "confirming";
   const canSubmit =
     !!wallet.account &&
@@ -63,11 +121,16 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
     token.trim() !== "" &&
     amount.trim() !== "" &&
     chainIdTo !== "" &&
+    !sameChain &&
     receiver.trim() !== "" &&
     !busy;
 
   async function handleBridge() {
     if (!wallet.provider || chainIdTo === "") return;
+    if (sameChain) {
+      setError("Source and destination must differ — pick a different destination chain.");
+      return;
+    }
     setError(null);
     setResult(null);
     setStage("sending");
@@ -79,12 +142,50 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
       );
       setResult(res);
       setStage("done");
+      void refreshBalance();
+      void trackDestCredit(receiver, Number(chainIdTo));
       if (res.submissionId) onSent?.(res.submissionId);
     } catch (e) {
       setStage("error");
       const msg = (e as { shortMessage?: string })?.shortMessage;
       setError(msg ?? (e instanceof Error ? e.message : "Bridge transaction failed."));
     }
+  }
+
+  // After a send, read the receiver's balance straight from the DESTINATION
+  // chain's RPC (not via MetaMask, which caches stale balances on local chains)
+  // and poll until the keeper's claim credits it.
+  async function trackDestCredit(receiverAddr: string, destChainId: number) {
+    const dest = findChain(chains, destChainId);
+    if (!dest?.rpcUrl || !dest.token) {
+      setDestNote(null);
+      return;
+    }
+    setDestNote(`Waiting for the keeper to credit ${dest.name}…`);
+    let last: bigint | null = null;
+    for (let i = 0; i < 30; i++) {
+      try {
+        const m = await readBalanceAt(dest.rpcUrl, dest.token, receiverAddr);
+        if (last != null && m.balance > last) {
+          setDestNote(
+            `Receiver now holds ${formatTokenAmount(m.balance, m.decimals)} ${m.symbol} on ${dest.name} (read from chain RPC).`,
+          );
+          return;
+        }
+        last = m.balance;
+        if (i === 0) {
+          setDestNote(
+            `Receiver holds ${formatTokenAmount(m.balance, m.decimals)} ${m.symbol} on ${dest.name}; waiting for the +${amount} credit…`,
+          );
+        }
+      } catch {
+        /* keep polling */
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    setDestNote(
+      `Sent. If your wallet shows no change on ${dest.name}, switch MetaMask to that network and refresh — it caches balances on local chains.`,
+    );
   }
 
   function persistChain(chainId: number, patch: Partial<BridgeChain>) {
@@ -147,8 +248,22 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
       {wallet.account && (
         <div className="bridge-form">
           <label>
-            From
-            <input value={sourceChain ? `${sourceChain.name} (${sourceChain.chainId})` : "—"} readOnly />
+            From (your wallet network)
+            <select
+              value={wallet.chainId ?? ""}
+              onChange={(e) => wallet.switchChain(Number(e.target.value))}
+            >
+              {!sourceChain && (
+                <option value={wallet.chainId ?? ""}>
+                  chain {wallet.chainId ?? "?"} (not configured)
+                </option>
+              )}
+              {chains.map((c) => (
+                <option key={c.chainId} value={c.chainId}>
+                  {c.name} ({c.chainId})
+                </option>
+              ))}
+            </select>
           </label>
 
           <label>
@@ -187,7 +302,25 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
           </label>
 
           <label>
-            Amount
+            <span className="label-row">
+              Amount
+              {meta && (
+                <span className="balance">
+                  balance {formatTokenAmount(meta.balance, meta.decimals)} {meta.symbol}
+                  {meta.balance > 0n && (
+                    <button
+                      type="button"
+                      className="link-btn"
+                      onClick={() =>
+                        setAmount(formatTokenAmount(meta.balance, meta.decimals))
+                      }
+                    >
+                      max
+                    </button>
+                  )}
+                </span>
+              )}
+            </span>
             <input
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
@@ -206,11 +339,36 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
             />
           </label>
 
+          {sameChain && (
+            <p className="zero-hint">
+              Destination equals source ({wallet.chainId}). Pick a different “To”
+              chain — a same-chain transfer is never claimed by the keeper and
+              would stay <b>Ready</b> forever.
+            </p>
+          )}
+
+          {meta && meta.balance === 0n && (
+            <p className="zero-hint">
+              This account holds 0 {meta.symbol} on{" "}
+              {sourceChain?.name ?? `chain ${wallet.chainId}`}. Switch the “From”
+              network to where your tokens are, or click <b>Mint test tokens</b>{" "}
+              (local TestToken only).
+            </p>
+          )}
+
           <div className="bridge-actions">
             <button onClick={handleBridge} disabled={!canSubmit}>
               {busy
                 ? STAGE_LABEL[stage as keyof typeof STAGE_LABEL]
                 : "Approve & bridge"}
+            </button>
+            <button
+              className="btn-ghost"
+              onClick={handleMint}
+              disabled={minting || busy || tokenAddr === ""}
+              title={`Mint ${FAUCET_AMOUNT} test tokens to your account`}
+            >
+              {minting ? "Minting…" : `Mint test tokens`}
             </button>
             {sourceChain && gate.trim() !== "" && (
               <button
@@ -237,6 +395,7 @@ export function BridgePanel({ onSent }: { onSent?: (submissionId: string) => voi
               <> {" · "}approve <code>{shortHex(result.approvalTxHash, 8, 6)}</code></>
             )}
           </div>
+          {destNote && <div className="banner-hint">{destNote}</div>}
         </div>
       )}
 

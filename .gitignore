@@ -22,3 +22,5 @@ debridge_node/bundlr_wallet.json
 .local
 .claude
 target
+sig-*
+.live-*
