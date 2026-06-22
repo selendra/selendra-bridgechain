@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Manage the bridge allowlists (allowed tokens + allowed chain pairs) and read
+# transaction history, all via the sig-store HTTP API. The DB is the source of
+# truth; this is just curl with friendly subcommands.
+#
+# Usage:
+#   scripts/allowlist.sh tokens                              # list allowed tokens
+#   scripts/allowlist.sh add-token <chainId> <token> [sym]   # allow a token
+#   scripts/allowlist.sh del-token <chainId> <token>         # remove a token
+#   scripts/allowlist.sh chains                              # list allowed pairs
+#   scripts/allowlist.sh add-chain <from> <to>               # allow a chain pair
+#   scripts/allowlist.sh del-chain <from> <to>               # remove a chain pair
+#   scripts/allowlist.sh history                             # transaction history
+#   scripts/allowlist.sh seed                                # local-dev defaults
+#
+# Env: SIG_STORE=http://127.0.0.1:8080 (override to point elsewhere).
+set -euo pipefail
+SIG_STORE="${SIG_STORE:-http://127.0.0.1:8080}"
+
+# Deterministic local anvil deploy (account #0 deploys TestToken then Gate).
+TOKEN="${TOKEN:-0x5FbDB2315678afecb367f032d93F642f64180aa3}"
+CHAIN_A="${CHAIN_A:-1337}"
+CHAIN_B="${CHAIN_B:-1338}"
+
+j() { if command -v jq >/dev/null 2>&1; then jq .; else cat; fi; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  tokens)  curl -fsS "$SIG_STORE/allowed/tokens" | j ;;
+  chains)  curl -fsS "$SIG_STORE/allowed/chains" | j ;;
+  history) curl -fsS "$SIG_STORE/history" | j ;;
+
+  add-token)
+    chain="$1"; token="$2"; sym="${3:-}"
+    if [ -n "$sym" ]; then symval="\"$sym\""; else symval=null; fi
+    curl -fsS -X POST "$SIG_STORE/allowed/tokens" -H 'content-type: application/json' \
+      -d "{\"chain_id\":$chain,\"token\":\"$token\",\"symbol\":$symval}" | j ;;
+  del-token)
+    chain="$1"; token="$2"
+    curl -fsS -X DELETE "$SIG_STORE/allowed/tokens/$chain/$token" -o /dev/null -w "%{http_code}\n" ;;
+
+  add-chain)
+    from="$1"; to="$2"
+    curl -fsS -X POST "$SIG_STORE/allowed/chains" -H 'content-type: application/json' \
+      -d "{\"chain_id_from\":$from,\"chain_id_to\":$to}" | j ;;
+  del-chain)
+    from="$1"; to="$2"
+    curl -fsS -X DELETE "$SIG_STORE/allowed/chains/$from/$to" -o /dev/null -w "%{http_code}\n" ;;
+
+  seed)
+    # Whitelist the local TestToken on both chains and both directions.
+    curl -fsS -X POST "$SIG_STORE/allowed/tokens" -H 'content-type: application/json' \
+      -d "{\"chain_id\":$CHAIN_A,\"token\":\"$TOKEN\",\"symbol\":\"TST\"}" >/dev/null
+    curl -fsS -X POST "$SIG_STORE/allowed/tokens" -H 'content-type: application/json' \
+      -d "{\"chain_id\":$CHAIN_B,\"token\":\"$TOKEN\",\"symbol\":\"TST\"}" >/dev/null
+    curl -fsS -X POST "$SIG_STORE/allowed/chains" -H 'content-type: application/json' \
+      -d "{\"chain_id_from\":$CHAIN_A,\"chain_id_to\":$CHAIN_B}" >/dev/null
+    curl -fsS -X POST "$SIG_STORE/allowed/chains" -H 'content-type: application/json' \
+      -d "{\"chain_id_from\":$CHAIN_B,\"chain_id_to\":$CHAIN_A}" >/dev/null
+    echo "seeded: TestToken on $CHAIN_A and $CHAIN_B; chain pairs $CHAIN_A<->$CHAIN_B"
+    curl -fsS "$SIG_STORE/allowed/tokens" | j ;;
+
+  *)
+    echo "usage: $0 {tokens|add-token|del-token|chains|add-chain|del-chain|history|seed}" >&2
+    exit 2 ;;
+esac

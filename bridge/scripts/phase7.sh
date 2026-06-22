@@ -17,11 +17,14 @@ export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACTS="$ROOT/contracts"
-STORE="$ROOT/sig-store-data-p7"
 LOGS="$ROOT/.e2e-logs"
 mkdir -p "$LOGS"
-rm -rf "$STORE"; mkdir -p "$STORE"
 rm -f "$LOGS"/val*-p7-state.json
+
+# Postgres-backed sig-store (the file-per-id store was retired). Runs in Docker.
+PG_NAME=bridge-pg-p7
+PG_PORT=5433
+DATABASE_URL="postgres://bridge:bridge@127.0.0.1:${PG_PORT}/bridge?sslmode=disable"
 
 # anvil default accounts: [0] deployer/sender, [1..3] validators, [4] keeper, [6] receiver
 ACC0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
@@ -46,6 +49,7 @@ cleanup() {
   echo "--- cleaning up ---"
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
   pkill -f "anvil --chain-id" 2>/dev/null || true
+  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -88,9 +92,20 @@ cast send "$TOKEN_SRC" "approve(address,uint256)" "$GATE_SRC" $TWICE --rpc-url $
 cast send "$TOKEN_DST" "mint(address,uint256)" "$GATE_DST" $TWICE --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
-echo "=== starting sig-store ($STORE_URL) ==="
-SIG_STORE_BIND=127.0.0.1:8080 SIG_STORE_DIR="$STORE" "$ROOT/target/debug/sig-store" >"$LOGS/sig-store.log" 2>&1 & track $!
-for i in $(seq 1 40); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
+echo "=== starting Postgres in Docker ($PG_NAME on :$PG_PORT) ==="
+docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+docker run -d --name "$PG_NAME" \
+  -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
+  -p ${PG_PORT}:5432 postgres:16-alpine >/dev/null
+for i in $(seq 1 60); do
+  docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && break
+  sleep 0.5; [[ $i == 60 ]] && fail "Postgres did not become ready"
+done
+echo "✅ Postgres ready"
+
+echo "=== starting Postgres-backed sig-store ($STORE_URL) ==="
+SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" "$ROOT/target/debug/sig-store" >"$LOGS/sig-store.log" 2>&1 & track $!
+for i in $(seq 1 60); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -s "$STORE_URL/health" | grep -q ok || fail "sig-store did not come up"
 echo "✅ sig-store healthy"
 
@@ -143,9 +158,10 @@ send_one() {
     "$TOKEN_SRC" $AMOUNT $DST_CHAIN "$RECEIVER" "0x" \
     --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 }
-# find the store file (== one record) for a given decimal nonce
-file_for_nonce() { grep -l "\"nonce\": $1" "$STORE"/*.json 2>/dev/null | head -1; }
-sig_count() { grep -c '"signer"' "$1" 2>/dev/null || echo 0; }
+# submissionId of the record with the given decimal nonce (via the HTTP API)
+sub_for_nonce() { curl -fsS "$STORE_URL/submissions" | python3 -c "import sys,json;d=json.load(sys.stdin);m=[r for r in d if r['nonce']==$1];print(m[0]['submission_id'] if m else '')"; }
+# signature count for a submissionId
+sig_count_id() { curl -fsS "$STORE_URL/submissions" | python3 -c "import sys,json;d=json.load(sys.stdin);m=[r for r in d if r['submission_id'].lower()=='${1,,}'];print(len(m[0]['signatures']) if m else 0)"; }
 
 echo
 echo "########## CHECK 1: 2-of-3 happy path ##########"
@@ -153,9 +169,10 @@ send_one    # nonce 0
 PAID=0
 for i in $(seq 1 80); do [[ "$(bal "$TOKEN_DST" "$RECEIVER" "$DST_RPC")" == "$AMOUNT" ]] && { PAID=1; break; }; sleep 0.25; done
 [[ "$PAID" == "1" ]] || fail "receiver not paid by threshold-2 claim"
-F0=$(file_for_nonce 0)
-echo "  nonce-0 record has $(sig_count "$F0") signatures (>=2 needed)"
-[[ "$(sig_count "$F0")" -ge 2 ]] || fail "expected >=2 signatures for nonce 0"
+SUB0=$(sub_for_nonce 0)
+N0=$(sig_count_id "$SUB0")
+echo "  nonce-0 record $SUB0 has $N0 signatures (>=2 needed)"
+[[ "$N0" -ge 2 ]] || fail "expected >=2 signatures for nonce 0"
 echo "✅ 2-of-3 transfer paid receiver $AMOUNT"
 
 echo
@@ -165,10 +182,9 @@ wait "$V2_PID" 2>/dev/null || true; wait "$V3_PID" 2>/dev/null || true
 echo "  stopped V2 and V3; only V1 online"
 send_one    # nonce 1, only V1 will sign
 sleep 3
-F1=$(file_for_nonce 1)
-[[ -n "$F1" ]] || fail "no record created for nonce 1"
-N1=$(sig_count "$F1")
-SUB1="0x$(basename "$F1" .json)"
+SUB1=$(sub_for_nonce 1)
+[[ -n "$SUB1" ]] || fail "no record created for nonce 1"
+N1=$(sig_count_id "$SUB1")
 EXECD1=$(cast call "$GATE_DST" 'executed(bytes32)(bool)' "$SUB1" --rpc-url $DST_RPC)
 CUR_BAL=$(bal "$TOKEN_DST" "$RECEIVER" "$DST_RPC")
 echo "  nonce-1 sigs=$N1  executed=$EXECD1  receiver=$CUR_BAL"
@@ -184,7 +200,7 @@ echo "  restarted V2; waiting for threshold + claim"
 PAID2=0
 for i in $(seq 1 100); do [[ "$(bal "$TOKEN_DST" "$RECEIVER" "$DST_RPC")" == "$TWICE" ]] && { PAID2=1; break; }; sleep 0.25; done
 EXECD1=$(cast call "$GATE_DST" 'executed(bytes32)(bool)' "$SUB1" --rpc-url $DST_RPC)
-echo "  nonce-1 sigs=$(sig_count "$F1")  executed=$EXECD1  receiver=$(bal "$TOKEN_DST" "$RECEIVER" "$DST_RPC")"
+echo "  nonce-1 sigs=$(sig_count_id "$SUB1")  executed=$EXECD1  receiver=$(bal "$TOKEN_DST" "$RECEIVER" "$DST_RPC")"
 [[ "$PAID2" == "1" && "$EXECD1" == "true" ]] || fail "recovery did not reach threshold/claim"
 echo "✅ recovered: 2nd signature arrived, claim executed, receiver paid $TWICE total"
 

@@ -29,6 +29,7 @@ use alloy::signers::Signer;
 use alloy_sol_types::{SolEvent, SolValue};
 use anyhow::Context;
 use bridge_core::abi::{AutoParamsTo, Gate};
+use bridge_core::allow::Allowlist;
 use bridge_core::store::{SignerSig, SubmissionRecord};
 use bridge_core::{AutoParams, Submission};
 use config::{Config, SourceChain};
@@ -189,9 +190,21 @@ async fn scan_source(
             // Process in chain order so nonce sequencing is meaningful.
             logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
 
+            // Allowlist for this batch. In sig-store mode a fetch failure is
+            // fail-closed (skip the batch) so we never sign a now-disallowed
+            // transfer on a stale view; in file mode it is None (no enforcement).
+            let allowlist = match sink.fetch_allowlist().await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(chain_id = source.chain_id, error = %e, "allowlist fetch failed; skipping batch");
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
+            };
+
             let mut paused = false;
             for log in &logs {
-                match handle_log(&signer, signer_addr, &sink, &runtime, log).await {
+                match handle_log(&signer, signer_addr, &sink, &runtime, log, allowlist.as_ref()).await {
                     Ok(true) => {} // processed
                     Ok(false) => {
                         // a nonce anomaly paused the scanner; stop this batch
@@ -224,6 +237,7 @@ async fn handle_log(
     sink: &Sink,
     runtime: &Arc<Mutex<Runtime>>,
     log: &alloy::rpc::types::Log,
+    allowlist: Option<&Allowlist>,
 ) -> anyhow::Result<bool> {
     let decoded = Gate::Sent::decode_log(&log.inner).context("decode Sent")?;
     let ev = &decoded.data;
@@ -267,6 +281,26 @@ async fn handle_log(
         rt.pause(PauseReason::IdMismatch { submission_id: format!("{emitted_id:#x}") });
         let _ = rt.save();
         return Ok(false);
+    }
+
+    // Allowlist enforcement: refuse to attest a non-whitelisted token or chain
+    // pair. We still consume the nonce (the transfer really happened on-chain) so
+    // the sequence stays intact — we just withhold our signature, so it can never
+    // reach threshold and be claimed.
+    if let Some(allow) = allowlist {
+        let debridge_hex = format!("{:#x}", ev.debridgeId);
+        let chain_from = u256_to_u64(ev.chainIdFrom);
+        if !allow.token_allowed(&debridge_hex) || !allow.chain_allowed(chain_from, chain_to) {
+            warn!(
+                submission_id = %emitted_id,
+                debridge_id = %debridge_hex,
+                chain_from,
+                chain_to,
+                "BLOCKED by allowlist — withholding signature (nonce advanced)"
+            );
+            runtime.lock().await.accept_nonce(chain_to, nonce);
+            return Ok(true);
+        }
     }
 
     // EIP-191 eth_sign over the raw 32-byte submissionId.

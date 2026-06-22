@@ -23,15 +23,31 @@ services:
     command: ["anvil --host 0.0.0.0 --chain-id 1338"]
     ports: ["8546:8545"]
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: bridge
+      POSTGRES_DB: bridge
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge -d bridge"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   sig-store:
     build: .
     command: ["sig-store"]
     environment:
       SIG_STORE_BIND: "0.0.0.0:8080"
-      SIG_STORE_DIR: "/data"
-      RUST_LOG: "sig_store=info"
-    volumes:
-      - sigstore-data:/data
+      DATABASE_URL: "postgres://bridge:bridge@postgres:5432/bridge"
+      RUST_LOG: "sig_store=info,bridge_db=info"
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports: ["8080:8080"]
 
   validator1:
@@ -66,5 +82,5 @@ services:
     depends_on: [sig-store, anvil-dst]
 
 volumes:
-  sigstore-data:
+  pgdata:
   val-state:

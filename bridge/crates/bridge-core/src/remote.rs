@@ -4,6 +4,7 @@
 //! The validator POSTs its signature; the keeper GETs all records. The server
 //! dedupes by signer, so multiple validators converge on one record per id.
 
+use crate::allow::{AllowedChain, AllowedToken, ClaimedRequest};
 use crate::store::{SignerSig, SubmissionRecord};
 
 #[derive(Debug, thiserror::Error)]
@@ -66,5 +67,30 @@ impl RemoteStore {
             return Ok(None);
         }
         Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// The whitelisted tokens (validator/keeper enforce these before signing/claiming).
+    pub async fn allowed_tokens(&self) -> Result<Vec<AllowedToken>, RemoteError> {
+        let url = format!("{}/allowed/tokens", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
+    /// The whitelisted source→target chain pairs.
+    pub async fn allowed_chains(&self) -> Result<Vec<AllowedChain>, RemoteError> {
+        let url = format!("{}/allowed/chains", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Mark a submission claimed after the keeper executes `claim()` on-chain.
+    pub async fn mark_claimed(&self, submission_id: &str, claim_tx: &str) -> Result<(), RemoteError> {
+        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
+        let url = format!("{}/submissions/{id}/claimed", self.base);
+        self.client
+            .post(url)
+            .json(&ClaimedRequest { claim_tx: claim_tx.to_string() })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }

@@ -11,6 +11,7 @@
 # After this, import anvil account 0 into MetaMask and bridge from the UI.
 # Re-running redeploys cleanly. Stop everything with:
 #   fuser -k 8545/tcp 8546/tcp 8080/tcp 8088/tcp 5173/tcp ; pkill -f 'anvil --chain-id'
+#   docker rm -f bridge-pg-live
 set -euo pipefail
 
 export PATH="$HOME/.nvm/versions/node/v25.9.0/bin:$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
@@ -18,10 +19,13 @@ export PATH="$HOME/.nvm/versions/node/v25.9.0/bin:$HOME/.foundry/bin:$HOME/.carg
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 WEB="$ROOT/web"
-STORE="$ROOT/sig-store-data-live"
 LOG=/tmp/bridge-run
 mkdir -p "$LOG"
-rm -rf "$STORE"; mkdir -p "$STORE"
+
+# Postgres-backed sig-store (the file-per-id store was retired). Runs in Docker.
+PG_NAME=bridge-pg-live
+PG_PORT=5433
+DATABASE_URL="postgres://bridge:bridge@127.0.0.1:${PG_PORT}/bridge?sslmode=disable"
 # Wipe scan cursors — a reset chain restarts at block 0, so stale resume points
 # would make validators skip the new events. Matches both -A.json and -B.json.
 rm -f "$ROOT"/.live-val*-state*.json
@@ -51,6 +55,7 @@ pkill -f 'target/debug/validator'  2>/dev/null || true
 pkill -f 'target/debug/keeper'     2>/dev/null || true
 pkill -f 'target/debug/sig-store'  2>/dev/null || true
 pkill -f 'target/debug/graphql-api' 2>/dev/null || true
+docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
 sleep 1.5
 
 echo "=== build rust services ==="
@@ -93,8 +98,16 @@ cast send "$TOKEN_SRC" "mint(address,uint256)" "$GATE_SRC" $MINT --rpc-url $SRC_
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_A" "$TOKEN_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_SRC" "setLocalToken(bytes32,address)" "$DEBRIDGE_B" "$TOKEN_SRC" --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 
-echo "=== boot sig-store + 2 validators + keeper ==="
-SIG_STORE_BIND=127.0.0.1:8080 SIG_STORE_DIR="$STORE" spawn "$ROOT/target/debug/sig-store" sig-store.log
+echo "=== start Postgres in Docker ($PG_NAME on :$PG_PORT) ==="
+docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+docker run -d --name "$PG_NAME" \
+  -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
+  -p ${PG_PORT}:5432 postgres:16-alpine >/dev/null
+for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && break; sleep 0.5; done
+
+echo "=== boot Postgres-backed sig-store + 2 validators + keeper ==="
+# sig-store retries the DB connection, so it tolerates Postgres still warming up.
+SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" spawn "$ROOT/target/debug/sig-store" sig-store.log
 for _ in $(seq 1 40); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 
 # Each validator watches BOTH gates ([[sources]]), so either direction is signed.
