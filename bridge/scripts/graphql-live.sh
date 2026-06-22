@@ -14,10 +14,14 @@ export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACTS="$ROOT/contracts"
-STORE="$ROOT/sig-store-data-gql"
 LOGS="$ROOT/.e2e-logs"
-mkdir -p "$LOGS"; rm -rf "$STORE"; mkdir -p "$STORE"
+mkdir -p "$LOGS"
 rm -f "$LOGS"/val*-gql-state.json
+
+# Postgres-backed sig-store (the file-per-id store was retired). Runs in Docker.
+PG_NAME=bridge-pg-gql
+PG_PORT=5433
+DATABASE_URL="postgres://bridge:bridge@127.0.0.1:${PG_PORT}/bridge?sslmode=disable"
 
 ACC0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 KEY0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -41,6 +45,7 @@ cleanup() {
   echo "--- cleaning up ---"
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
   pkill -f "anvil --chain-id" 2>/dev/null || true
+  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -76,9 +81,19 @@ cast send "$TOKEN_SRC" "approve(address,uint256)" "$GATE_SRC" 900000000000000000
 cast send "$TOKEN_DST" "mint(address,uint256)" "$GATE_DST" 900000000000000000000 --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
-echo "=== boot sig-store + validators + keeper ==="
-SIG_STORE_BIND=127.0.0.1:8080 SIG_STORE_DIR="$STORE" "$ROOT/target/debug/sig-store" >"$LOGS/sig-store-gql.log" 2>&1 & track $!
-for i in $(seq 1 40); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
+echo "=== start Postgres in Docker ($PG_NAME on :$PG_PORT) ==="
+docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+docker run -d --name "$PG_NAME" \
+  -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
+  -p ${PG_PORT}:5432 postgres:16-alpine >/dev/null
+for i in $(seq 1 60); do
+  docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && break
+  sleep 0.5; [[ $i == 60 ]] && fail "Postgres did not become ready"
+done
+
+echo "=== boot Postgres-backed sig-store + validators + keeper ==="
+SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" "$ROOT/target/debug/sig-store" >"$LOGS/sig-store-gql.log" 2>&1 & track $!
+for i in $(seq 1 60); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -s "$STORE_URL/health" | grep -q ok || fail "sig-store did not come up"
 
 write_vcfg() { cat > "$1" <<EOF

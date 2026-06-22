@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use bridge_core::allow::Allowlist;
 use bridge_core::remote::RemoteStore;
 use bridge_core::store::{self, SignerSig, SubmissionRecord};
 
@@ -45,5 +46,19 @@ impl Sink {
             }
         }
         Ok(())
+    }
+
+    /// Fetch the current allowlists from the sig-store, or `None` in legacy file
+    /// mode (no central allowlist → enforcement disabled). Built fresh each scan
+    /// tick so operator changes take effect without restarting the validator.
+    pub async fn fetch_allowlist(&self) -> anyhow::Result<Option<Allowlist>> {
+        match self {
+            Sink::File(_) => Ok(None),
+            Sink::Remote(remote) => {
+                let tokens = remote.allowed_tokens().await?;
+                let chains = remote.allowed_chains().await?;
+                Ok(Some(Allowlist::from_parts(&tokens, &chains)))
+            }
+        }
     }
 }

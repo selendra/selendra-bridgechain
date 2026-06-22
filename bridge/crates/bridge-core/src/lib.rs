@@ -10,6 +10,7 @@ use alloy_primitives::{keccak256, Address, B256, U256};
 mod submission;
 pub use submission::Submission;
 
+pub mod allow;
 pub mod store;
 
 #[cfg(feature = "abi")]

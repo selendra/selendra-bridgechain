@@ -1,0 +1,20 @@
+[package]
+name = "bridge-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `abi` gives us the trust-boundary checks (id<->params binding + signature
+# recovery) we reuse verbatim from the file store, plus `debridge_id` derivation.
+bridge-core = { workspace = true, features = ["abi"] }
+alloy-primitives = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

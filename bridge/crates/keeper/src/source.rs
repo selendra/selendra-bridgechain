@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use bridge_core::allow::Allowlist;
 use bridge_core::remote::RemoteStore;
 use bridge_core::store::{self, SubmissionRecord};
 
@@ -36,6 +37,27 @@ impl Source {
         match self {
             Source::File(dir) => Ok(store::load_all(dir)?),
             Source::Remote(remote) => Ok(remote.load_all().await?),
+        }
+    }
+
+    /// Current allowlists from the sig-store, or `None` in legacy file mode
+    /// (enforcement disabled). Refetched each tick so operator changes apply live.
+    pub async fn fetch_allowlist(&self) -> anyhow::Result<Option<Allowlist>> {
+        match self {
+            Source::File(_) => Ok(None),
+            Source::Remote(remote) => {
+                let tokens = remote.allowed_tokens().await?;
+                let chains = remote.allowed_chains().await?;
+                Ok(Some(Allowlist::from_parts(&tokens, &chains)))
+            }
+        }
+    }
+
+    /// Record a successful claim back to the store (no-op in file mode).
+    pub async fn mark_claimed(&self, submission_id: &str, claim_tx: &str) -> anyhow::Result<()> {
+        match self {
+            Source::File(_) => Ok(()),
+            Source::Remote(remote) => Ok(remote.mark_claimed(submission_id, claim_tx).await?),
         }
     }
 }

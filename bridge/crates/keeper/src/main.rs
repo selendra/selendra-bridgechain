@@ -120,6 +120,18 @@ async fn run_target(
     );
 
     loop {
+        // Allowlist for this tick. Fail-closed: if the sig-store is unreachable,
+        // skip the tick rather than claim on a stale view. None => file mode
+        // (no central allowlist, enforcement disabled).
+        let allowlist = match source.fetch_allowlist().await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(chain_id = target.chain_id, error = %e, "allowlist fetch failed; skipping tick");
+                tokio::time::sleep(retry).await;
+                continue;
+            }
+        };
+
         let records = source.load_all().await.unwrap_or_default();
         for rec in records {
             if rec.chain_id_to != target.chain_id {
@@ -128,24 +140,54 @@ async fn run_target(
             if (rec.signatures.len() as u64) < threshold {
                 continue;
             }
-            if let Err(e) = try_claim(&gate, &rec).await {
-                warn!(
+            // Second enforcement gate (validators are the first): never submit a
+            // claim for a non-whitelisted token or chain pair.
+            if let Some(allow) = &allowlist {
+                if !allow.token_allowed(&rec.debridge_id)
+                    || !allow.chain_allowed(rec.chain_id_from, rec.chain_id_to)
+                {
+                    warn!(
+                        chain_id = target.chain_id,
+                        submission_id = %rec.submission_id,
+                        "BLOCKED by allowlist — refusing to claim"
+                    );
+                    continue;
+                }
+            }
+            match try_claim(&gate, &rec).await {
+                Ok(Some(tx)) => {
+                    if let Err(e) = source.mark_claimed(&rec.submission_id, &tx).await {
+                        warn!(
+                            chain_id = target.chain_id,
+                            submission_id = %rec.submission_id,
+                            error = %e,
+                            "claimed on-chain but failed to record status"
+                        );
+                    }
+                }
+                Ok(None) => {} // already executed
+                Err(e) => warn!(
                     chain_id = target.chain_id,
                     submission_id = %rec.submission_id,
                     error = %e,
                     "claim failed"
-                );
+                ),
             }
         }
         tokio::time::sleep(Duration::from_millis(target.poll_interval_ms)).await;
     }
 }
 
-async fn try_claim<P: Provider>(gate: &Gate::GateInstance<P>, rec: &SubmissionRecord) -> anyhow::Result<()> {
+/// Submit `claim()` for one record. Returns `Some(tx_hash)` on a fresh claim,
+/// `None` if it was already executed (by us or another keeper).
+async fn try_claim<P: Provider>(
+    gate: &Gate::GateInstance<P>,
+    rec: &SubmissionRecord,
+) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
     if gate.executed(submission_id).call().await? {
-        return Ok(()); // already executed (by us or another keeper)
+        return Ok(None); // already executed (by us or another keeper)
     }
 
     let debridge_id = B256::from_str(&rec.debridge_id).context("bad debridge_id")?;
@@ -190,7 +232,7 @@ async fn try_claim<P: Provider>(gate: &Gate::GateInstance<P>, rec: &SubmissionRe
         status = receipt.status(),
         "CLAIMED"
     );
-    Ok(())
+    Ok(Some(format!("{:#x}", receipt.transaction_hash)))
 }
 
 fn bytes_of(hex_str: &str) -> anyhow::Result<Bytes> {

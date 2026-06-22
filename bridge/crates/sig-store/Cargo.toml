@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# `abi` enables the store's trust-boundary validation (id<->params binding +
-# signature authentication) — the sig-store is unauthenticated, so it must verify.
-bridge-core = { workspace = true, features = ["abi"] }
+# The Postgres source of truth. bridge-db reuses bridge-core's trust-boundary
+# validation (id<->params binding + signature authentication) — the sig-store is
+# unauthenticated, so the DB layer must verify every write.
+bridge-core = { workspace = true }
+bridge-db = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
