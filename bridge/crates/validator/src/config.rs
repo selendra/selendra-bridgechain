@@ -74,6 +74,20 @@ pub struct Store {
 pub struct Api {
     /// e.g. "127.0.0.1:9090"
     pub bind: String,
+    /// Bearer token guarding pause/resume/rescan. Falls back to the
+    /// `VALIDATOR_API_TOKEN` env var; unset on both => unauthenticated (dev).
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl Api {
+    /// The configured token, or the `VALIDATOR_API_TOKEN` env var as a fallback.
+    pub fn resolved_token(&self) -> Option<String> {
+        self.token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(|| std::env::var("VALIDATOR_API_TOKEN").ok().filter(|t| !t.is_empty()))
+    }
 }
 
 fn default_interval() -> u64 {

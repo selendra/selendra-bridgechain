@@ -20,8 +20,29 @@ pub struct RemoteStore {
 
 impl RemoteStore {
     pub fn new(base: impl Into<String>) -> Self {
+        // The sig-store is an authenticated trust boundary. If `SIG_STORE_TOKEN`
+        // is set, every request carries `Authorization: Bearer <token>` so the
+        // server accepts us; unset means the server is in open dev mode.
+        Self::with_token(base, std::env::var("SIG_STORE_TOKEN").ok())
+    }
+
+    /// Build a client that authenticates with `token` (if `Some`) on every request.
+    pub fn with_token(base: impl Into<String>, token: Option<String>) -> Self {
         let base = base.into().trim_end_matches('/').to_string();
-        Self { base, client: reqwest::Client::new() }
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = token.as_deref().filter(|t| !t.is_empty()) {
+            if let Ok(mut value) =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            {
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+        }
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_default();
+        Self { base, client }
     }
 
     /// Upsert one signature for a submission (server merges + dedupes by signer).

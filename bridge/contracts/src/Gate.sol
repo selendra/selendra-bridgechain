@@ -32,6 +32,13 @@ contract Gate {
     uint256 public validatorCount;
     uint256 public threshold;
 
+    // --- emergency circuit breaker ---
+    /// @dev when true, `send` and `claim` are halted (incident response)
+    bool public paused;
+    /// @dev may trip the breaker (fast incident response) but cannot un-pause;
+    ///      only `owner` can resume. address(0) until the owner appoints one.
+    address public guardian;
+
     // --- source-side state ---
     /// @dev per-target-chain monotonic nonce
     mapping(uint256 chainIdTo => uint256) public nonceTo;
@@ -67,6 +74,9 @@ contract Gate {
     event ValidatorSet(address indexed validator, bool active);
     event ThresholdSet(uint256 threshold);
     event LocalTokenSet(bytes32 indexed debridgeId, address indexed localToken);
+    event GuardianSet(address indexed guardian);
+    event Paused(address indexed account);
+    event Unpaused(address indexed account);
 
     error NotOwner();
     error ZeroAmount();
@@ -79,9 +89,16 @@ contract Gate {
     error ZeroAddress();
     /// @dev threshold must always satisfy 0 < threshold <= validatorCount
     error InvalidThreshold(uint256 threshold, uint256 validatorCount);
+    error EnforcedPause();
+    error NotAuthorizedToPause();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    modifier whenNotPaused() {
+        if (paused) revert EnforcedPause();
         _;
     }
 
@@ -156,6 +173,32 @@ contract Gate {
         emit LocalTokenSet(debridgeId, localToken);
     }
 
+    /// @notice Appoint (or clear) the guardian who can trip the circuit breaker.
+    /// @dev    The guardian is a low-trust "stop button": it can pause but never
+    ///         un-pause or move funds, so a compromised guardian can only cause a
+    ///         (recoverable) liveness halt, not theft. Pass address(0) to revoke.
+    function setGuardian(address newGuardian) external onlyOwner {
+        guardian = newGuardian;
+        emit GuardianSet(newGuardian);
+    }
+
+    /// @notice Halt `send`/`claim` in an incident. Callable by owner or guardian.
+    function pause() external {
+        if (msg.sender != owner && msg.sender != guardian) revert NotAuthorizedToPause();
+        if (!paused) {
+            paused = true;
+            emit Paused(msg.sender);
+        }
+    }
+
+    /// @notice Resume `send`/`claim`. Owner only — guardians can stop but not start.
+    function unpause() external onlyOwner {
+        if (paused) {
+            paused = false;
+            emit Unpaused(msg.sender);
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Source side: lock + emit
     // ---------------------------------------------------------------------
@@ -173,7 +216,7 @@ contract Gate {
         uint256 chainIdTo,
         bytes calldata receiver,
         bytes calldata autoParams
-    ) external returns (bytes32 submissionId) {
+    ) external whenNotPaused returns (bytes32 submissionId) {
         if (amount == 0) revert ZeroAmount();
         // EVM <-> EVM: the recipient must be a bare 20-byte address, else funds
         // would lock here and be misrouted by _toAddress on the target.
@@ -225,7 +268,7 @@ contract Gate {
         bytes calldata autoParams,
         bytes calldata nativeSender,
         bytes[] calldata signatures
-    ) external returns (bytes32 submissionId) {
+    ) external whenNotPaused returns (bytes32 submissionId) {
         submissionId = _idFor(
             debridgeId, amount, chainIdFrom, block.chainid, nonce, receiver, autoParams, nativeSender
         );

@@ -189,4 +189,68 @@ contract SecurityTest is Test {
         gate.setLocalToken(bytes32(0), address(token));
         vm.stopPrank();
     }
+
+    // ---- C5: emergency circuit breaker ----
+
+    function test_Pause_HaltsSend() public {
+        token.mint(attacker, 10 ether);
+        gate.pause();
+        assertTrue(gate.paused());
+        vm.startPrank(attacker);
+        token.approve(address(gate), type(uint256).max);
+        vm.expectRevert(Gate.EnforcedPause.selector);
+        gate.send(address(token), 1 ether, CHAIN_TO, abi.encodePacked(address(0xCAFE)), "");
+        vm.stopPrank();
+    }
+
+    function test_Pause_HaltsClaim() public {
+        gate.pause();
+        // any claim must revert on the pause guard before touching signatures
+        bytes[] memory sigs = new bytes[](0);
+        vm.expectRevert(Gate.EnforcedPause.selector);
+        gate.claim(bytes32(0), 1 ether, 1337, 0, abi.encodePacked(address(0xCAFE)), "", "", sigs);
+    }
+
+    function test_Unpause_ResumesSend() public {
+        token.mint(attacker, 10 ether);
+        gate.pause();
+        gate.unpause();
+        assertFalse(gate.paused());
+        vm.startPrank(attacker);
+        token.approve(address(gate), type(uint256).max);
+        // no revert: a normal send goes through again
+        gate.send(address(token), 1 ether, CHAIN_TO, abi.encodePacked(address(0xCAFE)), "");
+        vm.stopPrank();
+    }
+
+    function test_Guardian_CanPauseButNotUnpause() public {
+        address guardian = address(0x6A5D);
+        gate.setGuardian(guardian);
+        assertEq(gate.guardian(), guardian);
+
+        // guardian trips the breaker
+        vm.prank(guardian);
+        gate.pause();
+        assertTrue(gate.paused());
+
+        // but a guardian cannot resume — only the owner can
+        vm.prank(guardian);
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.unpause();
+
+        gate.unpause();
+        assertFalse(gate.paused());
+    }
+
+    function test_Pause_OnlyOwnerOrGuardian() public {
+        vm.prank(attacker);
+        vm.expectRevert(Gate.NotAuthorizedToPause.selector);
+        gate.pause();
+    }
+
+    function test_SetGuardian_OnlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.setGuardian(attacker);
+    }
 }

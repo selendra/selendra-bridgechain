@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         let api_state = api::ApiState {
             sources: runtimes.clone(),
             validator: format!("{signer_addr:#x}"),
+            token: api.resolved_token(),
         };
         let bind = api.bind.clone();
         tokio::spawn(async move {

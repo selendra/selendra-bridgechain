@@ -38,12 +38,17 @@ services:
       timeout: 3s
       retries: 20
 
+  # Shared secret that authenticates the off-chain stack to the sig-store. The
+  # server requires it on every route but /health; validators/keeper send it via
+  # SIG_STORE_TOKEN (RemoteStore reads that env). Override in real deployments:
+  #   SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
   sig-store:
     build: .
     command: ["sig-store"]
     environment:
       SIG_STORE_BIND: "0.0.0.0:8080"
       DATABASE_URL: "postgres://bridge:bridge@postgres:5432/bridge"
+      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
       RUST_LOG: "sig_store=info,bridge_db=info"
     depends_on:
       postgres:
@@ -53,6 +58,8 @@ services:
   validator1:
     build: .
     command: ["validator", "/configs/val1.toml"]
+    environment:
+      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
       - val-state:/data
@@ -61,6 +68,8 @@ services:
   validator2:
     build: .
     command: ["validator", "/configs/val2.toml"]
+    environment:
+      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
       - val-state:/data
@@ -69,6 +78,8 @@ services:
   validator3:
     build: .
     command: ["validator", "/configs/val3.toml"]
+    environment:
+      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
       - val-state:/data
@@ -77,6 +88,8 @@ services:
   keeper:
     build: .
     command: ["keeper", "/configs/keeper.toml"]
+    environment:
+      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
     depends_on: [sig-store, anvil-dst]

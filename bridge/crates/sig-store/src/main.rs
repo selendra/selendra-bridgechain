@@ -23,15 +23,19 @@
 //!   POST   /allowed/chains               -> add (body: {"chain_id_from":..,"chain_id_to":..})
 //!   DELETE /allowed/chains/:from/:to     -> remove
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use std::sync::Arc;
+
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bridge_core::allow::{AddTokenRequest, AllowedChain, AllowedToken, ClaimedRequest, SubmissionHistory};
 use bridge_core::store::SubmissionRecord;
 use bridge_db::{Db, DbError};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(about = "Postgres-backed signature store + allowlists for the bridge")]
@@ -42,11 +46,51 @@ struct Args {
     /// Postgres connection string, e.g. postgres://bridge:bridge@localhost:5432/bridge
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
+    /// Shared secret required as `Authorization: Bearer <token>` on every route
+    /// except `/health`. When unset the API is UNAUTHENTICATED (dev only) — the
+    /// allowlist (a security control) and history become world-writable, so set
+    /// this in any networked deployment.
+    #[arg(long, env = "SIG_STORE_TOKEN")]
+    auth_token: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
     db: Db,
+}
+
+/// Bearer-token gate. With a token configured, reject any request that doesn't
+/// present it (constant-time compare); `/health` is layered separately so it
+/// stays open for load-balancer / docker health checks.
+async fn require_auth(
+    State(expected): State<Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Length-checked constant-time byte comparison (avoids leaking the token via
+/// early-exit timing on the compare itself).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[tokio::main]
@@ -64,8 +108,8 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState { db };
 
-    let app = Router::new()
-        .route("/health", get(health))
+    // Everything but /health sits behind the bearer-token gate (when configured).
+    let mut protected = Router::new()
         .route("/submissions", post(post_submission).get(list_submissions))
         .route("/submissions/:id", get(get_submission))
         .route("/submissions/:id/claimed", post(post_claimed))
@@ -73,7 +117,25 @@ async fn main() -> anyhow::Result<()> {
         .route("/allowed/tokens", get(list_tokens).post(add_token))
         .route("/allowed/tokens/:chain/:token", delete(remove_token))
         .route("/allowed/chains", get(list_chains).post(add_chain))
-        .route("/allowed/chains/:from/:to", delete(remove_chain))
+        .route("/allowed/chains/:from/:to", delete(remove_chain));
+
+    match args.auth_token.filter(|t| !t.is_empty()) {
+        Some(token) => {
+            info!("auth enabled: bearer token required on all routes except /health");
+            protected = protected.route_layer(middleware::from_fn_with_state(
+                Arc::new(token),
+                require_auth,
+            ));
+        }
+        None => warn!(
+            "SIG_STORE_TOKEN is unset — API is UNAUTHENTICATED (the allowlist and \
+             history are world-writable). Set a token for any networked deployment."
+        ),
+    }
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
@@ -211,4 +273,73 @@ async fn remove_chain(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let removed = s.db.remove_allowed_chain(from, to).await.map_err(db_err)?;
     Ok(if removed { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    // The same wiring main() uses: /health open, everything else behind the gate.
+    fn app(token: &str) -> Router {
+        let protected = Router::new()
+            .route("/allowed/tokens", get(|| async { "tokens" }))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::new(token.to_string()),
+                require_auth,
+            ));
+        Router::new().route("/health", get(health)).merge(protected)
+    }
+
+    async fn status_of(req: Request<Body>) -> StatusCode {
+        app("s3cret").oneshot(req).await.unwrap().status()
+    }
+
+    fn req(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+    fn req_auth(uri: &str, bearer: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_needs_no_token() {
+        assert_eq!(status_of(req("/health")).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn protected_route_rejects_missing_token() {
+        assert_eq!(status_of(req("/allowed/tokens")).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_route_rejects_wrong_token() {
+        assert_eq!(
+            status_of(req_auth("/allowed/tokens", "nope")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_route_accepts_correct_token() {
+        assert_eq!(
+            status_of(req_auth("/allowed/tokens", "s3cret")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn ct_eq_is_correct() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab")); // length mismatch
+        assert!(!ct_eq(b"", b"x"));
+    }
 }
