@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // During `vite dev` the browser talks to the dashboard's own origin and we proxy
 // `/graphql` and `/health` to the running graphql-api (default 127.0.0.1:8088),
@@ -9,7 +10,7 @@ import react from "@vitejs/plugin-react";
 const API = process.env.GRAPHQL_API_URL ?? "http://127.0.0.1:8088";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
     proxy: {
