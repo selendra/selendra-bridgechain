@@ -12,7 +12,7 @@ use async_graphql::{ComplexObject, Context, Enum, InputObject, Object, SimpleObj
 use bridge_core::store::{SignerSig, SubmissionRecord};
 
 use crate::backend::Backend;
-use crate::chain::Chains;
+use crate::chain::{ChainInfo, Chains};
 
 /// Shared, read-mostly state handed to every resolver via the schema's data.
 pub struct ApiState {
@@ -23,6 +23,35 @@ pub struct ApiState {
     /// Optional destination-gate RPCs, so `executed`/`status` can report on-chain
     /// delivery. Empty => those fields are null/UNKNOWN.
     pub chains: Chains,
+    /// The network registry served to the UI via the `chains` query (so the
+    /// frontend discovers configured chains instead of hardcoding them). Empty
+    /// when the API wasn't started with `--chains-file`.
+    pub registry: Vec<ChainInfo>,
+}
+
+/// A network the bridge UI can target. Mirrors [`ChainInfo`] for the wire.
+#[derive(SimpleObject)]
+pub struct Chain {
+    pub chain_id: u64,
+    pub name: String,
+    /// Read-only RPC for off-wallet reads (decimals/balances). Null when unset.
+    pub rpc_url: Option<String>,
+    /// Deployed Gate on this chain, or null if it isn't pinned server-side.
+    pub gate: Option<String>,
+    /// Default ERC-20 to prefill when bridging from this chain. Null if unset.
+    pub token: Option<String>,
+}
+
+impl From<ChainInfo> for Chain {
+    fn from(c: ChainInfo) -> Self {
+        Chain {
+            chain_id: c.chain_id,
+            name: c.name,
+            rpc_url: c.rpc_url,
+            gate: c.gate,
+            token: c.token,
+        }
+    }
 }
 
 /// Lifecycle of a transfer, combining off-chain signatures with on-chain truth.
@@ -221,6 +250,13 @@ impl Query {
         let st = state(ctx);
         let rec = st.backend.load(&submission_id).await?;
         Ok(rec.map(|r| Submission::from_record(r, st.threshold)))
+    }
+
+    /// The configured network registry, so the UI can discover chains (id, name,
+    /// RPC, gate, token) from the backend instead of hardcoding them. Empty when
+    /// the API was started without `--chains-file`.
+    async fn chains(&self, ctx: &Context<'_>) -> Vec<Chain> {
+        state(ctx).registry.iter().cloned().map(Chain::from).collect()
     }
 
     /// Aggregate counts across the whole store.

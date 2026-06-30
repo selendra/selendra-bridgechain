@@ -62,3 +62,37 @@ export function findChain(chains: BridgeChain[], chainId: number | null): Bridge
   if (chainId == null) return undefined;
   return chains.find((c) => c.chainId === chainId);
 }
+
+/** Backend-advertised chain (nullable fields) -> local BridgeChain (optionals). */
+export function fromRemote(c: {
+  chainId: number;
+  name: string;
+  rpcUrl: string | null;
+  gate: string | null;
+  token: string | null;
+}): BridgeChain {
+  return {
+    chainId: c.chainId,
+    name: c.name,
+    rpcUrl: c.rpcUrl ?? undefined,
+    gate: c.gate ?? undefined,
+    token: c.token ?? undefined,
+  };
+}
+
+/**
+ * Non-destructively fold a backend-served registry into the local one: append
+ * any chain the user hasn't seen (by chainId), but never clobber local edits to
+ * gate/token/rpc the user has made. Returns the SAME `local` reference when
+ * there's nothing to add, so callers can skip a state update cheaply.
+ */
+export function mergeChains(local: BridgeChain[], remote: BridgeChain[]): BridgeChain[] {
+  const have = new Set(local.map((c) => c.chainId));
+  const additions = remote.filter((c) => !have.has(c.chainId));
+  return additions.length === 0 ? local : [...local, ...additions];
+}
+
+/** A blank chain row for the "add chain" action (chainId 0 = "fill me in"). */
+export function blankChain(): BridgeChain {
+  return { chainId: 0, name: "" };
+}

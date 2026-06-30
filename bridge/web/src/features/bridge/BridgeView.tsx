@@ -1,10 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, Coins, Wallet } from "lucide-react";
-import { useWallet } from "../../hooks/useWallet";
 import {
+  ChevronDown,
+  ChevronRight,
+  Coins,
+  Plus,
+  Trash2,
+  Wallet,
+} from "lucide-react";
+import { useWallet } from "../../hooks/useWallet";
+import { useChains } from "../../hooks/queries";
+import {
+  blankChain,
   type BridgeChain,
   findChain,
+  fromRemote,
   loadChains,
+  mergeChains,
   saveChains,
 } from "../../lib/chains";
 import {
@@ -214,6 +225,51 @@ export function BridgeView({
     setChains(next);
     saveChains(next);
   }
+
+  function commitChains(next: BridgeChain[]) {
+    setChains(next);
+    saveChains(next);
+  }
+
+  // Edit a settings row by index (chainId itself is editable, so we can't key by
+  // it). Number-typed fields (chainId) are coerced; blanks become 0.
+  function editChain(index: number, patch: Partial<BridgeChain>) {
+    commitChains(chains.map((c, i) => (i === index ? { ...c, ...patch } : c)));
+  }
+  function addChainRow() {
+    commitChains([...chains, blankChain()]);
+    setShowSettings(true);
+  }
+  function removeChainRow(index: number) {
+    commitChains(chains.filter((_, i) => i !== index));
+  }
+
+  // Fold the backend-advertised registry into the local one: new chains the user
+  // hasn't seen are appended; local edits are never overwritten. Runs whenever
+  // the fetched list changes; mergeChains returns the same ref when there's
+  // nothing to add, so this can't loop.
+  const remote = useChains();
+  useEffect(() => {
+    const data = remote.data;
+    if (!data?.length) return;
+    setChains((local) => {
+      const merged = mergeChains(local, data.map(fromRemote));
+      if (merged === local) return local;
+      saveChains(merged);
+      return merged;
+    });
+  }, [remote.data]);
+
+  // Duplicate chainIds break findChain(); surface it in the settings panel.
+  const dupChainIds = useMemo(() => {
+    const seen = new Set<number>();
+    const dups = new Set<number>();
+    for (const c of chains) {
+      if (c.chainId && seen.has(c.chainId)) dups.add(c.chainId);
+      seen.add(c.chainId);
+    }
+    return dups;
+  }, [chains]);
 
   // ---- Not installed gate ----
   if (!wallet.available) {
@@ -485,46 +541,117 @@ export function BridgeView({
           Network settings
         </button>
         {showSettings && (
-          <table className="mt-3 w-full border-collapse text-[12.5px]">
-            <thead>
-              <tr className="text-left text-[11px] uppercase tracking-wide text-muted">
-                <th className="px-2 py-1.5 font-medium">Chain id</th>
-                <th className="px-2 py-1.5 font-medium">Name</th>
-                <th className="px-2 py-1.5 font-medium">Gate</th>
-                <th className="px-2 py-1.5 font-medium">Default token</th>
-              </tr>
-            </thead>
-            <tbody>
-              {chains.map((c) => (
-                <tr key={c.chainId}>
-                  <td className="px-2 py-1.5 font-mono">{c.chainId}</td>
-                  <td className="px-2 py-1.5">{c.name}</td>
-                  <td className="px-2 py-1.5">
-                    <Input
-                      className="h-8 font-mono text-[11.5px]"
-                      value={c.gate ?? ""}
-                      placeholder="0x…"
-                      spellCheck={false}
-                      onChange={(e) =>
-                        persistChain(c.chainId, { gate: e.target.value })
-                      }
-                    />
-                  </td>
-                  <td className="px-2 py-1.5">
-                    <Input
-                      className="h-8 font-mono text-[11.5px]"
-                      value={c.token ?? ""}
-                      placeholder="0x…"
-                      spellCheck={false}
-                      onChange={(e) =>
-                        persistChain(c.chainId, { token: e.target.value })
-                      }
-                    />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="mt-3">
+            <p className="mb-2 text-[12px] text-muted">
+              Add, remove, or edit the networks you can bridge between. Stored in
+              this browser; new chains advertised by the backend are merged in
+              automatically.
+            </p>
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-[12.5px]">
+                <thead>
+                  <tr className="text-left text-[11px] uppercase tracking-wide text-muted">
+                    <th className="px-1.5 py-1.5 font-medium">Chain id</th>
+                    <th className="px-1.5 py-1.5 font-medium">Name</th>
+                    <th className="px-1.5 py-1.5 font-medium">RPC URL</th>
+                    <th className="px-1.5 py-1.5 font-medium">Gate</th>
+                    <th className="px-1.5 py-1.5 font-medium">Default token</th>
+                    <th className="px-1.5 py-1.5" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {chains.map((c, i) => (
+                    <tr key={i}>
+                      <td className="px-1.5 py-1.5">
+                        <Input
+                          className="h-8 w-20 font-mono text-[11.5px]"
+                          value={c.chainId || ""}
+                          placeholder="1337"
+                          inputMode="numeric"
+                          spellCheck={false}
+                          onChange={(e) =>
+                            editChain(i, {
+                              chainId: Number(e.target.value.trim()) || 0,
+                            })
+                          }
+                        />
+                      </td>
+                      <td className="px-1.5 py-1.5">
+                        <Input
+                          className="h-8 w-28 text-[11.5px]"
+                          value={c.name}
+                          placeholder="My chain"
+                          onChange={(e) => editChain(i, { name: e.target.value })}
+                        />
+                      </td>
+                      <td className="px-1.5 py-1.5">
+                        <Input
+                          className="h-8 w-40 font-mono text-[11.5px]"
+                          value={c.rpcUrl ?? ""}
+                          placeholder="http://127.0.0.1:8545"
+                          spellCheck={false}
+                          onChange={(e) =>
+                            editChain(i, { rpcUrl: e.target.value || undefined })
+                          }
+                        />
+                      </td>
+                      <td className="px-1.5 py-1.5">
+                        <Input
+                          className="h-8 w-36 font-mono text-[11.5px]"
+                          value={c.gate ?? ""}
+                          placeholder="0x…"
+                          spellCheck={false}
+                          onChange={(e) =>
+                            editChain(i, { gate: e.target.value || undefined })
+                          }
+                        />
+                      </td>
+                      <td className="px-1.5 py-1.5">
+                        <Input
+                          className="h-8 w-36 font-mono text-[11.5px]"
+                          value={c.token ?? ""}
+                          placeholder="0x…"
+                          spellCheck={false}
+                          onChange={(e) =>
+                            editChain(i, { token: e.target.value || undefined })
+                          }
+                        />
+                      </td>
+                      <td className="px-1.5 py-1.5">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => removeChainRow(i)}
+                          title="Remove this chain"
+                          aria-label={`Remove ${c.name || c.chainId}`}
+                        >
+                          <Trash2 />
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {dupChainIds.size > 0 && (
+              <p className="mt-2 text-[12px] text-warning">
+                Duplicate chain id{dupChainIds.size > 1 ? "s" : ""}{" "}
+                {[...dupChainIds].join(", ")} — each network must have a unique
+                chain id, or selecting it won't work correctly.
+              </p>
+            )}
+
+            <Button
+              variant="subtle"
+              size="sm"
+              className="mt-3"
+              onClick={addChainRow}
+            >
+              <Plus />
+              Add chain
+            </Button>
+          </div>
         )}
       </div>
     </Card>

@@ -84,6 +84,16 @@ export interface SubmissionFilter {
   ready?: boolean | null;
 }
 
+/** A network the backend advertises via the `chains` query. Null fields are
+ *  simply unset server-side (the UI fills/overrides them locally). */
+export interface Chain {
+  chainId: number;
+  name: string;
+  rpcUrl: string | null;
+  gate: string | null;
+  token: string | null;
+}
+
 // ---- Queries ------------------------------------------------------------
 
 // Shared field set so the list and the by-id lookup stay in sync.
@@ -128,8 +138,18 @@ const SUBMISSION_QUERY = `
   }
 `;
 
+const CHAINS_QUERY = `
+  query Chains {
+    chains { chainId name rpcUrl gate token }
+  }
+`;
+
 export function fetchStats(signal?: AbortSignal): Promise<Stats> {
   return gql<{ stats: Stats }>(STATS_QUERY, undefined, signal).then((d) => d.stats);
+}
+
+export function fetchChains(signal?: AbortSignal): Promise<Chain[]> {
+  return gql<{ chains: Chain[] }>(CHAINS_QUERY, undefined, signal).then((d) => d.chains);
 }
 
 export function fetchSubmissions(

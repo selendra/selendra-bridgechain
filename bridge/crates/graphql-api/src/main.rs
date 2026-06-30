@@ -53,6 +53,12 @@ struct Args {
     /// it, `executed` is null and `status` falls back to signatures only.
     #[arg(long = "gate", value_name = "CHAINID=RPC,GATE")]
     gates: Vec<String>,
+    /// JSON file listing the network registry served to the UI via the `chains`
+    /// query (an array of {chainId,name,rpcUrl?,gate?,token?}). Each chain with
+    /// an rpcUrl+gate is also registered for `executed()` lookups (an explicit
+    /// `--gate` for the same chain wins). Omit it => `chains` returns `[]`.
+    #[arg(long = "chains-file", env = "GRAPHQL_CHAINS_FILE", value_name = "PATH")]
+    chains_file: Option<String>,
     /// Expose the `submitSignature` mutation (off by default — read-only).
     #[arg(long, env = "GRAPHQL_ALLOW_MUTATIONS", default_value_t = false)]
     allow_mutations: bool,
@@ -81,10 +87,27 @@ async fn main() -> anyhow::Result<()> {
     for spec in &args.gates {
         chains.add_spec(spec)?;
     }
+
+    // Load the UI-facing registry (if any) and fold each chain's gate into the
+    // executed-gate map, so one --chains-file can drive both the `chains` query
+    // and on-chain status without repeating every gate as a --gate flag.
+    let registry = match &args.chains_file {
+        Some(path) => chain::load_registry(path)?,
+        None => Vec::new(),
+    };
+    for c in &registry {
+        if let (Some(rpc), Some(gate)) = (&c.rpc_url, &c.gate) {
+            chains.add(c.chain_id, rpc, gate)?;
+        }
+    }
     let chain_ids = chains.configured();
 
-    let state =
-        ApiState { backend: Arc::new(backend), threshold: args.threshold, chains };
+    let state = ApiState {
+        backend: Arc::new(backend),
+        threshold: args.threshold,
+        chains,
+        registry,
+    };
 
     // Depth/complexity caps so one request can't fan out to hundreds of store
     // loads or destination-gate RPCs (e.g. an alias bomb). Generous enough for
