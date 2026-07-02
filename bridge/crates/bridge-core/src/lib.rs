@@ -16,6 +16,11 @@ pub mod store;
 #[cfg(feature = "abi")]
 pub mod abi;
 
+// Key custody for the relayer nodes. Needs alloy's local signer / keystore, so
+// it rides the same `abi` feature the validator and keeper already enable.
+#[cfg(feature = "abi")]
+pub mod signer;
+
 #[cfg(feature = "http")]
 pub mod remote;
 

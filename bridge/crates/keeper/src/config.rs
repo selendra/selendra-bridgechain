@@ -1,3 +1,4 @@
+use bridge_core::signer::SignerConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -9,7 +10,9 @@ pub struct Config {
     /// keeper should deliver claims to (e.g. chainB *and* chainC).
     #[serde(default)]
     pub targets: Vec<TargetChain>,
-    pub keeper: Keeper,
+    /// How the keeper holds the funded gas-payer key that signs `claim()` txs
+    /// (raw dev key, env var, or an encrypted keystore). See [`SignerConfig`].
+    pub keeper: SignerConfig,
     pub store: Store,
 }
 
@@ -20,12 +23,6 @@ pub struct TargetChain {
     pub gate: String,
     #[serde(default = "default_interval")]
     pub poll_interval_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Keeper {
-    /// funded key on the target chain that pays gas for `claim()`
-    pub private_key: String,
 }
 
 /// Where the keeper reads signatures: a local directory (`dir`) or the HTTP

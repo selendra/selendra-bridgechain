@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg_path = std::env::args().nth(1).unwrap_or_else(|| "validator.toml".into());
     let cfg = Config::load(&cfg_path)?;
 
-    let signer: PrivateKeySigner = cfg.signer.private_key.parse().context("bad private_key")?;
+    let signer = cfg.signer.load("validator").context("loading validator signer")?;
     let signer_addr = signer.address();
     // One sink, shared across every per-source scan loop.
     let sink = Arc::new(Sink::from_config(&cfg.store)?);

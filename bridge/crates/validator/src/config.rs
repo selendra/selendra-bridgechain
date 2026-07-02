@@ -1,3 +1,4 @@
+use bridge_core::signer::SignerConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -9,7 +10,9 @@ pub struct Config {
     /// validator process can sign transfers originating on B *and* C.
     #[serde(default)]
     pub sources: Vec<SourceChain>,
-    pub signer: Signer,
+    /// How this node holds its signing key (raw dev key, env var, or — for
+    /// production — an encrypted keystore). See [`SignerConfig`].
+    pub signer: SignerConfig,
     pub store: Store,
     /// Optional operator HTTP API (pause/resume/rescan/status).
     #[serde(default)]
@@ -52,12 +55,6 @@ impl SourceChain {
         anyhow::ensure!(!out.is_empty(), "no RPC endpoints configured (set `rpc` or `rpcs`)");
         Ok(out)
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Signer {
-    /// dev-only raw key; production would use an encrypted keystore
-    pub private_key: String,
 }
 
 /// Where signatures go. Either a local directory (`dir`) or the HTTP sig-store
