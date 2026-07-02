@@ -142,15 +142,39 @@ docker compose up -d validator1 validator2 validator3 keeper
            rpc = "http://…"                 # single endpoint (back-compat), OR
            rpcs = ["http://…", "http://…"]  # ordered failover list
            state_file = "validator-state.json"   # resumable cursor + nonce state
-[signer]   private_key      # dev only; production uses an encrypted keystore
+[signer]   # how this node holds its signing key — see "Key custody" below
 [store]    dir = "…"   OR   url = "http://sig-store:8080"
 [api]      bind = "127.0.0.1:9090"   # optional operator API
 
 # keeper.toml
 [target]   chain_id, rpc, gate, poll_interval_ms
-[keeper]   private_key      # funded on the target chain, pays claim() gas
+[keeper]   # funded gas-payer key — same custody options as [signer]
 [store]    dir = "…"   OR   url = "http://sig-store:8080"
 ```
+
+### Key custody
+
+No single key can move funds on-chain — `claim()` needs a threshold of *distinct*
+validator signatures. That only holds if each relayer guards its own key well, so
+`[signer]` (validator) and `[keeper]` (gas payer) both accept, in order of
+preference — **exactly one** source:
+
+```toml
+[signer]
+# 1. Encrypted keystore (Web3 Secret Storage / `cast wallet`) — recommended.
+keystore = "/run/secrets/validator-keystore.json"
+keystore_password_file = "/run/secrets/keystore-password"   # OR
+keystore_password_env  = "KEYSTORE_PASSWORD"                # OR (dev) keystore_password = "…"
+
+# 2. Raw key via env var — keeps the secret out of the file (Docker/systemd secret).
+private_key_env = "VALIDATOR_PRIVATE_KEY"
+
+# 3. Raw key inline — DEV ONLY (logged as a warning; a leaked config is a leaked key).
+private_key = "0x…"
+```
+
+Setting more than one source (or a keystore without a password) is rejected at
+startup. Secrets are redacted from any debug output of the config.
 
 ## What's next (per the build plan)
 

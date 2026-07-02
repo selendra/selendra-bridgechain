@@ -1,5 +1,8 @@
 import { useState } from "react";
-import { fetchSubmission, GqlError, type Submission } from "../lib/api";
+import { Search } from "lucide-react";
+import { fetchSubmission, GqlError, type Submission } from "../../lib/api";
+import { Button } from "../../components/ui/button";
+import { Input } from "../../components/ui/input";
 
 interface Props {
   onFound: (s: Submission) => void;
@@ -34,18 +37,22 @@ export function Lookup({ onFound }: Props) {
   };
 
   return (
-    <form className="lookup" onSubmit={submit}>
-      <input
-        type="text"
-        placeholder="Look up submissionId (0x + 64 hex)…"
-        value={id}
-        spellCheck={false}
-        onChange={(e) => setId(e.target.value)}
-      />
-      <button type="submit" disabled={busy || id.trim() === ""}>
+    <form className="flex flex-wrap items-center gap-2" onSubmit={submit}>
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-faint" />
+        <Input
+          type="text"
+          placeholder="Look up submissionId (0x + 64 hex)…"
+          value={id}
+          spellCheck={false}
+          onChange={(e) => setId(e.target.value)}
+          className="w-[300px] max-w-[48vw] pl-8"
+        />
+      </div>
+      <Button type="submit" size="sm" disabled={busy || id.trim() === ""}>
         {busy ? "…" : "Find"}
-      </button>
-      {error && <span className="lookup-error">{error}</span>}
+      </Button>
+      {error && <span className="text-[12px] text-warning">{error}</span>}
     </form>
   );
 }

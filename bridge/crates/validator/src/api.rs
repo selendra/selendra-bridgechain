@@ -17,14 +17,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::state::Runtime;
 
@@ -33,6 +35,39 @@ pub struct ApiState {
     /// One runtime per watched source chain, keyed by chain_id.
     pub sources: Arc<BTreeMap<u64, Arc<Mutex<Runtime>>>>,
     pub validator: String,
+    /// Shared secret required as `Authorization: Bearer <token>` on the state-
+    /// changing routes (pause/resume/rescan). `None` => unauthenticated (dev).
+    pub token: Option<String>,
+}
+
+/// Bearer-token gate for the operator API's state-changing routes.
+async fn require_auth(
+    State(expected): State<Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(Serialize)]
@@ -52,16 +87,33 @@ struct RescanRequest {
 }
 
 pub fn router(state: ApiState) -> Router {
-    Router::new()
+    // Read-only status stays open for monitoring; the state-changing routes
+    // (which can halt the validator — a DoS vector) require the bearer token.
+    let status = Router::new()
         .route("/status", get(status_all))
-        .route("/status/:chain_id", get(status_one))
+        .route("/status/:chain_id", get(status_one));
+
+    let mut control = Router::new()
         .route("/pause", post(pause_bare))
         .route("/pause/:chain_id", post(pause_one))
         .route("/resume", post(resume_bare))
         .route("/resume/:chain_id", post(resume_one))
         .route("/rescan", post(rescan_bare))
-        .route("/rescan/:chain_id", post(rescan_one))
-        .with_state(state)
+        .route("/rescan/:chain_id", post(rescan_one));
+
+    match state.token.clone().filter(|t| !t.is_empty()) {
+        Some(token) => {
+            info!("operator API auth enabled: bearer token required for pause/resume/rescan");
+            control = control
+                .route_layer(middleware::from_fn_with_state(Arc::new(token), require_auth));
+        }
+        None => warn!(
+            "VALIDATOR_API_TOKEN is unset — operator API pause/resume/rescan are \
+             UNAUTHENTICATED (anyone who can reach it can halt this validator)."
+        ),
+    }
+
+    status.merge(control).with_state(state)
 }
 
 /// Spawn the operator API on `bind`. Returns once the listener is bound.

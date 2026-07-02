@@ -14,7 +14,7 @@ sleep 0.5
 
 # --- backend: GraphQL API over the existing signature store ---
 cd "$ROOT"
-setsid bash -c 'exec ./target/debug/graphql-api --bind 127.0.0.1:8088 --dir sig-store-data --threshold 2' \
+setsid bash -c 'exec ./target/debug/graphql-api --bind 127.0.0.1:8088 --dir sig-store-data --threshold 2 --chains-file chains.json' \
   >"$LOG/api.log" 2>&1 < /dev/null &
 disown || true
 

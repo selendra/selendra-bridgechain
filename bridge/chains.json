@@ -1,0 +1,5 @@
+[
+  { "chain_id": 1337, "name": "Anvil A", "rpc_url": "http://127.0.0.1:8545" },
+  { "chain_id": 1338, "name": "Anvil B", "rpc_url": "http://127.0.0.1:8546" },
+  { "chain_id": 1339, "name": "Anvil C", "rpc_url": "http://127.0.0.1:8547" }
+]

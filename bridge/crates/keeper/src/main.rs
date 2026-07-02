@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg_path = std::env::args().nth(1).unwrap_or_else(|| "keeper.toml".into());
     let cfg = Config::load(&cfg_path)?;
 
-    let signer: PrivateKeySigner = cfg.keeper.private_key.parse().context("bad private_key")?;
+    let signer = cfg.keeper.load("keeper").context("loading keeper signer")?;
     // Shared across every per-target loop (one HTTP client / one dir handle).
     let source = Arc::new(Source::from_config(&cfg.store)?);
 

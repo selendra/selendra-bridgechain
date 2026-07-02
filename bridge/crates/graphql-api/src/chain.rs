@@ -13,6 +13,41 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use anyhow::Context;
 use bridge_core::abi::Gate;
+use serde::{Deserialize, Serialize};
+
+/// A network the bridge UI can target, served to the frontend via the `chains`
+/// query so it discovers configured networks instead of hardcoding them.
+///
+/// Only `chain_id` and `name` are required; `gate`/`token` are deployed fresh by
+/// the local scripts each run, so they're optional here and may be supplied (or
+/// overridden) from the UI. When `rpc_url` + `gate` are present, the API also
+/// registers the gate for on-chain `executed()` lookups (see [`Chains::add`]).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChainInfo {
+    pub chain_id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+    #[serde(default)]
+    pub gate: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Load the chain registry from a JSON file (an array of [`ChainInfo`]).
+pub fn load_registry(path: &str) -> anyhow::Result<Vec<ChainInfo>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading chains file {path}"))?;
+    let chains: Vec<ChainInfo> =
+        serde_json::from_str(&raw).with_context(|| format!("parsing chains file {path}"))?;
+    for c in &chains {
+        if let Some(g) = &c.gate {
+            Address::from_str(g.trim())
+                .with_context(|| format!("bad gate address for chain {} in {path}", c.chain_id))?;
+        }
+    }
+    Ok(chains)
+}
 
 /// Destination gates the API can read execution status from. Cheap to clone
 /// (each `DynProvider` is an `Arc` internally); share freely across resolvers.
@@ -51,6 +86,26 @@ impl Chains {
         let provider = ProviderBuilder::new().connect_http(url).erased();
         self.gates.insert(chain_id, (provider, gate));
         Ok(chain_id)
+    }
+
+    /// Register a destination gate from already-parsed parts (used to fold the
+    /// `--chains-file` registry into the executed-gate map). A no-op if this
+    /// chain already has a gate (an explicit `--gate` wins).
+    pub fn add(&mut self, chain_id: u64, rpc: &str, gate: &str) -> anyhow::Result<()> {
+        if self.gates.contains_key(&chain_id) {
+            return Ok(());
+        }
+        let gate: Address = gate
+            .trim()
+            .parse()
+            .with_context(|| format!("bad gate address for chain {chain_id}"))?;
+        let url = rpc
+            .trim()
+            .parse()
+            .with_context(|| format!("bad rpc url for chain {chain_id}"))?;
+        let provider = ProviderBuilder::new().connect_http(url).erased();
+        self.gates.insert(chain_id, (provider, gate));
+        Ok(())
     }
 
     /// The destination chainIds this API can report execution status for.

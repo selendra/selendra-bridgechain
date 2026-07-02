@@ -1,4 +1,7 @@
-import type { SubmissionFilter } from "../lib/api";
+import { X } from "lucide-react";
+import type { SubmissionFilter } from "../../lib/api";
+import { Button } from "../../components/ui/button";
+import { FieldLabel, Input, Select } from "../../components/ui/input";
 
 export type ReadyFilter = "any" | "ready" | "pending";
 
@@ -38,32 +41,33 @@ interface Props {
 
 export function Filters({ values, onChange, thresholdKnown }: Props) {
   const set = (patch: Partial<FilterValues>) => onChange({ ...values, ...patch });
+  const dirty = JSON.stringify(values) !== JSON.stringify(EMPTY_FILTERS);
 
   return (
-    <section className="filters">
-      <label>
+    <section className="flex flex-wrap items-end gap-3">
+      <FieldLabel className="w-28">
         From chain
-        <input
+        <Input
           type="number"
           inputMode="numeric"
           placeholder="any"
           value={values.chainIdFrom}
           onChange={(e) => set({ chainIdFrom: e.target.value })}
         />
-      </label>
-      <label>
+      </FieldLabel>
+      <FieldLabel className="w-28">
         To chain
-        <input
+        <Input
           type="number"
           inputMode="numeric"
           placeholder="any"
           value={values.chainIdTo}
           onChange={(e) => set({ chainIdTo: e.target.value })}
         />
-      </label>
-      <label>
+      </FieldLabel>
+      <FieldLabel className="w-28">
         Min signatures
-        <input
+        <Input
           type="number"
           inputMode="numeric"
           min={0}
@@ -71,10 +75,10 @@ export function Filters({ values, onChange, thresholdKnown }: Props) {
           value={values.minSignatures}
           onChange={(e) => set({ minSignatures: e.target.value })}
         />
-      </label>
-      <label>
+      </FieldLabel>
+      <FieldLabel className="w-36">
         Readiness
-        <select
+        <Select
           value={values.ready}
           onChange={(e) => set({ ready: e.target.value as ReadyFilter })}
           disabled={!thresholdKnown}
@@ -87,15 +91,17 @@ export function Filters({ values, onChange, thresholdKnown }: Props) {
           <option value="any">Any</option>
           <option value="ready">Ready only</option>
           <option value="pending">Pending only</option>
-        </select>
-      </label>
-      <button
-        type="button"
-        className="btn-ghost"
+        </Select>
+      </FieldLabel>
+      <Button
+        variant="ghost"
+        size="sm"
+        disabled={!dirty}
         onClick={() => onChange(EMPTY_FILTERS)}
       >
+        <X />
         Clear
-      </button>
+      </Button>
     </section>
   );
 }
