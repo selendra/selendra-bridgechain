@@ -207,7 +207,11 @@ contract Gate {
     /// @param token      the ERC-20 to lock on this (source) chain
     /// @param amount     amount to bridge
     /// @param chainIdTo  destination chain id
-    /// @param receiver   destination recipient — exactly 20 bytes (packed EVM address)
+    /// @param receiver   destination recipient. Its width is fixed by the target VM:
+    ///                   20 bytes for an EVM address, or 32 bytes for a non-EVM
+    ///                   account key (e.g. a Solana pubkey / SPL associated token
+    ///                   account). Any other length is rejected so funds can't lock
+    ///                   here against a receiver the target gate can't decode.
     /// @param autoParams empty bytes for none, or abi.encode(AutoParamsTo) for an
     ///                   execution payload
     function send(
@@ -218,9 +222,11 @@ contract Gate {
         bytes calldata autoParams
     ) external whenNotPaused returns (bytes32 submissionId) {
         if (amount == 0) revert ZeroAmount();
-        // EVM <-> EVM: the recipient must be a bare 20-byte address, else funds
-        // would lock here and be misrouted by _toAddress on the target.
-        if (receiver.length != 20) revert BadReceiver();
+        // The receiver is only ever hashed and emitted here (never dereferenced on
+        // this chain), but we still pin its width to the destination address size:
+        // 20 = EVM address, 32 = Solana/non-EVM account key. A wrong length means a
+        // malformed recipient, so reject rather than lock funds against garbage.
+        if (receiver.length != 20 && receiver.length != 32) revert BadReceiver();
 
         uint256 nonce = nonceTo[chainIdTo];
         bytes32 debridgeId = BridgeHash.getDebridgeId(block.chainid, token);

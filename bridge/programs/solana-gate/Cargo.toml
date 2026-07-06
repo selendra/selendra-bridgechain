@@ -1,0 +1,25 @@
+[package]
+name = "solana-gate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Solana bridge gate program — the on-chain counterpart of Gate.sol"
+
+# Built with the Solana toolchain, NOT the host workspace:
+#     cargo build-sbf --manifest-path programs/solana-gate/Cargo.toml
+# (its solana-program / spl-token deps only compile for the BPF/SBF target). The
+# protocol logic here is the tested `bridge-solana` crate's logic, reimplemented
+# against Solana syscalls (keccak, secp256k1_recover) and SPL CPIs.
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+# Pinned to the local test node's runtime (Solana 1.18.26 / platform-tools v1.41).
+[dependencies]
+solana-program = "=1.18.26"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+borsh = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[features]
+no-entrypoint = []

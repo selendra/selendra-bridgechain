@@ -1597,6 +1597,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-solana"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "anyhow",
+ "borsh",
+ "bridge-core",
+ "hex",
+ "k256",
+ "serde",
+ "serde_json",
+ "sha3 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3263,6 +3281,7 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2",
+ "signature",
 ]
 
 [[package]]

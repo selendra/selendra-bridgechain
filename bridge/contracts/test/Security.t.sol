@@ -131,15 +131,17 @@ contract SecurityTest is Test {
         assertEq(gate.nonceTo(CHAIN_TO), 2, "nonces must stay sequential under reentrancy");
     }
 
-    // ---- C3: receiver must be exactly 20 bytes ----
+    // ---- C3: receiver width must be 20 (EVM) or 32 (Solana/non-EVM) ----
+    // The 32-byte case is a *valid* Solana receiver now; see SolanaBridge.t.sol.
 
     function test_Send_RevertsReceiverTooLong() public {
         token.mint(attacker, 10 ether);
         vm.startPrank(attacker);
         token.approve(address(gate), type(uint256).max);
-        // 32-byte left-padded address — the classic mis-encoding
+        // 33 bytes — wider than any supported destination address size.
+        bytes memory tooLong = new bytes(33);
         vm.expectRevert(Gate.BadReceiver.selector);
-        gate.send(address(token), 1 ether, CHAIN_TO, abi.encode(address(0xCAFE)), "");
+        gate.send(address(token), 1 ether, CHAIN_TO, tooLong, "");
         vm.stopPrank();
     }
 

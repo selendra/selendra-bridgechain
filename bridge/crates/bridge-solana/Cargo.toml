@@ -1,0 +1,38 @@
+[package]
+name = "bridge-solana"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+# The Solana side of the bridge, host-testable.
+#
+# This crate holds the protocol logic a Solana gate program runs — the keccak
+# submissionId, secp256k1 signature verification, and the claim/send state
+# machine — plus the off-chain relayer adapters (scan a Sent log, encode a claim
+# instruction). It is deliberately alloy-free: it hashes with `sha3` (Solana's
+# keccak syscall) and recovers signers with `k256` (Solana's secp256k1_recover
+# syscall), so the exact bytes here are what the on-chain program computes.
+#
+# The deployable BPF program lives in ../../programs/solana-gate (excluded from
+# this workspace; built with `cargo build-sbf`). It is a thin entrypoint over the
+# same logic proven here.
+
+[dependencies]
+# keccak256 — same primitive as Solana's `keccak` syscall.
+sha3 = "0.10"
+# secp256k1 ECDSA recovery — same as Solana's `secp256k1_recover` syscall.
+k256 = { version = "0.13", features = ["ecdsa"] }
+# Borsh wire format — how a Solana program (de)serializes instruction data.
+borsh = { version = "1", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests prove byte-for-byte agreement with the EVM/alloy side.
+bridge-core = { workspace = true, features = ["abi"] }
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+tokio = { workspace = true }

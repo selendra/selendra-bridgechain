@@ -1,6 +1,10 @@
 # rust
 /target
 
+# solana BPF build + localnet harness deps (Cargo.lock IS committed for pins)
+programs/solana-gate/target
+tools/localnet/node_modules
+
 # foundry
 contracts/out
 contracts/cache
