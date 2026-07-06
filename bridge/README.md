@@ -1,4 +1,4 @@
-# EVM ↔ EVM Bridge (Phases 0–7)
+# EVM ↔ EVM + EVM ↔ Solana Bridge (Phases 0–8)
 
 An external-validator bridge built per [`../docs/BRIDGE_BUILD_PLAN.md`](../docs/BRIDGE_BUILD_PLAN.md),
 modeled on [deBridge's `DeBridgeGate`](https://github.com/debridge-finance/debridge-contracts-v1/tree/main/contracts/transfers).
@@ -176,8 +176,71 @@ private_key = "0x…"
 Setting more than one source (or a keystore without a password) is rejected at
 startup. Secrets are redacted from any debug output of the config.
 
+## EVM ↔ Solana (Phase 8)
+
+The bridge is no longer EVM-only. The protocol is chain-agnostic: the sacred
+keccak `submissionId` and the EIP-191 secp256k1 validator signatures only need a
+keccak and a secp256k1-recover primitive to verify — and Solana has both
+(`keccak` and `secp256k1_recover` syscalls). So **the same validator set, with the
+same keys, signs for both VMs** — no new signing path, no new trust assumption.
+
+What changed:
+
+- **`Gate.sol`** `send()` now accepts a **32-byte** receiver (a Solana pubkey /
+  SPL token account) as well as a 20-byte EVM address, so an EVM→Solana transfer
+  can be initiated. Any other width is still rejected.
+- **`crates/bridge-solana`** — the Solana side, host-testable and alloy-free:
+  `hash` (keccak `submissionId`, byte-identical to `BridgeHash.sol`), `verify`
+  (`secp256k1_recover` + the ascending-signer threshold rule from
+  `_verifySignatures`), the `SolanaGate` send/claim state machine, the Borsh
+  instruction wire format, and the off-chain relayer adapters (scan a `Sent`
+  program log; encode a `claim` instruction).
+- **`programs/solana-gate`** — the deployable native Solana program: a
+  syscall-based reimplementation of the above, built with `cargo build-sbf` (out
+  of the host workspace; see its README).
+
+Solana's chain id is `7565164` (deBridge's value, also used in the hash fixtures).
+
+Verify the whole thing — no Solana runtime needed:
+
+```bash
+bash scripts/solana-e2e.sh
+```
+
+It runs (1) the Foundry test for the 32-byte send path, (2) the cross-chain hash
++ signature equivalence (`bridge-solana` reproduces every fixture id and accepts
+real validator signatures), and (3) a both-direction end-to-end simulation driven
+by real validator signatures: EVM→Solana claim releases SPL under a 2-of-3
+threshold (replay-blocked, below-threshold refused), and a Solana→Send is scanned,
+independently recomputed, and its signatures pass the EVM gate's verification.
+
+### On a real Solana validator (Docker)
+
+The program has also been built and run against a **live local validator** —
+proving the `secp256k1_recover` / `keccak` path works on-chain, not just in the
+host reproduction:
+
+```bash
+# 1. local validator
+docker run -d --name solana-node -p 8899:8899 -p 8900:8900 \
+  solanalabs/solana:v1.18.26 solana-test-validator --ledger /tmp/ledger --quiet
+# 2. build the BPF program (handles the toolchain/edition2024 dep pinning)
+bash scripts/build-solana.sh
+# 3. deploy + drive a real EVM->Solana claim
+bash scripts/solana-localnet-e2e.sh
+```
+
+Step 3 deploys `solana_gate.so`, creates an SPL mint + a program-owned vault +
+a receiver account, `Init`s the gate with the 3 EVM validators (threshold 2), and
+submits a `Claim` carrying **2 real validator signatures**. It asserts, on-chain:
+the SPL is released to the receiver, a replay is rejected, and a **1-of-3
+(below-threshold) claim is refused** — no funds move without quorum. The
+signatures are the exact EIP-191 secp256k1 signatures the EVM validators produce.
+
 ## What's next (per the build plan)
 
+- **P8+** deploy `solana-gate` to a **localnet** ✓ (done — `scripts/build-solana.sh`
+  + `scripts/solana-localnet-e2e.sh`); next, a public **devnet** deploy and wiring
+  the live validator/keeper to a Solana RPC (scan program logs / submit claims).
 - **P8** asset registry + wrapped-token minting (`deployId`).
 - **P9** testnet soak, chaos, audit.
-```
