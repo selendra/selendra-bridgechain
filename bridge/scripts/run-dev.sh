@@ -19,8 +19,9 @@ setsid bash -c 'exec ./target/debug/graphql-api --bind 127.0.0.1:8088 --dir sig-
 disown || true
 
 # --- frontend: Vite dev server (proxies /graphql -> 127.0.0.1:8088) ---
-cd "$ROOT/web"
-setsid bash -c 'exec npx vite --host 127.0.0.1 --port 5173 --strictPort' \
+cd "$ROOT/frontend"
+[ -d node_modules ] || npm install --no-audit --no-fund
+setsid bash -c 'exec npx vite --host 0.0.0.0 --port 5173 --strictPort' \
   >"$LOG/web.log" 2>&1 < /dev/null &
 disown || true
 
