@@ -24,3 +24,4 @@ debridge_node/bundlr_wallet.json
 target
 sig-*
 .live-*
+bridge/contracts/fixtures/swap-deploy.env

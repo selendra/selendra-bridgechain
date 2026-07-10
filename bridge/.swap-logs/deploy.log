@@ -1,0 +1,36 @@
+No files changed, compilation skipped
+Warning: EIP-3855 is not supported in one or more of the RPCs used.
+Unsupported Chain IDs: 1337.
+Contracts deployed with a Solidity version equal or higher than 0.8.20 might not work properly.
+For more information, please see https://eips.ethereum.org/EIPS/eip-3855
+Script ran successfully.
+
+== Logs ==
+  SwapPool: 0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9
+  stable  : 0x5FbDB2315678afecb367f032d93F642f64180aa3
+  WETH    : 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
+  TT      : 0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
+
+## Setting up 1 EVM.
+
+==========================
+
+Chain 1337
+
+Estimated gas price: 2.000000001 gwei
+
+Estimated total gas used for script: 4894057
+
+Estimated amount required: 0.009788114004894057 ETH
+
+==========================
+
+
+==========================
+
+ONCHAIN EXECUTION COMPLETE & SUCCESSFUL.
+
+Transactions saved to: /home/nath/project/debridge-node/bridge/contracts/broadcast/DeploySwap.s.sol/1337/run-latest.json
+
+Sensitive values saved to: /home/nath/project/debridge-node/bridge/contracts/cache/DeploySwap.s.sol/1337/run-latest.json
+
