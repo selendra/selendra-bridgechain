@@ -13,6 +13,7 @@ use bridge_core::store::{SignerSig, SubmissionRecord};
 
 use crate::backend::Backend;
 use crate::chain::{ChainInfo, Chains};
+use crate::swap::{PoolToken, Swaps};
 
 /// Shared, read-mostly state handed to every resolver via the schema's data.
 pub struct ApiState {
@@ -27,6 +28,9 @@ pub struct ApiState {
     /// frontend discovers configured chains instead of hardcoding them). Empty
     /// when the API wasn't started with `--chains-file`.
     pub registry: Vec<ChainInfo>,
+    /// Optional same-chain `SwapPool` RPCs, so `pools`/`swapQuote` can report
+    /// live pool state. Empty => those fields are null.
+    pub swaps: Swaps,
 }
 
 /// A network the bridge UI can target. Mirrors [`ChainInfo`] for the wire.
@@ -50,6 +54,39 @@ impl From<ChainInfo> for Chain {
             rpc_url: c.rpc_url,
             gate: c.gate,
             token: c.token,
+        }
+    }
+}
+
+/// One listed token in a same-chain swap pool. Numeric fields are decimal
+/// strings (uint256) to avoid JSON precision loss, like `Submission.amount`.
+#[derive(SimpleObject)]
+pub struct PoolTokenView {
+    /// `0x`-prefixed token address.
+    pub token: String,
+    /// ERC-20 symbol (empty if the token doesn't expose one).
+    pub symbol: String,
+    pub decimals: u8,
+    /// USD price, 1e18-scaled, decimal string.
+    pub price: String,
+    /// Current reserve (the swap lock), in token base units, decimal string.
+    pub reserve: String,
+    /// Max swap-out value in 1e18-scaled USD (`reserve*price/10^decimals`).
+    pub max_swap_usd: String,
+    /// True for the pool's core-price stablecoin.
+    pub is_stable: bool,
+}
+
+impl From<PoolToken> for PoolTokenView {
+    fn from(p: PoolToken) -> Self {
+        PoolTokenView {
+            token: p.token,
+            symbol: p.symbol,
+            decimals: p.decimals,
+            price: p.price,
+            reserve: p.reserve,
+            max_swap_usd: p.max_swap_usd,
+            is_stable: p.is_stable,
         }
     }
 }
@@ -257,6 +294,32 @@ impl Query {
     /// the API was started without `--chains-file`.
     async fn chains(&self, ctx: &Context<'_>) -> Vec<Chain> {
         state(ctx).registry.iter().cloned().map(Chain::from).collect()
+    }
+
+    /// Live snapshot of a same-chain swap pool: every listed token with its
+    /// price, reserve (the swap lock), and max-swap-out USD value. `null` when
+    /// the API has no `--swap` configured for `chainId` (or the RPC read failed).
+    async fn pools(&self, ctx: &Context<'_>, chain_id: u64) -> Option<Vec<PoolTokenView>> {
+        state(ctx)
+            .swaps
+            .pools(chain_id)
+            .await
+            .map(|v| v.into_iter().map(Into::into).collect())
+    }
+
+    /// On-chain `quote` for a same-chain swap: the pegged output (net of fee,
+    /// before the reserve cap) for swapping `amountIn` of `tokenIn` into
+    /// `tokenOut`, as a decimal string. `null` when the chain isn't configured,
+    /// an address/amount is malformed, or a token isn't listed (call reverts).
+    async fn swap_quote(
+        &self,
+        ctx: &Context<'_>,
+        chain_id: u64,
+        token_in: String,
+        token_out: String,
+        amount_in: String,
+    ) -> Option<String> {
+        state(ctx).swaps.quote(chain_id, &token_in, &token_out, &amount_in).await
     }
 
     /// Aggregate counts across the whole store.

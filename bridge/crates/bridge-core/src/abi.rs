@@ -65,5 +65,30 @@ sol! {
         function approve(address spender, uint256 amount) external returns (bool);
         function balanceOf(address account) external view returns (uint256);
         function mint(address to, uint256 amount) external;
+        function symbol() external view returns (string);
+        function decimals() external view returns (uint8);
+    }
+
+    /// Same-chain pegged-price swap pool. Signatures MUST match
+    /// `contracts/src/SwapPool.sol` (read-view subset used by the GraphQL API).
+    #[sol(rpc)]
+    contract SwapPool {
+        event TokenListed(address indexed token, uint256 price, uint8 decimals);
+        event TokenDelisted(address indexed token);
+
+        function stable() external view returns (address);
+        /// Public getter for the `tokens` mapping (fields in declaration order).
+        function tokens(address token)
+            external
+            view
+            returns (bool listed, uint8 decimals, uint256 price, uint256 reserve);
+        function quote(address tokenIn, address tokenOut, uint256 amountIn)
+            external
+            view
+            returns (uint256 amountOut);
+        function maxSwapOut(address token)
+            external
+            view
+            returns (uint256 reserve, uint256 usdValue);
     }
 }

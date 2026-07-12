@@ -17,6 +17,7 @@
 mod backend;
 mod chain;
 mod schema;
+mod swap;
 
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ use tracing::info;
 use backend::Backend;
 use chain::Chains;
 use schema::{ApiState, Mutation, Query};
+use swap::Swaps;
 
 #[derive(Parser, Debug)]
 #[command(about = "GraphQL API over the bridge signature store")]
@@ -59,6 +61,12 @@ struct Args {
     /// `--gate` for the same chain wins). Omit it => `chains` returns `[]`.
     #[arg(long = "chains-file", env = "GRAPHQL_CHAINS_FILE", value_name = "PATH")]
     chains_file: Option<String>,
+    /// Same-chain SwapPool(s) for the `pools`/`swapQuote` read view, as
+    /// `CHAINID=RPC,POOL` (repeatable), e.g.
+    /// `--swap 1337=http://127.0.0.1:8545,0xPool...`. Without it, `pools` and
+    /// `swapQuote` return null. Read-only — no swaps are executed server-side.
+    #[arg(long = "swap", value_name = "CHAINID=RPC,POOL")]
+    swaps: Vec<String>,
     /// Expose the `submitSignature` mutation (off by default — read-only).
     #[arg(long, env = "GRAPHQL_ALLOW_MUTATIONS", default_value_t = false)]
     allow_mutations: bool,
@@ -102,11 +110,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let chain_ids = chains.configured();
 
+    let mut swaps = Swaps::new();
+    for spec in &args.swaps {
+        swaps.add_spec(spec)?;
+    }
+    let swap_ids = swaps.configured();
+
     let state = ApiState {
         backend: Arc::new(backend),
         threshold: args.threshold,
         chains,
         registry,
+        swaps,
     };
 
     // Depth/complexity caps so one request can't fan out to hundreds of store
@@ -139,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         threshold = ?args.threshold,
         mutations = args.allow_mutations,
         on_chain_status_for = ?chain_ids,
+        swap_pools_for = ?swap_ids,
         "graphql-api listening (GraphiQL at /)"
     );
     axum::serve(listener, app).await?;

@@ -28,6 +28,7 @@ contracts/broadcast
 /keeper-gql.toml
 /validator-state.json
 *.json.tmp
+*.log
 
 # deps are vendored by forge install; keep lib out of git
 contracts/lib

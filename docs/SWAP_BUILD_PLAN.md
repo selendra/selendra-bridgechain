@@ -234,15 +234,25 @@ This is a design note only; Phase E is out of scope for this plan's build.
 Phase A  SwapPool.sol: registry + pegged quote + seed + swap + reserve cap   ← core   ✅ DONE
 Phase B  Governance & safety: oracle role, deviation guard, pause, fees, access tests  ✅ DONE
 Phase C  Deploy script + shell e2e (anvil): seed pools, swap across decimals, hit lock ✅ DONE
-Phase D  Read view: expose pools/quote in graphql-api (RPC read, like Gate.executed)   ⬜ TODO
+Phase D  Read view: expose pools/quote in graphql-api (RPC read, like Gate.executed)   ✅ DONE
 Phase E  Frontend: real Swap mode wired to wallet (quote → approve → swap)             ⬜ TODO
 Phase F  (later) Cross-chain SwapRouter over Gate.send/claim + autoParams intent        ⬜ LATER
 ```
 
-**Build status (as of this commit):** Phases A–C shipped. `contracts/src/SwapPool.sol`
+**Build status (as of this commit):** Phases A–D shipped. `contracts/src/SwapPool.sol`
 + `contracts/test/Swap.t.sol` (27 tests) + `contracts/script/DeploySwap.s.sol` +
 `bridge/scripts/swap.sh`. All **67 forge tests pass** (40 existing bridge + 27 swap);
 `swap.sh` proves pegged pricing and the reserve lock on a live anvil.
+
+**Phase D as built:** `graphql-api` gained a read-only `pools(chainId)` +
+`swapQuote(chainId, tokenIn, tokenOut, amountIn)` view, driven by a repeatable
+`--swap CHAINID=RPC,POOL` flag (mirrors `--gate`). Listed tokens are discovered by
+replaying `TokenListed`/`TokenDelisted` logs; each token's price/reserve/decimals
+come from the `tokens()` getter and `maxSwapUsd` is derived (`reserve*price/10^dec`).
+`swapQuote` calls the on-chain `SwapPool.quote`. Both degrade to `null` on an
+unconfigured chain or RPC/revert (never fail the query). Bindings added to
+`bridge-core/src/abi.rs` (`SwapPool` + `symbol()`/`decimals()` on the ERC-20).
+Proven by `bridge/scripts/swap-gql.sh` (pools + quote asserted against on-chain).
 
 ---
 
