@@ -46,6 +46,8 @@ export interface WalletState {
   connect: () => Promise<void>;
   disconnect: () => void;
   switchChain: (chainId: number) => Promise<void>;
+  /** Raw EIP-1193 request against the active provider (for reads + txs). */
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
 }
 
 export function useWallet(): WalletState {
@@ -186,6 +188,14 @@ export function useWallet(): WalletState {
     [provider]
   );
 
+  const request = useCallback(
+    (args: { method: string; params?: unknown[] }) => {
+      if (!provider) return Promise.reject(new Error("No wallet connected"));
+      return provider.request(args);
+    },
+    [provider]
+  );
+
   return {
     available: !!provider,
     walletName: active?.name ?? null,
@@ -196,5 +206,6 @@ export function useWallet(): WalletState {
     connect,
     disconnect,
     switchChain,
+    request,
   };
 }

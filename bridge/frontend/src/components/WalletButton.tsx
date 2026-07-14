@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, Glyph } from "./icons";
-import { chainViz, shortHex } from "../data/assets";
-import { useWallet } from "../wallet/useWallet";
+import { chainViz, shortHex } from "../data/format";
+import type { WalletState } from "../wallet/useWallet";
 
 const KNOWN_CHAIN_NAMES: Record<number, string> = {
   1: "Ethereum",
@@ -15,8 +15,9 @@ const KNOWN_CHAIN_NAMES: Record<number, string> = {
   31337: "Localhost",
 };
 
-export function WalletButton() {
-  const wallet = useWallet();
+/** The connect / connected-account control in the navbar. Wallet state is owned
+ *  by App and shared, so this and the views act on one connection. */
+export function WalletButton({ wallet }: { wallet: WalletState }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -30,7 +31,6 @@ export function WalletButton() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  // Not connected → a Connect button (works for MetaMask / any injected wallet).
   if (!wallet.address) {
     return (
       <div className="wallet" ref={ref}>
@@ -38,9 +38,7 @@ export function WalletButton() {
           type="button"
           className="connect-btn"
           onClick={() =>
-            wallet.available
-              ? wallet.connect()
-              : window.open("https://metamask.io/download/", "_blank", "noopener")
+            wallet.available ? wallet.connect() : window.open("https://metamask.io/download/", "_blank", "noopener")
           }
           disabled={wallet.connecting}
           title={wallet.available ? "Connect MetaMask" : "No EVM wallet detected — get MetaMask"}

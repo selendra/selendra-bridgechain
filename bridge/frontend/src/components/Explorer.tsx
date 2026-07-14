@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Dropdown, type DropdownOption } from "./Dropdown";
 import { StatusBadge } from "./StatusBadge";
 import { Glyph, Refresh, ArrowRight, Search } from "./icons";
-import { chainViz, formatUnits, shortHex } from "../data/assets";
+import { chainViz, formatUnits, shortHex } from "../data/format";
 import { fetchStats, fetchSubmissions } from "../api/client";
 import { usePoll } from "../api/hooks";
 import type { Chain, Stats, Submission, SubmissionFilter } from "../api/types";

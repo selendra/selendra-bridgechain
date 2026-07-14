@@ -1,7 +1,7 @@
 import { useEffect, type ReactNode } from "react";
 import { StatusBadge } from "./StatusBadge";
 import { Glyph, ArrowRight } from "./icons";
-import { chainViz, formatUnits, shortHex } from "../data/assets";
+import { chainViz, formatUnits, shortHex } from "../data/format";
 import { fetchSubmission } from "../api/client";
 import { usePoll } from "../api/hooks";
 import type { Chain, Submission } from "../api/types";

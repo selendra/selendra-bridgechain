@@ -1332,3 +1332,205 @@ body {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+/* ================================================================== *
+ * Additions for the rewritten Bridge + Swap views (same visual base) *
+ * ================================================================== */
+
+.card__title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--ink);
+}
+.card__subtitle {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 360px;
+}
+
+/* a from/to row label (replaces the old chain dropdown on the left) */
+.amount-row__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.mono,
+.mono-sm {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.mono-sm {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* --- slippage toggle (in the summary) --- */
+.slippage {
+  display: flex;
+  gap: 6px;
+}
+.slippage__opt {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--white);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.slippage__opt--on {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+/* --- warning notice variant --- */
+.notice--warn {
+  background: #fff5e6;
+  border: 1px solid #f5deb3;
+  color: #9a6a12;
+  margin-top: 18px;
+  margin-bottom: 0;
+}
+
+/* --- tx status banner --- */
+.txbar {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 20px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.txbar__hash {
+  margin-left: auto;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 0.8;
+}
+.txbar--pending {
+  background: var(--blue-soft);
+  border: 1px solid #cfe3ff;
+  color: var(--blue-dark);
+}
+.txbar--done {
+  background: #eafaf1;
+  border: 1px solid #b9ead2;
+  color: #0a8f5b;
+}
+.txbar--error {
+  background: #fdeeec;
+  border: 1px solid #f3c6c0;
+  color: #b23b2b;
+}
+
+.spin {
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* --- bridge: from/to route --- */
+.bridge-route {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.bridge-route__node {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--line-2);
+  border-radius: 16px;
+  background: var(--surface);
+}
+.bridge-route__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.bridge-route__hint {
+  font-size: 12px;
+  color: var(--muted-2);
+}
+.bridge-route__arrow {
+  align-self: center;
+  color: var(--muted-2);
+  flex-shrink: 0;
+}
+
+/* --- form fields (bridge) --- */
+.fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 18px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field__label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.field__max {
+  border: none;
+  background: none;
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+  padding: 0;
+}
+.field__max:hover {
+  text-decoration: underline;
+}
+.field__input {
+  height: 46px;
+  padding: 0 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--white);
+  font-size: 15px;
+  color: var(--ink);
+  outline: none;
+  font-family: inherit;
+  transition: border-color 0.15s;
+}
+.field__input:focus {
+  border-color: var(--blue);
+}
+.field__input--bad {
+  border-color: #e0a3a3;
+  background: #fef7f6;
+}
+
+.ghost-btn--full {
+  width: 100%;
+  justify-content: center;
+  margin-top: 14px;
+}

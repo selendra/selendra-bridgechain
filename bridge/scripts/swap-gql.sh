@@ -99,6 +99,20 @@ BOGUS=0x000000000000000000000000000000000000dEaD
 N2=$(gql "query { swapQuote(chainId:$CHAIN, tokenIn:\"$BOGUS\", tokenOut:\"$STABLE\", amountIn:\"1\") }" | field 'd["data"]["swapQuote"]')
 check "swapQuote(unlisted token)" "$N2" "None"
 
+
+# ---------------------------------------------------------------------------
+echo
+echo "=== Q4: swapPool exposes the pool address for the UI to swap against ==="
+SP=$(gql "query { swapPool(chainId:$CHAIN) { chainId address stable tokens { symbol } } }")
+echo "$SP"
+check "swapPool address"   "$(echo "$SP" | field 'd["data"]["swapPool"]["address"].lower()')" "$(echo "$SWAP_POOL" | tr 'A-Z' 'a-z')"
+check "swapPool stable"    "$(echo "$SP" | field 'd["data"]["swapPool"]["stable"].lower()')"  "$(echo "$STABLE" | tr 'A-Z' 'a-z')"
+check "swapPool chainId"   "$(echo "$SP" | field 'd["data"]["swapPool"]["chainId"]')"          "$CHAIN"
+check "swapPool tokens"    "$(echo "$SP" | field 'len(d["data"]["swapPool"]["tokens"])')"      "3"
+# unconfigured chain -> null
+N3=$(gql "query { swapPool(chainId:9999) { address } }" | field 'd["data"]["swapPool"]')
+check "swapPool(unknown chain)" "$N3" "None"
+
 echo
 echo "================= RESULT ================="
 if [[ "$FAIL" == "0" ]]; then

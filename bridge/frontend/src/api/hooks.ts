@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+/** Debounce a rapidly-changing value (e.g. an amount input driving a quote). */
+export function useDebounced<T>(value: T, ms: number): T {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setV(value), ms);
+    return () => clearTimeout(id);
+  }, [value, ms]);
+  return v;
+}
+
 export interface PollResult<T> {
   data: T | null;
   error: string | null;

@@ -1,0 +1,103 @@
+// Presentation helpers + unit math. The backend only knows chain id/name/rpc,
+// so the gradient/short-code per chain are supplied here (curated palette, or
+// derived deterministically for unknown ids). No fake token registry, no fake
+// USD prices — token metadata now comes live from the swap pool.
+
+export const SOLANA_CHAIN_ID = 7565164;
+
+const CHAIN_PALETTE: Record<number, { gradient: [string, string]; short: string }> = {
+  [SOLANA_CHAIN_ID]: { gradient: ["#9945FF", "#14F195"], short: "SOL" },
+  1: { gradient: ["#8FA6F3", "#3C55DE"], short: "ETH" },
+  8453: { gradient: ["#4C8CFB", "#0052FF"], short: "BASE" },
+  42161: { gradient: ["#3AC6F2", "#2D77E8"], short: "ARB" },
+  10: { gradient: ["#FF6E6E", "#FF0420"], short: "OP" },
+  137: { gradient: ["#A879F7", "#7B3FE4"], short: "POLY" },
+  1337: { gradient: ["#7C5CFF", "#3AA0FF"], short: "A" },
+  1338: { gradient: ["#00C2A8", "#14C8E6"], short: "B" },
+  1339: { gradient: ["#F7A34B", "#F25C05"], short: "C" },
+};
+
+export interface ChainViz {
+  gradient: [string, string];
+  short: string;
+}
+
+/** Deterministic pastel gradient for an id/string we have no palette entry for. */
+function derivedGradient(seed: number): [string, string] {
+  const h = (seed * 2654435761) % 360;
+  return [`hsl(${h} 75% 62%)`, `hsl(${(h + 40) % 360} 75% 48%)`];
+}
+
+export function chainViz(chainId: number, name?: string): ChainViz {
+  const hit = CHAIN_PALETTE[chainId];
+  if (hit) return hit;
+  const short =
+    (name ?? String(chainId)).replace(/[^A-Za-z0-9]/g, "").slice(0, 4).toUpperCase() || String(chainId);
+  return { gradient: derivedGradient(chainId), short };
+}
+
+/** Stable gradient for a token, derived from its address (no registry needed). */
+export function tokenGradient(address: string): [string, string] {
+  let acc = 0;
+  const s = address.toLowerCase();
+  for (let i = 2; i < s.length; i += 4) acc = (acc + parseInt(s.slice(i, i + 4) || "0", 16)) % 100000;
+  return derivedGradient(acc + 7);
+}
+
+// --- unit math -----------------------------------------------------------
+
+/** Parse a human decimal string into base units (bigint). Invalid => 0n. */
+export function parseUnits(value: string, decimals: number): bigint {
+  const s = value.trim();
+  if (!s || !/^\d*\.?\d*$/.test(s)) return 0n;
+  const [wholeRaw, fracRaw = ""] = s.split(".");
+  const whole = wholeRaw || "0";
+  const frac = (fracRaw + "0".repeat(decimals)).slice(0, decimals);
+  try {
+    return BigInt((whole + frac).replace(/^0+(?=\d)/, "") || "0");
+  } catch {
+    return 0n;
+  }
+}
+
+/** Format base units as a grouped, trimmed decimal for DISPLAY (e.g. 1,234.56). */
+export function formatUnits(raw: string | bigint, decimals = 18, maxFrac = 6): string {
+  let s = typeof raw === "bigint" ? raw.toString() : raw.trim();
+  let neg = false;
+  if (s.startsWith("-")) {
+    neg = true;
+    s = s.slice(1);
+  }
+  if (!/^\d+$/.test(s)) return String(raw);
+  s = s.padStart(decimals + 1, "0");
+  const whole = s.slice(0, s.length - decimals).replace(/^0+(?=\d)/, "");
+  let frac = decimals ? s.slice(s.length - decimals) : "";
+  frac = frac.slice(0, maxFrac).replace(/0+$/, "");
+  let grouped: string;
+  try {
+    grouped = BigInt(whole).toLocaleString("en-US");
+  } catch {
+    grouped = whole;
+  }
+  return (neg ? "-" : "") + (frac ? `${grouped}.${frac}` : grouped);
+}
+
+/** Format base units as a plain decimal for an INPUT field (no grouping, full). */
+export function formatUnitsRaw(raw: bigint, decimals: number): string {
+  const neg = raw < 0n;
+  const s = (neg ? -raw : raw).toString().padStart(decimals + 1, "0");
+  const whole = s.slice(0, s.length - decimals);
+  const frac = decimals ? s.slice(s.length - decimals).replace(/0+$/, "") : "";
+  return (neg ? "-" : "") + (frac ? `${whole}.${frac}` : whole);
+}
+
+/** Middle-truncate a hex string: 0x1234…abcd. */
+export function shortHex(hex: string, lead = 6, tail = 4): string {
+  if (!hex || hex.length <= lead + tail + 2) return hex;
+  return `${hex.slice(0, lead)}…${hex.slice(-tail)}`;
+}
+
+/** True for a well-formed 0x-prefixed 20-byte EVM address. */
+export function isAddress(v: string): boolean {
+  return /^0x[0-9a-fA-F]{40}$/.test(v.trim());
+}

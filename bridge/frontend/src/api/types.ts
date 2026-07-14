@@ -51,3 +51,22 @@ export interface SubmissionFilter {
   minSignatures?: number;
   ready?: boolean;
 }
+
+// --- swap (same-chain SwapPool read view) --------------------------------
+
+export interface PoolToken {
+  token: string; // 0x address (lowercase)
+  symbol: string;
+  decimals: number;
+  price: string; // 1e18-scaled USD, decimal string
+  reserve: string; // base units, decimal string — this is the swap lock
+  maxSwapUsd: string; // reserve*price/10^decimals, 1e18-scaled, decimal string
+  isStable: boolean;
+}
+
+export interface SwapPoolInfo {
+  chainId: number;
+  address: string; // SwapPool contract — approve/swap target
+  stable: string;
+  tokens: PoolToken[];
+}

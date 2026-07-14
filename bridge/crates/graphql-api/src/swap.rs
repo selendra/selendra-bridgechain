@@ -39,6 +39,18 @@ pub struct PoolToken {
     pub is_stable: bool,
 }
 
+/// A configured pool's address + core stablecoin + its listed tokens. The
+/// `address` is what the UI sends `approve`/`swap` transactions to (the `pools`
+/// token list alone can't be swapped against without it).
+#[derive(Clone, Debug)]
+pub struct PoolInfo {
+    /// `0x`-prefixed SwapPool contract address.
+    pub address: String,
+    /// `0x`-prefixed core stablecoin (the unit of account).
+    pub stable: String,
+    pub tokens: Vec<PoolToken>,
+}
+
 /// Same-chain swap pools the API can read from. Cheap to clone (each
 /// `DynProvider` is an `Arc` internally); share freely across resolvers.
 #[derive(Clone, Default)]
@@ -180,6 +192,22 @@ impl Swaps {
             });
         }
         Some(out)
+    }
+
+    /// Pool metadata (address + stable) alongside the full token snapshot, so a
+    /// UI can build swap/approve transactions against a discovered pool. `None`
+    /// on the same conditions as [`pools`](Self::pools).
+    pub async fn pool_info(&self, chain_id: u64) -> Option<PoolInfo> {
+        let (_, pool_addr) = self.pools.get(&chain_id)?;
+        let tokens = self.pools(chain_id).await?;
+        // The stable is the (only) token flagged is_stable; derive it from the
+        // snapshot rather than re-reading `stable()` off-chain.
+        let stable = tokens
+            .iter()
+            .find(|t| t.is_stable)
+            .map(|t| t.token.clone())
+            .unwrap_or_default();
+        Some(PoolInfo { address: format!("{pool_addr:#x}"), stable, tokens })
     }
 
     /// On-chain `quote(tokenIn, tokenOut, amountIn)` — the pegged output for a

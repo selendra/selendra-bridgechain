@@ -8,6 +8,10 @@ node_modules/
 /debridge_node/log
 dist/
 data
+# ...but the frontend's src/data is real source (formatters/presentation), not a
+# runtime store — the bare `data` rule above would otherwise silently drop it.
+!bridge/frontend/src/data/
+!bridge/frontend/src/data/**
 /debridge_node/keystore.json
 
 .DS_Store

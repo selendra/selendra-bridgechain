@@ -13,7 +13,7 @@ use bridge_core::store::{SignerSig, SubmissionRecord};
 
 use crate::backend::Backend;
 use crate::chain::{ChainInfo, Chains};
-use crate::swap::{PoolToken, Swaps};
+use crate::swap::{PoolInfo, PoolToken, Swaps};
 
 /// Shared, read-mostly state handed to every resolver via the schema's data.
 pub struct ApiState {
@@ -75,6 +75,30 @@ pub struct PoolTokenView {
     pub max_swap_usd: String,
     /// True for the pool's core-price stablecoin.
     pub is_stable: bool,
+}
+
+/// A configured same-chain swap pool: its contract address, core stablecoin,
+/// and the tokens listed on it. The `address` is what a wallet sends
+/// `approve`/`swap` to, so a UI can execute a swap end-to-end from this alone.
+#[derive(SimpleObject)]
+pub struct SwapPoolInfo {
+    pub chain_id: u64,
+    /// `0x`-prefixed SwapPool contract address.
+    pub address: String,
+    /// `0x`-prefixed core stablecoin (unit of account).
+    pub stable: String,
+    pub tokens: Vec<PoolTokenView>,
+}
+
+impl SwapPoolInfo {
+    fn build(chain_id: u64, info: PoolInfo) -> Self {
+        SwapPoolInfo {
+            chain_id,
+            address: info.address,
+            stable: info.stable,
+            tokens: info.tokens.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 impl From<PoolToken> for PoolTokenView {
@@ -305,6 +329,17 @@ impl Query {
             .pools(chain_id)
             .await
             .map(|v| v.into_iter().map(Into::into).collect())
+    }
+
+    /// Full snapshot of a same-chain swap pool INCLUDING its contract address and
+    /// core stablecoin, so a UI can execute a swap (approve + `swap`) against it.
+    /// `null` when the API has no `--swap` for `chainId` (or the RPC read failed).
+    async fn swap_pool(&self, ctx: &Context<'_>, chain_id: u64) -> Option<SwapPoolInfo> {
+        state(ctx)
+            .swaps
+            .pool_info(chain_id)
+            .await
+            .map(|info| SwapPoolInfo::build(chain_id, info))
     }
 
     /// On-chain `quote` for a same-chain swap: the pegged output (net of fee,

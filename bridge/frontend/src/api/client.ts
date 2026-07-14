@@ -2,7 +2,13 @@
 // (/graphql and /health -> 127.0.0.1:8088, see vite.config.ts). In a production
 // build, serve the SPA behind the same origin as graphql-api, or set VITE_API.
 
-import type { Chain, Stats, Submission, SubmissionFilter } from "./types";
+import type {
+  Chain,
+  Stats,
+  Submission,
+  SubmissionFilter,
+  SwapPoolInfo,
+} from "./types";
 
 const API_BASE = import.meta.env.VITE_API ?? "";
 
@@ -28,12 +34,10 @@ export async function health(): Promise<boolean> {
   }
 }
 
-// --- queries -------------------------------------------------------------
+// --- bridge / signature store -------------------------------------------
 
 export function fetchChains(): Promise<Chain[]> {
-  return gql<{ chains: Chain[] }>(
-    `{ chains { chainId name rpcUrl gate token } }`
-  ).then((d) => d.chains);
+  return gql<{ chains: Chain[] }>(`{ chains { chainId name rpcUrl gate token } }`).then((d) => d.chains);
 }
 
 export function fetchStats(): Promise<Stats> {
@@ -66,4 +70,31 @@ export function fetchSubmission(submissionId: string): Promise<Submission | null
      }`,
     { id: submissionId }
   ).then((d) => d.submission);
+}
+
+// --- swap (same-chain SwapPool) -----------------------------------------
+// chainId is inlined as an integer literal (it's a validated number, not free
+// text) to sidestep the u64 GraphQL scalar name; string args use variables.
+
+export function fetchSwapPool(chainId: number): Promise<SwapPoolInfo | null> {
+  return gql<{ swapPool: SwapPoolInfo | null }>(
+    `{ swapPool(chainId: ${chainId}) {
+         chainId address stable
+         tokens { token symbol decimals price reserve maxSwapUsd isStable }
+       } }`
+  ).then((d) => d.swapPool);
+}
+
+export function fetchSwapQuote(
+  chainId: number,
+  tokenIn: string,
+  tokenOut: string,
+  amountIn: string
+): Promise<string | null> {
+  return gql<{ swapQuote: string | null }>(
+    `query Q($in: String!, $out: String!, $amt: String!) {
+       swapQuote(chainId: ${chainId}, tokenIn: $in, tokenOut: $out, amountIn: $amt)
+     }`,
+    { in: tokenIn, out: tokenOut, amt: amountIn }
+  ).then((d) => d.swapQuote);
 }
