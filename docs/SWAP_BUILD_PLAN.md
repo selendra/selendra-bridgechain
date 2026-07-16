@@ -201,10 +201,11 @@ bar. Pegged pricing moves the main risk from math to **the price source**:
 
 ---
 
-## Cross-chain forward-compat (Phase E, not built now)
+## Cross-chain (Phase F — BUILT)
 
 The same-chain `SwapPool` is the primitive. Cross-chain "swap TokenX@A → TokenY@B"
-becomes a **composition** later, with zero changes to `SwapPool`:
+is a **composition** in `contracts/src/SwapRouter.sol`, with **zero changes to
+`SwapPool` OR `Gate`**:
 
 ```
 @ ChainA:  SwapRouter.swapAndBridge()
@@ -224,7 +225,28 @@ Enablers already present or cheap to add:
 - Routing through the **stablecoin** cross-chain means only *one* asset
   (the stable) needs bridge liquidity on every chain — the hub pays off here.
 
-This is a design note only; Phase E is out of scope for this plan's build.
+**Phase F as built.** The destination leg is **trustless with no Gate callback**:
+`SwapRouter.finalize` proves delivery by checking `Gate.executed[submissionId]`.
+Because `amount` and the swap intent (`finalToken, finalReceiver, finalMinOut`,
+carried in `autoParams.data`) are both committed inside that id — signed by the
+validators — the router can trust exactly `amount` of the stable was delivered to
+it for that intent. A per-id `finalized` guard makes it idempotent; if the
+destination swap can't complete (output over the pool lock, token unlisted,
+slippage) it **falls back to delivering the stable**, so funds never strand. The
+bridge `receiver` is the peer router (owner-registered per corridor via
+`setRemoteRouter`); the end user rides in the intent. `claimAndFinalize` bundles
+`Gate.claim` + the destination swap into one destination tx. Nothing in `Gate` or
+`SwapPool` changed — the `computeSubmissionId`/`executed`/`tokenOf` surface was
+already sufficient.
+
+Proven by `contracts/test/SwapRouter.t.sol` (8 tests: cross-chain round trip,
+two-step claim→finalize, idempotency, not-delivered revert, fallback, stable
+intent, access — all 75 forge tests green) and `bridge/scripts/xswap.sh` (two live
+anvils: `WETH@1337 → TT@1338`, validator-signed, `swapAndBridge → claimAndFinalize`).
+
+**Remaining follow-ups (not blocking):** keeper auto-`finalize` after claim (today
+the destination swap is a separate call / `claimAndFinalize`); a graphql-api
+`remoteRouter`/corridor read view; a frontend cross-chain swap mode.
 
 ---
 
@@ -235,8 +257,8 @@ Phase A  SwapPool.sol: registry + pegged quote + seed + swap + reserve cap   ←
 Phase B  Governance & safety: oracle role, deviation guard, pause, fees, access tests  ✅ DONE
 Phase C  Deploy script + shell e2e (anvil): seed pools, swap across decimals, hit lock ✅ DONE
 Phase D  Read view: expose pools/quote in graphql-api (RPC read, like Gate.executed)   ✅ DONE
-Phase E  Frontend: real Swap mode wired to wallet (quote → approve → swap)             ⬜ TODO
-Phase F  (later) Cross-chain SwapRouter over Gate.send/claim + autoParams intent        ⬜ LATER
+Phase E  Frontend: real Swap mode wired to wallet (quote → approve → swap)             ✅ DONE
+Phase F  Cross-chain SwapRouter over Gate.send/claim + autoParams intent                ✅ DONE
 ```
 
 **Build status (as of this commit):** Phases A–D shipped. `contracts/src/SwapPool.sol`
