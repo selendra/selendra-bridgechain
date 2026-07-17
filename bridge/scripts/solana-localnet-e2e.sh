@@ -32,7 +32,7 @@ for i in 1 2 3 4 5; do solana airdrop 100 >/dev/null 2>&1 && break || sleep 2; d
 echo "payer $(solana address) balance $(solana balance)"
 
 echo "== deploy =="
-solana program deploy "$ROOT/programs/solana-gate/target/deploy/solana_gate.so" --output json > /tmp/deploy.json
+solana program deploy "$ROOT/crates/solana-gate/target/deploy/solana_gate.so" --output json > /tmp/deploy.json
 PROGRAM_ID="$(python3 -c 'import json;print(json.load(open("/tmp/deploy.json"))["programId"])')"
 echo "programId $PROGRAM_ID"
 

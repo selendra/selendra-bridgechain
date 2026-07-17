@@ -1,6 +1,6 @@
 //! The Borsh instruction wire format a Solana gate program (de)serializes.
 //!
-//! Solana programs take a raw byte buffer as instruction data; the convention is
+//! Solana crate take a raw byte buffer as instruction data; the convention is
 //! Borsh. This is the on-the-wire contract between the off-chain keeper (which
 //! builds a `Claim`) and the on-chain program (which decodes and executes it).
 //! Governance instructions are included for completeness; the bridge hot path is

@@ -13,7 +13,7 @@
 //!   * [`instruction`] — the Borsh wire format a Solana program (de)serializes.
 //!   * [`relayer`] — off-chain adapters: scan a `Sent` log, encode a `claim` ix.
 //!
-//! The deployable BPF program (../../programs/solana-gate) is a thin entrypoint
+//! The deployable BPF program (../../crates/solana-gate) is a thin entrypoint
 //! over [`gate`], built with `cargo build-sbf`.
 
 pub mod gate;

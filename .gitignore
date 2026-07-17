@@ -8,6 +8,10 @@ node_modules/
 /debridge_node/log
 dist/
 data
+# ...but the frontend's src/data is real source (formatters/presentation), not a
+# runtime store — the bare `data` rule above would otherwise silently drop it.
+!bridge/frontend/src/data/
+!bridge/frontend/src/data/**
 /debridge_node/keystore.json
 
 .DS_Store
@@ -24,3 +28,7 @@ debridge_node/bundlr_wallet.json
 target
 sig-*
 .live-*
+bridge/contracts/fixtures/swap-deploy.env
+bridge/contracts/fixtures/xswap-*.env
+bridge/.xswap-logs
+.playwright-mcp

@@ -195,7 +195,7 @@ What changed:
   `_verifySignatures`), the `SolanaGate` send/claim state machine, the Borsh
   instruction wire format, and the off-chain relayer adapters (scan a `Sent`
   program log; encode a `claim` instruction).
-- **`programs/solana-gate`** — the deployable native Solana program: a
+- **`crates/solana-gate`** — the deployable native Solana program: a
   syscall-based reimplementation of the above, built with `cargo build-sbf` (out
   of the host workspace; see its README).
 

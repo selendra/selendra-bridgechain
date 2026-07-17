@@ -13,7 +13,7 @@ license = { workspace = true }
 # keccak syscall) and recovers signers with `k256` (Solana's secp256k1_recover
 # syscall), so the exact bytes here are what the on-chain program computes.
 #
-# The deployable BPF program lives in ../../programs/solana-gate (excluded from
+# The deployable BPF program lives in ../../crates/solana-gate (excluded from
 # this workspace; built with `cargo build-sbf`). It is a thin entrypoint over the
 # same logic proven here.
 

@@ -32,6 +32,10 @@ pub struct ChainInfo {
     pub gate: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+    /// Deployed `SwapRouter` on this chain, for cross-chain-swap (Phase F). Like
+    /// `gate`/`token`, optional and re-deployed fresh by local scripts each run.
+    #[serde(default)]
+    pub router: Option<String>,
 }
 
 /// Load the chain registry from a JSON file (an array of [`ChainInfo`]).
