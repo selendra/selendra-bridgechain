@@ -8,6 +8,8 @@ export interface Chain {
   rpcUrl: string | null;
   gate: string | null;
   token: string | null;
+  /** Deployed SwapRouter on this chain, for cross-chain swap. Null if unset. */
+  router: string | null;
 }
 
 export interface SignatureRef {

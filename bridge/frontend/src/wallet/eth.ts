@@ -14,6 +14,11 @@ const SEL = {
   decimals: "313ce567", // decimals()
   swap: "d5bcb9b5", // swap(address,address,uint256,uint256,address)
   send: "565443e9", // send(address,uint256,uint256,bytes,bytes)
+  swapAndBridge: "07c1462d", // swapAndBridge(address,uint256,uint256,uint256,address,address,uint256)
+  finalize: "c2c1fffb", // finalize(bytes32,uint256,uint256,uint256,bytes,bytes,bytes)
+  remoteRouter: "a6b18e64", // remoteRouter(uint256)
+  executed: "a9fcfb33", // executed(bytes32)
+  finalized: "0abea268", // finalized(bytes32)
 } as const;
 
 function strip0x(h: string): string {
@@ -33,6 +38,12 @@ function encAddress(addr: string): string {
 function encUint(v: bigint): string {
   if (v < 0n) throw new Error("negative uint");
   return word(v.toString(16));
+}
+
+function encBytes32(hex: string): string {
+  const h = strip0x(hex).toLowerCase();
+  if (h.length !== 64 || /[^0-9a-f]/.test(h)) throw new Error(`bad bytes32: ${hex}`);
+  return h;
 }
 
 /** A dynamic `bytes` tail: length word + right-padded data. */
@@ -97,6 +108,96 @@ export function encodeSend(
   );
 }
 
+export function encodeSwapAndBridge(
+  tokenIn: string,
+  amountIn: bigint,
+  minStableOut: bigint,
+  chainIdTo: bigint,
+  finalToken: string,
+  finalReceiver: string,
+  finalMinOut: bigint
+): string {
+  // all 7 args are static (address/uint256) — no offsets needed.
+  return (
+    "0x" +
+    SEL.swapAndBridge +
+    encAddress(tokenIn) +
+    encUint(amountIn) +
+    encUint(minStableOut) +
+    encUint(chainIdTo) +
+    encAddress(finalToken) +
+    encAddress(finalReceiver) +
+    encUint(finalMinOut)
+  );
+}
+
+/**
+ * `abi.encode(Gate.AutoParamsTo)` — reproduces exactly what `SwapRouter.swapAndBridge`
+ * builds on-chain (see SwapRouter.sol), so the frontend can reconstruct the same
+ * `autoParams` bytes for a later `finalize()` call without reading them back from
+ * a log. `data` is itself `abi.encode(finalToken, finalReceiver, finalMinOut)` —
+ * three static words, encoded by the caller (see `encodeSwapIntent` below).
+ */
+export function encodeAutoParamsTo(
+  executionFee: bigint,
+  flags: bigint,
+  fallbackAddressHex: string,
+  dataHex: string
+): string {
+  // head: executionFee, flags, off(fallbackAddress), off(data) => 4 words.
+  const fbTail = encBytesTail(fallbackAddressHex);
+  const dataTail = encBytesTail(dataHex || "0x");
+  const offFallback = BigInt(4 * 32);
+  const offData = offFallback + BigInt(fbTail.length / 2);
+  return (
+    "0x" +
+    encUint(executionFee) +
+    encUint(flags) +
+    encUint(offFallback) +
+    encUint(offData) +
+    fbTail +
+    dataTail
+  );
+}
+
+/** `abi.encode(finalToken, finalReceiver, finalMinOut)` — the swap-intent tail
+ *  of `AutoParamsTo.data`. All three fields are static, so no offsets needed. */
+export function encodeSwapIntent(finalToken: string, finalReceiver: string, finalMinOut: bigint): string {
+  return "0x" + encAddress(finalToken) + encAddress(finalReceiver) + encUint(finalMinOut);
+}
+
+export function encodeFinalize(
+  debridgeId: string,
+  amount: bigint,
+  chainIdFrom: bigint,
+  nonce: bigint,
+  receiverHex: string,
+  autoParamsHex: string,
+  nativeSenderHex: string
+): string {
+  // head: debridgeId, amount, chainIdFrom, nonce, off(receiver), off(autoParams), off(nativeSender) => 7 words.
+  const recvTail = encBytesTail(receiverHex);
+  const autoTail = encBytesTail(autoParamsHex);
+  const nsTail = encBytesTail(nativeSenderHex);
+  const offReceiver = BigInt(7 * 32);
+  const offAuto = offReceiver + BigInt(recvTail.length / 2);
+  const offNs = offAuto + BigInt(autoTail.length / 2);
+  return (
+    "0x" +
+    SEL.finalize +
+    encBytes32(debridgeId) +
+    encUint(amount) +
+    encUint(chainIdFrom) +
+    encUint(nonce) +
+    encUint(offReceiver) +
+    encUint(offAuto) +
+    encUint(offNs) +
+    recvTail +
+    autoTail +
+    nsTail
+  );
+}
+
 // --- reads (eth_call) ----------------------------------------------------
 
 async function ethCall(req: Eip1193Request, to: string, data: string): Promise<string> {
@@ -118,6 +219,29 @@ export async function readAllowance(
 
 export async function readDecimals(req: Eip1193Request, token: string): Promise<number> {
   return Number(hexToBigInt(await ethCall(req, token, "0x" + SEL.decimals)));
+}
+
+/** Decode a single dynamic `bytes` return value: [offset][length][data...]. */
+function decodeBytesReturn(hex: string): string {
+  const h = strip0x(hex);
+  if (h.length < 128) return "0x";
+  const len = Number(hexToBigInt("0x" + h.slice(64, 128)));
+  return "0x" + h.slice(128, 128 + len * 2);
+}
+
+/** The peer router registered for `chainIdTo` (empty "0x" if the corridor isn't wired). */
+export async function readRemoteRouter(req: Eip1193Request, router: string, chainIdTo: bigint): Promise<string> {
+  return decodeBytesReturn(await ethCall(req, router, "0x" + SEL.remoteRouter + encUint(chainIdTo)));
+}
+
+/** Whether the destination Gate has released funds for this submissionId (the keeper claimed it). */
+export async function readExecuted(req: Eip1193Request, gate: string, submissionId: string): Promise<boolean> {
+  return hexToBigInt(await ethCall(req, gate, "0x" + SEL.executed + encBytes32(submissionId))) === 1n;
+}
+
+/** Whether the destination-leg swap for this submissionId has already been completed. */
+export async function readFinalized(req: Eip1193Request, router: string, submissionId: string): Promise<boolean> {
+  return hexToBigInt(await ethCall(req, router, "0x" + SEL.finalized + encBytes32(submissionId))) === 1n;
 }
 
 // --- writes (eth_sendTransaction) ---------------------------------------
@@ -162,24 +286,98 @@ export function sendBridge(
   return sendTx(req, from, gate, encodeSend(token, amount, BigInt(chainIdTo), receiverHex, autoParamsHex));
 }
 
+export function sendSwapAndBridge(
+  req: Eip1193Request,
+  from: string,
+  router: string,
+  tokenIn: string,
+  amountIn: bigint,
+  minStableOut: bigint,
+  chainIdTo: number,
+  finalToken: string,
+  finalReceiver: string,
+  finalMinOut: bigint
+): Promise<string> {
+  return sendTx(
+    req,
+    from,
+    router,
+    encodeSwapAndBridge(tokenIn, amountIn, minStableOut, BigInt(chainIdTo), finalToken, finalReceiver, finalMinOut)
+  );
+}
+
+export function sendFinalize(
+  req: Eip1193Request,
+  from: string,
+  router: string,
+  debridgeId: string,
+  amount: bigint,
+  chainIdFrom: number,
+  nonce: number,
+  receiverHex: string,
+  autoParamsHex: string,
+  nativeSenderHex: string
+): Promise<string> {
+  return sendTx(
+    req,
+    from,
+    router,
+    encodeFinalize(debridgeId, amount, BigInt(chainIdFrom), BigInt(nonce), receiverHex, autoParamsHex, nativeSenderHex)
+  );
+}
+
 // --- confirmation --------------------------------------------------------
 
-/** Poll for a receipt; resolves { success } once mined, throws on timeout. */
-export async function waitReceipt(
+type RawLog = { address: string; topics: string[]; data: string };
+
+/** Poll for a receipt; resolves once mined (with its logs), throws on timeout. */
+export async function waitReceiptFull(
   req: Eip1193Request,
   hash: string,
   timeoutMs = 90_000
-): Promise<{ success: boolean }> {
+): Promise<{ success: boolean; logs: RawLog[] }> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const r = (await req({ method: "eth_getTransactionReceipt", params: [hash] })) as {
       blockNumber?: string;
       status?: string;
+      logs?: RawLog[];
     } | null;
-    if (r && r.blockNumber) return { success: r.status === "0x1" };
+    if (r && r.blockNumber) return { success: r.status === "0x1", logs: r.logs ?? [] };
     await new Promise((res) => setTimeout(res, 1200));
   }
   throw new Error("Timed out waiting for confirmation");
+}
+
+/** Poll for a receipt; resolves { success } once mined, throws on timeout. */
+export async function waitReceipt(req: Eip1193Request, hash: string, timeoutMs = 90_000): Promise<{ success: boolean }> {
+  const { success } = await waitReceiptFull(req, hash, timeoutMs);
+  return { success };
+}
+
+/**
+ * Pull `{submissionId, debridgeId, amount, nonce}` out of the `Sent` event the
+ * Gate emits during `swapAndBridge` (or a plain `send`). We only need the log's
+ * `address` to find it (the Gate emits exactly one `Sent` per call) — no event
+ * topic0/signature hash needed. `submissionId`/`debridgeId` are indexed
+ * (topics[1]/[2]); `amount`/`nonce` are static fields at fixed word offsets in
+ * the non-indexed data (word0 and word4 — see `Sent`'s field order in Gate.sol),
+ * so no dynamic-offset ABI decoding is needed for them either.
+ */
+export function extractSent(
+  logs: RawLog[],
+  gate: string
+): { submissionId: string; debridgeId: string; amount: bigint; nonce: bigint } | null {
+  const log = logs.find((l) => l.address?.toLowerCase() === gate.toLowerCase());
+  if (!log || log.topics.length < 3) return null;
+  const data = strip0x(log.data);
+  const wordAt = (i: number) => data.slice(i * 64, i * 64 + 64);
+  return {
+    submissionId: log.topics[1],
+    debridgeId: log.topics[2],
+    amount: hexToBigInt("0x" + wordAt(0)),
+    nonce: hexToBigInt("0x" + wordAt(4)),
+  };
 }
 
 /** Normalize a wallet/RPC error into a short human message. */

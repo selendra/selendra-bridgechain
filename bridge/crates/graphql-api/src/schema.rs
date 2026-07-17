@@ -44,6 +44,8 @@ pub struct Chain {
     pub gate: Option<String>,
     /// Default ERC-20 to prefill when bridging from this chain. Null if unset.
     pub token: Option<String>,
+    /// Deployed `SwapRouter` on this chain, for cross-chain-swap. Null if unset.
+    pub router: Option<String>,
 }
 
 impl From<ChainInfo> for Chain {
@@ -54,6 +56,7 @@ impl From<ChainInfo> for Chain {
             rpc_url: c.rpc_url,
             gate: c.gate,
             token: c.token,
+            router: c.router,
         }
     }
 }
