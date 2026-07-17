@@ -1,4 +1,4 @@
-import { Logo, Gear } from "./icons";
+import { Logo } from "./icons";
 import { WalletButton } from "./WalletButton";
 import type { WalletState } from "../wallet/useWallet";
 
@@ -46,9 +46,6 @@ export function Navbar({ view, onNavigate, connected, wallet }: NavbarProps) {
           {statusText}
         </span>
         <WalletButton wallet={wallet} />
-        <button type="button" className="icon-btn nav__gear" aria-label="Settings">
-          <Gear size={20} />
-        </button>
       </div>
     </header>
   );

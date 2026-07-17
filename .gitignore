@@ -31,3 +31,4 @@ sig-*
 bridge/contracts/fixtures/swap-deploy.env
 bridge/contracts/fixtures/xswap-*.env
 bridge/.xswap-logs
+.playwright-mcp
