@@ -15,7 +15,7 @@
 #      refused); Solana->EVM send is scanned, recomputed, and its signatures pass
 #      the EVM gate's verification rule.
 #
-# The deployable BPF program (programs/solana-gate) is a syscall-based
+# The deployable BPF program (crates/solana-gate) is a syscall-based
 # reimplementation of the logic proven in step 3; building it needs the Solana
 # toolchain (see that crate's README) and is intentionally out of scope here.
 set -euo pipefail

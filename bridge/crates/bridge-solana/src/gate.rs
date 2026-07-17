@@ -1,6 +1,6 @@
 //! The Solana gate program's brain: the send/claim state machine, host-testable.
 //!
-//! The deployable native program (../../programs/solana-gate) is a thin
+//! The deployable native program (../../crates/solana-gate) is a thin
 //! entrypoint that deserializes a [`crate::instruction::GateInstruction`] and
 //! calls these methods against on-chain account state (a PDA config, an SPL
 //! vault, the receiver's token account). Here the same transitions run against

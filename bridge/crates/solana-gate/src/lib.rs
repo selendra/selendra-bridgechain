@@ -9,7 +9,7 @@
 //! VMs — see the host crate `bridge-solana`, whose tests prove this logic
 //! byte-for-byte against Gate.sol and bridge-core.
 //!
-//! Build: `cargo build-sbf --manifest-path programs/solana-gate/Cargo.toml`.
+//! Build: `cargo build-sbf --manifest-path crates/solana-gate/Cargo.toml`.
 //!
 //! Account model:
 //!   * **Config PDA** (`["config"]`) — owner, validator set, threshold, chain id,
