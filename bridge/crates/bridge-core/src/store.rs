@@ -101,7 +101,11 @@ pub fn ensure_dir(dir: &Path) -> Result<(), StoreError> {
 
 /// True iff two records carry identical transfer parameters (everything but the
 /// collected signatures). Hex/hash fields are compared case-insensitively.
-fn same_params(a: &SubmissionRecord, b: &SubmissionRecord) -> bool {
+///
+/// Callers comparing against a normalized/stored `submission_id` (e.g. one
+/// that's always `0x`-prefixed) should normalize both sides the same way first
+/// — this does a literal case-insensitive compare of the field as given.
+pub fn same_params(a: &SubmissionRecord, b: &SubmissionRecord) -> bool {
     a.submission_id.eq_ignore_ascii_case(&b.submission_id)
         && a.debridge_id.eq_ignore_ascii_case(&b.debridge_id)
         && a.amount == b.amount

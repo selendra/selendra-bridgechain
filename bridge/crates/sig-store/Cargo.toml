@@ -9,7 +9,7 @@ license.workspace = true
 # the HTTP boundary; bridge-db ALSO reuses bridge-core's trust-boundary
 # validation (id<->params binding + signature authentication) as defense in
 # depth, so even an authenticated client can't forge a record or signature.
-bridge-core = { workspace = true }
+bridge-core = { workspace = true, features = ["axum-auth"] }
 bridge-db = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

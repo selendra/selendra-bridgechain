@@ -25,13 +25,13 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bridge_core::allow::{AddTokenRequest, AllowedChain, AllowedToken, ClaimedRequest, SubmissionHistory};
+use bridge_core::auth::require_auth;
 use bridge_core::store::SubmissionRecord;
 use bridge_db::{Db, DbError};
 use clap::Parser;
@@ -57,40 +57,6 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     db: Db,
-}
-
-/// Bearer-token gate. With a token configured, reject any request that doesn't
-/// present it (constant-time compare); `/health` is layered separately so it
-/// stays open for load-balancer / docker health checks.
-async fn require_auth(
-    State(expected): State<Arc<String>>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if ct_eq(presented.as_bytes(), expected.as_bytes()) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
-/// Length-checked constant-time byte comparison (avoids leaking the token via
-/// early-exit timing on the compare itself).
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[tokio::main]
@@ -279,7 +245,7 @@ async fn remove_chain(
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, Request};
     use tower::ServiceExt; // for `oneshot`
 
     // The same wiring main() uses: /health open, everything else behind the gate.
@@ -334,12 +300,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ct_eq_is_correct() {
-        assert!(ct_eq(b"abc", b"abc"));
-        assert!(ct_eq(b"", b""));
-        assert!(!ct_eq(b"abc", b"abd"));
-        assert!(!ct_eq(b"abc", b"ab")); // length mismatch
-        assert!(!ct_eq(b"", b"x"));
-    }
+    // `ct_eq` itself is covered by bridge_core::auth's own tests.
 }

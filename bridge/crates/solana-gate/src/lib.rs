@@ -369,6 +369,19 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
 
     let cfg = Config::deserialize(&mut &config_ai.data.borrow()[..])?;
 
+    // Bind the release destination to the signed `receiver`. `claim` is
+    // deliberately permissionless (any keeper may submit a threshold-signed
+    // submission), so the token account funds are released to must be exactly
+    // the one the validators signed for -- not whatever `receiver_token` the
+    // caller happens to supply. Without this check anyone who observes a
+    // threshold-signed submission (e.g. via the public sig-store) could claim
+    // it themselves and redirect the payout to their own account.
+    let receiver: [u8; 32] =
+        args.receiver.as_slice().try_into().map_err(|_| GateError::BadReceiver)?;
+    if receiver_token.key != &Pubkey::new_from_array(receiver) {
+        return Err(GateError::BadReceiver.into());
+    }
+
     let id = submission_id(
         &args.debridge_id,
         args.amount,

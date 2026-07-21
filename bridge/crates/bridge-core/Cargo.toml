@@ -12,6 +12,9 @@ default = []
 abi = ["dep:alloy", "alloy-primitives/k256"]
 # HTTP client for the sig-store service (used by validator/keeper in Phase 7).
 http = ["dep:reqwest"]
+# Shared bearer-token axum middleware for the operator/admin HTTP surfaces
+# (validator's operator API, sig-store).
+axum-auth = ["dep:axum"]
 
 [dependencies]
 alloy-primitives = { workspace = true }
@@ -23,3 +26,4 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }

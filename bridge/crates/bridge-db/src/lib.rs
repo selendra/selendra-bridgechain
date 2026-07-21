@@ -185,15 +185,13 @@ impl Db {
                 .await?;
 
         if let Some(row) = existing {
-            let same = row.debridge_id.eq_ignore_ascii_case(&record.debridge_id)
-                && row.amount == record.amount
-                && row.chain_id_from as u64 == record.chain_id_from
-                && row.chain_id_to as u64 == record.chain_id_to
-                && row.nonce as u64 == record.nonce
-                && row.receiver.eq_ignore_ascii_case(&record.receiver)
-                && row.auto_params.eq_ignore_ascii_case(&record.auto_params)
-                && row.native_sender.eq_ignore_ascii_case(&record.native_sender);
-            if !same {
+            // Reuse bridge-core's param-equality check rather than re-deriving the
+            // field list here. Compare against a copy of `record` whose id is
+            // normalized the same way `row.submission_id` is (both `0x`-prefixed,
+            // lowercase) — `record.submission_id` itself may lack the prefix.
+            let mut incoming = record.clone();
+            incoming.submission_id = id.clone();
+            if !store::same_params(&row.into_record(Vec::new()), &incoming) {
                 return Err(StoreError::ParamsConflict(record.submission_id.clone()).into());
             }
         } else {

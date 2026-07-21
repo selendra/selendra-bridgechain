@@ -1571,6 +1571,7 @@ dependencies = [
  "alloy",
  "alloy-primitives",
  "anyhow",
+ "axum 0.7.9",
  "hex",
  "reqwest 0.12.28",
  "serde",
@@ -1584,12 +1585,8 @@ name = "bridge-db"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "anyhow",
  "bridge-core",
  "chrono",
- "hex",
- "serde",
- "serde_json",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",

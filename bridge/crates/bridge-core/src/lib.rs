@@ -24,6 +24,9 @@ pub mod signer;
 #[cfg(feature = "http")]
 pub mod remote;
 
+#[cfg(feature = "axum-auth")]
+pub mod auth;
+
 /// Domain-separating prefix, matching `BridgeHash.SUBMISSION_PREFIX` in Solidity.
 pub const SUBMISSION_PREFIX: u64 = 1;
 

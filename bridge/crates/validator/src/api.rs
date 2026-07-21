@@ -17,12 +17,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::middleware;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bridge_core::auth::require_auth;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -38,36 +38,6 @@ pub struct ApiState {
     /// Shared secret required as `Authorization: Bearer <token>` on the state-
     /// changing routes (pause/resume/rescan). `None` => unauthenticated (dev).
     pub token: Option<String>,
-}
-
-/// Bearer-token gate for the operator API's state-changing routes.
-async fn require_auth(
-    State(expected): State<Arc<String>>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if ct_eq(presented.as_bytes(), expected.as_bytes()) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[derive(Serialize)]

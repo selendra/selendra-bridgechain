@@ -17,8 +17,6 @@ const SEL = {
   swapAndBridge: "07c1462d", // swapAndBridge(address,uint256,uint256,uint256,address,address,uint256)
   finalize: "c2c1fffb", // finalize(bytes32,uint256,uint256,uint256,bytes,bytes,bytes)
   remoteRouter: "a6b18e64", // remoteRouter(uint256)
-  executed: "a9fcfb33", // executed(bytes32)
-  finalized: "0abea268", // finalized(bytes32)
 } as const;
 
 function strip0x(h: string): string {
@@ -232,16 +230,6 @@ function decodeBytesReturn(hex: string): string {
 /** The peer router registered for `chainIdTo` (empty "0x" if the corridor isn't wired). */
 export async function readRemoteRouter(req: Eip1193Request, router: string, chainIdTo: bigint): Promise<string> {
   return decodeBytesReturn(await ethCall(req, router, "0x" + SEL.remoteRouter + encUint(chainIdTo)));
-}
-
-/** Whether the destination Gate has released funds for this submissionId (the keeper claimed it). */
-export async function readExecuted(req: Eip1193Request, gate: string, submissionId: string): Promise<boolean> {
-  return hexToBigInt(await ethCall(req, gate, "0x" + SEL.executed + encBytes32(submissionId))) === 1n;
-}
-
-/** Whether the destination-leg swap for this submissionId has already been completed. */
-export async function readFinalized(req: Eip1193Request, router: string, submissionId: string): Promise<boolean> {
-  return hexToBigInt(await ethCall(req, router, "0x" + SEL.finalized + encBytes32(submissionId))) === 1n;
 }
 
 // --- writes (eth_sendTransaction) ---------------------------------------

@@ -99,16 +99,6 @@ impl Allowlist {
         }
     }
 
-    /// True once at least one token has been whitelisted (i.e. enforcement is on).
-    pub fn tokens_configured(&self) -> bool {
-        !self.debridge_ids.is_empty()
-    }
-
-    /// True once at least one chain pair has been whitelisted.
-    pub fn chains_configured(&self) -> bool {
-        !self.chains.is_empty()
-    }
-
     /// Opt-in semantics: an empty token list allows everything; otherwise only
     /// listed `debridge_id`s pass. `debridge_id` is matched case-insensitively.
     pub fn token_allowed(&self, debridge_id: &str) -> bool {

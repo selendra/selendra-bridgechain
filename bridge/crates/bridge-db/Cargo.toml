@@ -12,9 +12,5 @@ alloy-primitives = { workspace = true }
 sqlx = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-hex = { workspace = true }
-anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

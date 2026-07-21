@@ -218,19 +218,7 @@ contract SwapRouter is ReentrancyGuard {
         // Delivery proof: the Gate only sets this after verifying the validator
         // threshold, and the amount + intent are bound into the id it signed.
         if (!gate.executed(submissionId)) revert NotDelivered(submissionId);
-        if (finalized[submissionId]) revert AlreadyFinalized(submissionId);
-        // The claim released the stable to `receiver`; it must be this router,
-        // and the delivered asset must be the stable we know how to route.
-        if (_toAddress(receiver) != address(this)) revert NotForThisRouter();
-        if (gate.tokenOf(debridgeId) != stable) revert UnexpectedAsset();
-
-        finalized[submissionId] = true; // effects before interactions (idempotent)
-
-        (address finalToken, address finalReceiver, uint256 finalMinOut) =
-            _decodeIntent(autoParams);
-        if (finalReceiver == address(0)) revert ZeroAddress();
-
-        _deliver(submissionId, amount, finalToken, finalReceiver, finalMinOut);
+        _settle(submissionId, debridgeId, amount, receiver, autoParams);
     }
 
     /// @notice Convenience wrapper: `claim` the bridge transfer into this router
@@ -246,17 +234,30 @@ contract SwapRouter is ReentrancyGuard {
         bytes[] calldata signatures
     ) external nonReentrant returns (bytes32 submissionId) {
         // Releases `amount` of the stable to `receiver` (this router) and sets
-        // executed[submissionId]. Reverts if it was already claimed.
-        gate.claim(debridgeId, amount, chainIdFrom, nonce, receiver, autoParams, nativeSender, signatures);
+        // executed[submissionId]. Reverts if it was already claimed. `claim`
+        // itself returns the submissionId, so there's no need to recompute it.
+        submissionId =
+            gate.claim(debridgeId, amount, chainIdFrom, nonce, receiver, autoParams, nativeSender, signatures);
+        _settle(submissionId, debridgeId, amount, receiver, autoParams);
+    }
 
-        submissionId = gate.computeSubmissionId(
-            debridgeId, amount, chainIdFrom, block.chainid, nonce, receiver, autoParams, nativeSender
-        );
+    /// @dev Shared post-delivery tail for `finalize`/`claimAndFinalize`: confirm
+    ///      the stable was released to this router for an asset it knows how to
+    ///      route, mark idempotent, decode the swap intent, and deliver.
+    function _settle(
+        bytes32 submissionId,
+        bytes32 debridgeId,
+        uint256 amount,
+        bytes calldata receiver,
+        bytes calldata autoParams
+    ) internal {
         if (finalized[submissionId]) revert AlreadyFinalized(submissionId);
+        // The claim released the stable to `receiver`; it must be this router,
+        // and the delivered asset must be the stable we know how to route.
         if (_toAddress(receiver) != address(this)) revert NotForThisRouter();
         if (gate.tokenOf(debridgeId) != stable) revert UnexpectedAsset();
 
-        finalized[submissionId] = true;
+        finalized[submissionId] = true; // effects before interactions (idempotent)
 
         (address finalToken, address finalReceiver, uint256 finalMinOut) =
             _decodeIntent(autoParams);

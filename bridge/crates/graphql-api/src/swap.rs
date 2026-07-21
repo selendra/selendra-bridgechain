@@ -12,11 +12,12 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use alloy::primitives::{Address, U256};
-use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
-use anyhow::Context;
 use bridge_core::abi::{IERC20Mintable, SwapPool};
+
+use crate::chain::{provider_for, split_spec};
 
 /// One listed token in a pool, flattened for the wire. Numeric fields are
 /// decimal strings (uint256) to avoid JSON precision loss, mirroring how
@@ -67,25 +68,8 @@ impl Swaps {
     /// `1337=http://127.0.0.1:8545,0xPool...`. The HTTP provider is built eagerly
     /// (no network I/O yet); the first query is what hits the chain.
     pub fn add_spec(&mut self, spec: &str) -> anyhow::Result<u64> {
-        let (id_s, rest) = spec
-            .split_once('=')
-            .with_context(|| format!("--swap must be CHAINID=RPC,POOL, got {spec:?}"))?;
-        let (rpc, pool_s) = rest
-            .split_once(',')
-            .with_context(|| format!("--swap must be CHAINID=RPC,POOL, got {spec:?}"))?;
-        let chain_id: u64 = id_s
-            .trim()
-            .parse()
-            .with_context(|| format!("bad chainId in --swap {spec:?}"))?;
-        let pool: Address = pool_s
-            .trim()
-            .parse()
-            .with_context(|| format!("bad pool address in --swap {spec:?}"))?;
-        let url = rpc
-            .trim()
-            .parse()
-            .with_context(|| format!("bad rpc url in --swap {spec:?}"))?;
-        let provider = ProviderBuilder::new().connect_http(url).erased();
+        let (chain_id, rpc, pool_s) = split_spec(spec, "--swap")?;
+        let (provider, pool) = provider_for(pool_s, rpc, &format!("--swap {spec:?}"))?;
         self.pools.insert(chain_id, (provider, pool));
         Ok(chain_id)
     }

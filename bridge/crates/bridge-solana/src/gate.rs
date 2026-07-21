@@ -111,10 +111,6 @@ impl SolanaGate {
         self.validators.contains(a)
     }
 
-    pub fn is_executed(&self, id: &Bytes32) -> bool {
-        self.executed.contains(id)
-    }
-
     pub fn nonce_to(&self, chain_id_to: u64) -> u64 {
         self.nonce_to.get(&chain_id_to).copied().unwrap_or(0)
     }

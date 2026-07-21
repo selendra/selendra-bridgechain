@@ -53,6 +53,30 @@ pub fn load_registry(path: &str) -> anyhow::Result<Vec<ChainInfo>> {
     Ok(chains)
 }
 
+/// Split a `CHAINID=RPC,ADDR` spec (the shape both `--gate` and `--swap` use)
+/// into its parts. `flag` names the flag in error messages.
+pub(crate) fn split_spec<'s>(spec: &'s str, flag: &str) -> anyhow::Result<(u64, &'s str, &'s str)> {
+    let (id_s, rest) = spec
+        .split_once('=')
+        .with_context(|| format!("{flag} must be CHAINID=RPC,ADDR, got {spec:?}"))?;
+    let (rpc, addr_s) = rest
+        .split_once(',')
+        .with_context(|| format!("{flag} must be CHAINID=RPC,ADDR, got {spec:?}"))?;
+    let chain_id: u64 =
+        id_s.trim().parse().with_context(|| format!("bad chainId in {flag} {spec:?}"))?;
+    Ok((chain_id, rpc, addr_s))
+}
+
+/// Parse an address + RPC url and build an (erased) HTTP provider. `ctx` names
+/// the source in error messages (e.g. `"--gate 1338=...,0xabc"` or `"chain 1338"`).
+pub(crate) fn provider_for(addr: &str, rpc: &str, ctx: &str) -> anyhow::Result<(DynProvider, Address)> {
+    let address: Address =
+        addr.trim().parse().with_context(|| format!("bad address in {ctx}"))?;
+    let url = rpc.trim().parse().with_context(|| format!("bad rpc url in {ctx}"))?;
+    let provider = ProviderBuilder::new().connect_http(url).erased();
+    Ok((provider, address))
+}
+
 /// Destination gates the API can read execution status from. Cheap to clone
 /// (each `DynProvider` is an `Arc` internally); share freely across resolvers.
 #[derive(Clone, Default)]
@@ -69,25 +93,8 @@ impl Chains {
     /// `1338=http://127.0.0.1:8546,0xabc...`. The HTTP provider is built eagerly
     /// (no network I/O yet); the first `executed()` call is what hits the chain.
     pub fn add_spec(&mut self, spec: &str) -> anyhow::Result<u64> {
-        let (id_s, rest) = spec
-            .split_once('=')
-            .with_context(|| format!("--gate must be CHAINID=RPC,GATE, got {spec:?}"))?;
-        let (rpc, gate_s) = rest
-            .split_once(',')
-            .with_context(|| format!("--gate must be CHAINID=RPC,GATE, got {spec:?}"))?;
-        let chain_id: u64 = id_s
-            .trim()
-            .parse()
-            .with_context(|| format!("bad chainId in --gate {spec:?}"))?;
-        let gate: Address = gate_s
-            .trim()
-            .parse()
-            .with_context(|| format!("bad gate address in --gate {spec:?}"))?;
-        let url = rpc
-            .trim()
-            .parse()
-            .with_context(|| format!("bad rpc url in --gate {spec:?}"))?;
-        let provider = ProviderBuilder::new().connect_http(url).erased();
+        let (chain_id, rpc, gate_s) = split_spec(spec, "--gate")?;
+        let (provider, gate) = provider_for(gate_s, rpc, &format!("--gate {spec:?}"))?;
         self.gates.insert(chain_id, (provider, gate));
         Ok(chain_id)
     }
@@ -99,15 +106,7 @@ impl Chains {
         if self.gates.contains_key(&chain_id) {
             return Ok(());
         }
-        let gate: Address = gate
-            .trim()
-            .parse()
-            .with_context(|| format!("bad gate address for chain {chain_id}"))?;
-        let url = rpc
-            .trim()
-            .parse()
-            .with_context(|| format!("bad rpc url for chain {chain_id}"))?;
-        let provider = ProviderBuilder::new().connect_http(url).erased();
+        let (provider, gate) = provider_for(gate, rpc, &format!("chain {chain_id}"))?;
         self.gates.insert(chain_id, (provider, gate));
         Ok(())
     }
