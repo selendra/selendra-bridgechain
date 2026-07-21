@@ -5,6 +5,7 @@ import { chainViz, formatUnits, shortHex } from "../data/format";
 import { fetchSubmission } from "../api/client";
 import { usePoll } from "../api/hooks";
 import type { Chain, Submission } from "../api/types";
+import { useChainDecimals } from "./useChainDecimals";
 
 interface Props {
   submissionId: string;
@@ -31,6 +32,7 @@ export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
     [submissionId],
     6000
   );
+  const decimalsByChain = useChainDecimals(chains);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -71,7 +73,7 @@ export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
               <StatusBadge status={data.status} />
             </div>
 
-            <Row label="Amount">{formatUnits(data.amount, 18)} </Row>
+            <Row label="Amount">{formatUnits(data.amount, decimalsByChain[data.chainIdFrom] ?? 18)} </Row>
             <Row label="Nonce">{data.nonce}</Row>
             <Row label="Receiver" mono>
               {data.receiver}

@@ -7,6 +7,7 @@ import { fetchStats, fetchSubmissions } from "../api/client";
 import { usePoll } from "../api/hooks";
 import type { Chain, Stats, Submission, SubmissionFilter } from "../api/types";
 import { SubmissionDetail } from "./SubmissionDetail";
+import { useChainDecimals } from "./useChainDecimals";
 
 interface ExplorerProps {
   chains: Chain[];
@@ -55,6 +56,7 @@ export function Explorer({ chains, initialFilter }: ExplorerProps) {
 
   const stats = usePoll<Stats>(() => fetchStats(), [], 5000);
   const subs = usePoll<Submission[]>(() => fetchSubmissions(filter), [from, to, readyOnly], 5000);
+  const decimalsByChain = useChainDecimals(chains);
 
   const chainOptions: DropdownOption[] = [
     { value: ANY, label: "Any chain", glyph: <span className="dot-any" /> },
@@ -152,7 +154,7 @@ export function Explorer({ chains, initialFilter }: ExplorerProps) {
                     <ChainCell chains={chains} id={sub.chainIdTo} />
                   </span>
                 </td>
-                <td className="tbl__amount">{formatUnits(sub.amount, 18)}</td>
+                <td className="tbl__amount">{formatUnits(sub.amount, decimalsByChain[sub.chainIdFrom] ?? 18)}</td>
                 <td className="tbl__num">{sub.nonce}</td>
                 <td className="tbl__num">
                   <span className="sig-count">

@@ -56,9 +56,10 @@ struct Args {
     #[arg(long = "gate", value_name = "CHAINID=RPC,GATE")]
     gates: Vec<String>,
     /// JSON file listing the network registry served to the UI via the `chains`
-    /// query (an array of {chainId,name,rpcUrl?,gate?,token?}). Each chain with
-    /// an rpcUrl+gate is also registered for `executed()` lookups (an explicit
-    /// `--gate` for the same chain wins). Omit it => `chains` returns `[]`.
+    /// query (an array of {chain_id,name,rpc_url?,gate?,token?,router?} — snake_case,
+    /// matching ChainInfo's serde field names). Each chain with a rpc_url+gate is
+    /// also registered for `executed()` lookups (an explicit `--gate` for the same
+    /// chain wins). Omit it => `chains` returns `[]`.
     #[arg(long = "chains-file", env = "GRAPHQL_CHAINS_FILE", value_name = "PATH")]
     chains_file: Option<String>,
     /// Same-chain SwapPool(s) for the `pools`/`swapQuote` read view, as

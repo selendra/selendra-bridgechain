@@ -196,6 +196,23 @@ export function encodeFinalize(
   );
 }
 
+/** An `Eip1193Request` backed by a plain JSON-RPC endpoint, for read-only calls
+ *  (e.g. `readDecimals`) against a chain the user's wallet isn't connected to —
+ *  the registry's `rpcUrl`, not `window.ethereum`, is the source of truth. */
+export function rpcRequest(url: string): Eip1193Request {
+  let id = 0;
+  return async ({ method, params }) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params: params ?? [] }),
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(json.error.message ?? "RPC error");
+    return json.result;
+  };
+}
+
 // --- reads (eth_call) ----------------------------------------------------
 
 async function ethCall(req: Eip1193Request, to: string, data: string): Promise<string> {
