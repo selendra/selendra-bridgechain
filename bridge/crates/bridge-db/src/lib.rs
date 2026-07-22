@@ -14,7 +14,7 @@
 use std::str::FromStr;
 
 use alloy_primitives::{Address, U256};
-use bridge_core::allow::{AllowedChain, AllowedToken, SubmissionHistory};
+use bridge_core::allow::{AllowedChain, AllowedToken, SubmissionHistory, SwapBridgeInfo, SwapRecord};
 use bridge_core::store::{self, SignerSig, StoreError, SubmissionRecord};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, PgPool};
@@ -67,6 +67,71 @@ struct SubmissionRow {
     claim_tx: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    refund_status: String,
+    refund_tx: Option<String>,
+}
+
+#[derive(FromRow)]
+struct SwapBridgeRow {
+    submission_id: String,
+    token_in: String,
+    amount_in: String,
+    stable_out: String,
+    final_token: String,
+    final_receiver: String,
+    finalize_tx: Option<String>,
+    finalize_amount_out: Option<String>,
+    finalize_fallback: Option<bool>,
+    finalized_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SwapBridgeRow {
+    fn into_info(self) -> SwapBridgeInfo {
+        SwapBridgeInfo {
+            token_in: self.token_in,
+            amount_in: self.amount_in,
+            stable_out: self.stable_out,
+            final_token: self.final_token,
+            final_receiver: self.final_receiver,
+            finalize_tx: self.finalize_tx,
+            finalize_amount_out: self.finalize_amount_out,
+            finalize_fallback: self.finalize_fallback,
+            finalized_at: self.finalized_at.map(|t| t.to_rfc3339()),
+        }
+    }
+}
+
+#[derive(FromRow)]
+struct SwapRow {
+    chain_id: i64,
+    tx_hash: String,
+    log_index: i32,
+    sender: String,
+    receiver: String,
+    token_in: String,
+    token_out: String,
+    amount_in: String,
+    amount_out: String,
+    block_number: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl SwapRow {
+    fn into_record(self) -> SwapRecord {
+        SwapRecord {
+            chain_id: self.chain_id as u64,
+            tx_hash: self.tx_hash,
+            log_index: self.log_index as i64,
+            sender: self.sender,
+            receiver: self.receiver,
+            token_in: self.token_in,
+            token_out: self.token_out,
+            amount_in: self.amount_in,
+            amount_out: self.amount_out,
+            block_number: self.block_number as u64,
+            created_at: self.created_at.to_rfc3339(),
+        }
+    }
 }
 
 #[derive(FromRow)]
@@ -92,7 +157,7 @@ impl SubmissionRow {
         }
     }
 
-    fn into_history(self, signature_count: i64) -> SubmissionHistory {
+    fn into_history(self, signature_count: i64, swap_intent: Option<SwapBridgeInfo>) -> SubmissionHistory {
         SubmissionHistory {
             submission_id: self.submission_id,
             debridge_id: self.debridge_id,
@@ -106,6 +171,10 @@ impl SubmissionRow {
             signature_count,
             created_at: self.created_at.to_rfc3339(),
             updated_at: self.updated_at.to_rfc3339(),
+            stuck: self.refund_status != "none",
+            refund_status: self.refund_status,
+            refund_tx: self.refund_tx,
+            swap_intent,
         }
     }
 }
@@ -313,7 +382,8 @@ impl Db {
     }
 
     /// The transaction-history view: every submission with its status, claim tx,
-    /// signature count, and timestamps. Newest first.
+    /// signature count, refund eligibility, swap intent (if any), and timestamps.
+    /// Newest first.
     pub async fn history(&self) -> Result<Vec<SubmissionHistory>, DbError> {
         let rows: Vec<SubmissionRow> =
             sqlx::query_as("SELECT * FROM submissions ORDER BY created_at DESC").fetch_all(&self.pool).await?;
@@ -323,13 +393,222 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         let counts: std::collections::HashMap<String, i64> = counts.into_iter().collect();
+
+        let swap_bridges: Vec<SwapBridgeRow> = sqlx::query_as("SELECT * FROM swap_bridges")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut swap_bridges: std::collections::HashMap<String, SwapBridgeInfo> = swap_bridges
+            .into_iter()
+            .map(|r| (r.submission_id.clone(), r.into_info()))
+            .collect();
+
         Ok(rows
             .into_iter()
             .map(|r| {
                 let n = counts.get(&r.submission_id).copied().unwrap_or(0);
-                r.into_history(n)
+                let intent = swap_bridges.remove(&r.submission_id);
+                r.into_history(n, intent)
             })
             .collect())
+    }
+
+    // ---------------------------------------------------------------------
+    // Indexer support: observe on-chain events independently of validator
+    // signing, so a transfer is visible even before (or without) any signature.
+    // ---------------------------------------------------------------------
+
+    /// Insert a submission row on first observation of its `Sent` event, before
+    /// any signature exists. Idempotent — a later `upsert_signature` call for the
+    /// same id just adds signatures to this row. Enforces the same id<->params
+    /// binding as `upsert_signature`, but never touches an existing row (params
+    /// are immutable; if a row already exists there is nothing to update here).
+    pub async fn observe_submission(&self, record: SubmissionRecord) -> Result<(), DbError> {
+        if !store::is_valid_submission_id(&record.submission_id) {
+            return Err(StoreError::BadField("submission_id").into());
+        }
+        let computed = store::canonical_submission_id(&record)?;
+        let claimed = alloy_primitives::B256::from_str(&record.submission_id)
+            .map_err(|_| StoreError::BadField("submission_id"))?;
+        if computed != claimed {
+            return Err(StoreError::IdMismatch {
+                claimed: format!("{claimed:#x}"),
+                computed: format!("{computed:#x}"),
+            }
+            .into());
+        }
+
+        let id = norm_id(&record.submission_id);
+        sqlx::query(
+            "INSERT INTO submissions \
+             (submission_id, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
+              receiver, auto_params, native_sender) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             ON CONFLICT (submission_id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(record.debridge_id.to_ascii_lowercase())
+        .bind(&record.amount)
+        .bind(record.chain_id_from as i64)
+        .bind(record.chain_id_to as i64)
+        .bind(record.nonce as i64)
+        .bind(record.receiver.to_ascii_lowercase())
+        .bind(record.auto_params.to_ascii_lowercase())
+        .bind(record.native_sender.to_ascii_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a completed same-chain swap (`SwapPool.Swapped`). Idempotent on
+    /// `(chain_id, tx_hash, log_index)` so a re-scanned block range is harmless.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_swap(
+        &self,
+        chain_id: u64,
+        tx_hash: &str,
+        log_index: i64,
+        sender: &str,
+        receiver: &str,
+        token_in: &str,
+        token_out: &str,
+        amount_in: &str,
+        amount_out: &str,
+        block_number: u64,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO swaps \
+             (chain_id, tx_hash, log_index, sender, receiver, token_in, token_out, \
+              amount_in, amount_out, block_number) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+        )
+        .bind(chain_id as i64)
+        .bind(tx_hash.to_ascii_lowercase())
+        .bind(log_index as i32)
+        .bind(sender.to_ascii_lowercase())
+        .bind(receiver.to_ascii_lowercase())
+        .bind(token_in.to_ascii_lowercase())
+        .bind(token_out.to_ascii_lowercase())
+        .bind(amount_in)
+        .bind(amount_out)
+        .bind(block_number as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_swaps(&self, chain_id: Option<u64>, limit: i64) -> Result<Vec<SwapRecord>, DbError> {
+        let rows: Vec<SwapRow> = match chain_id {
+            Some(c) => {
+                sqlx::query_as(
+                    "SELECT * FROM swaps WHERE chain_id = $1 ORDER BY created_at DESC LIMIT $2",
+                )
+                .bind(c as i64)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as("SELECT * FROM swaps ORDER BY created_at DESC LIMIT $1")
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        Ok(rows.into_iter().map(SwapRow::into_record).collect())
+    }
+
+    /// Record the source-leg swap intent of a `SwapRouter.swapAndBridge` call
+    /// (the `SwapBridged` event), keyed by the bridge submission it produced.
+    /// The submission row itself must already exist (inserted by
+    /// `observe_submission` from the paired `Sent` event in the same tx).
+    pub async fn record_swap_bridge_intent(
+        &self,
+        submission_id: &str,
+        token_in: &str,
+        amount_in: &str,
+        stable_out: &str,
+        final_token: &str,
+        final_receiver: &str,
+    ) -> Result<(), DbError> {
+        let id = norm_id(submission_id);
+        sqlx::query(
+            "INSERT INTO swap_bridges \
+             (submission_id, token_in, amount_in, stable_out, final_token, final_receiver) \
+             VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT (submission_id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(token_in.to_ascii_lowercase())
+        .bind(amount_in)
+        .bind(stable_out)
+        .bind(final_token.to_ascii_lowercase())
+        .bind(final_receiver.to_ascii_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record the destination-leg outcome (`Finalized` / `FinalizeFallback`) of a
+    /// swap-bridge. `fallback = true` means the destination swap failed and the
+    /// stable was delivered directly instead.
+    pub async fn record_finalized(
+        &self,
+        submission_id: &str,
+        finalize_tx: &str,
+        amount_out: &str,
+        fallback: bool,
+    ) -> Result<(), DbError> {
+        let id = norm_id(submission_id);
+        sqlx::query(
+            "UPDATE swap_bridges SET finalize_tx = $2, finalize_amount_out = $3, \
+             finalize_fallback = $4, finalized_at = now() WHERE submission_id = $1",
+        )
+        .bind(&id)
+        .bind(finalize_tx)
+        .bind(amount_out)
+        .bind(fallback)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Flip `refund_status` from `'none'` to `'eligible'` for submissions that
+    /// are still unclaimed and older than `timeout`. Purely informational — sets
+    /// the flag the (future) refund mechanism and the UI's "stuck" badge read;
+    /// no funds move.
+    pub async fn sweep_refund_eligible(&self, timeout: chrono::Duration) -> Result<u64, DbError> {
+        let cutoff = chrono::Utc::now() - timeout;
+        let res = sqlx::query(
+            "UPDATE submissions SET refund_status = 'eligible' \
+             WHERE status <> 'claimed' AND refund_status = 'none' AND created_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Resume cursor for one chain (indexer). `None` if never persisted.
+    pub async fn get_cursor(&self, chain_id: u64) -> Result<Option<u64>, DbError> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT last_block FROM indexer_cursors WHERE chain_id = $1")
+                .bind(chain_id as i64)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(b,)| b as u64))
+    }
+
+    pub async fn set_cursor(&self, chain_id: u64, last_block: u64) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO indexer_cursors (chain_id, last_block, updated_at) VALUES ($1,$2,now()) \
+             ON CONFLICT (chain_id) DO UPDATE SET last_block = EXCLUDED.last_block, updated_at = now()",
+        )
+        .bind(chain_id as i64)
+        .bind(last_block as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------------

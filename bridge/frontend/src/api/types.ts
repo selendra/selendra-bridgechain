@@ -72,3 +72,64 @@ export interface SwapPoolInfo {
   stable: string;
   tokens: PoolToken[];
 }
+
+// --- transaction history (database-backed, requires graphql-api --db-url) -
+
+/** The swap intent (and destination outcome) of a swap-then-bridge transfer. */
+export interface SwapIntent {
+  tokenIn: string;
+  amountIn: string;
+  stableOut: string;
+  finalToken: string;
+  finalReceiver: string;
+  finalizeTx: string | null;
+  finalizeAmountOut: string | null;
+  finalizeFallback: boolean | null;
+  finalizedAt: string | null;
+}
+
+/**
+ * A row from the DB-backed `history` query: every bridge transfer the indexer
+ * has observed, including ones stuck at zero signatures (which `submissions`
+ * can never show — that view only exists once a validator has signed).
+ */
+export interface HistoryEntry {
+  submissionId: string;
+  debridgeId: string;
+  amount: string;
+  chainIdFrom: number;
+  chainIdTo: number;
+  nonce: number;
+  receiver: string;
+  status: string; // 'signed' | 'claimed' (DB lifecycle, not the live-checked SubmissionStatus)
+  claimTx: string | null;
+  signatureCount: number;
+  createdAt: string;
+  updatedAt: string;
+  /** Past the refund timeout and still unclaimed. Informational — no refund mechanism exists yet. */
+  stuck: boolean;
+  refundStatus: string; // 'none' | 'eligible' | 'refunded'
+  refundTx: string | null;
+  swapIntent: SwapIntent | null;
+}
+
+export interface HistoryFilter {
+  chainIdFrom?: number;
+  chainIdTo?: number;
+  stuckOnly?: boolean;
+  submissionId?: string;
+}
+
+/** A completed same-chain swap (SwapPool.Swapped), mirrored by the indexer. */
+export interface SwapHistoryEntry {
+  chainId: number;
+  txHash: string;
+  sender: string;
+  receiver: string;
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: string;
+  amountOut: string;
+  blockNumber: number;
+  createdAt: string;
+}

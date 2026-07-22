@@ -8,6 +8,7 @@ members = [
     "crates/keeper",
     "crates/sig-store",
     "crates/graphql-api",
+    "crates/indexer",
 ]
 # The deployable Solana BPF program is built with the Solana toolchain
 # (`cargo build-sbf`), not the host workspace — its solana-program/spl-token deps

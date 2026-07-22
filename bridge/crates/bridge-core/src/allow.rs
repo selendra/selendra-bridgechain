@@ -69,8 +69,10 @@ pub struct SubmissionHistory {
     pub chain_id_to: u64,
     pub nonce: u64,
     pub receiver: String,
-    /// `signed` once at least one validator has attested; `claimed` after the
-    /// keeper executes `claim()` on the target chain.
+    /// `signed` once the transfer has been observed (regardless of signature
+    /// count — see the indexer, which inserts on `Sent` before any validator has
+    /// acted) or at least one validator has attested; `claimed` after a keeper
+    /// executes `claim()` on the target chain.
     pub status: String,
     /// Target-chain claim tx hash, once claimed.
     pub claim_tx: Option<String>,
@@ -78,6 +80,66 @@ pub struct SubmissionHistory {
     /// RFC-3339 timestamps.
     pub created_at: String,
     pub updated_at: String,
+    /// True once `created_at` is older than the indexer's refund timeout and the
+    /// transfer still isn't `claimed` — a candidate for the (separate) refund
+    /// mechanism. Purely informational: no funds move because of this flag.
+    #[serde(default)]
+    pub stuck: bool,
+    /// `none` | `eligible` | `refunded` — see [`crate::allow`] module docs on the
+    /// planned refund flow. Set by the indexer's periodic sweep; `refunded` is
+    /// reserved for the future on-chain refund mechanism (unused for now).
+    #[serde(default = "default_refund_status")]
+    pub refund_status: String,
+    /// Source-chain refund tx hash, once refunded (future mechanism; unused for now).
+    #[serde(default)]
+    pub refund_tx: Option<String>,
+    /// If this transfer was a `SwapRouter.swapAndBridge` (swap-then-bridge) rather
+    /// than a plain bridge send, its swap intent/outcome.
+    #[serde(default)]
+    pub swap_intent: Option<SwapBridgeInfo>,
+}
+
+fn default_refund_status() -> String {
+    "none".to_string()
+}
+
+/// One same-chain swap (`SwapPool.Swapped`), mirrored into the DB by the indexer.
+/// Same-chain swaps are atomic (revert on failure), so unlike a bridge transfer
+/// there is no "stuck" state to track here — only completed swaps are ever emitted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapRecord {
+    pub chain_id: u64,
+    /// `0x`-prefixed transaction hash.
+    pub tx_hash: String,
+    pub log_index: i64,
+    pub sender: String,
+    pub receiver: String,
+    pub token_in: String,
+    pub token_out: String,
+    /// decimal strings (uint256)
+    pub amount_in: String,
+    pub amount_out: String,
+    pub block_number: u64,
+    /// RFC-3339 timestamp.
+    pub created_at: String,
+}
+
+/// The swap intent (source leg) and outcome (destination leg) of a
+/// `SwapRouter.swapAndBridge` transfer, keyed by the bridge `submissionId`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapBridgeInfo {
+    pub token_in: String,
+    pub amount_in: String,
+    pub stable_out: String,
+    pub final_token: String,
+    pub final_receiver: String,
+    /// Set once the destination leg has run (`Finalized`/`FinalizeFallback`).
+    pub finalize_tx: Option<String>,
+    pub finalize_amount_out: Option<String>,
+    /// True if the destination swap failed and the router fell back to
+    /// delivering the stable itself (`FinalizeFallback`).
+    pub finalize_fallback: Option<bool>,
+    pub finalized_at: Option<String>,
 }
 
 /// In-memory mirror of the allowlists, built from the fetched rows for O(1)

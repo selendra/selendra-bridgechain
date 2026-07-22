@@ -2650,6 +2650,7 @@ dependencies = [
  "async-graphql-axum",
  "axum 0.7.9",
  "bridge-core",
+ "bridge-db",
  "clap",
  "serde",
  "serde_json",
@@ -3101,6 +3102,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "indexer"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "alloy-sol-types",
+ "anyhow",
+ "bridge-core",
+ "bridge-db",
+ "chrono",
+ "hex",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

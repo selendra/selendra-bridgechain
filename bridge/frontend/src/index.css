@@ -1012,6 +1012,29 @@ body {
   color: var(--blue);
 }
 
+/* explorer tabs (bridge transfers / same-chain swaps) */
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--line-2);
+}
+.tab {
+  padding: 8px 4px 12px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-right: 18px;
+}
+.tab--active {
+  color: var(--blue);
+  border-bottom-color: var(--blue);
+}
+
 .search {
   display: flex;
   align-items: center;
@@ -1166,6 +1189,16 @@ body {
   border-color: #b9ead2;
 }
 .badge--unknown {
+  background: var(--surface);
+  color: var(--muted);
+  border-color: var(--line-2);
+}
+.badge--refund-eligible {
+  background: #fdecea;
+  color: #b3261e;
+  border-color: #f5c2bd;
+}
+.badge--refund-refunded {
   background: var(--surface);
   color: var(--muted);
   border-color: var(--line-2);

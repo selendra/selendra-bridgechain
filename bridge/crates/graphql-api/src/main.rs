@@ -71,6 +71,11 @@ struct Args {
     /// Expose the `submitSignature` mutation (off by default — read-only).
     #[arg(long, env = "GRAPHQL_ALLOW_MUTATIONS", default_value_t = false)]
     allow_mutations: bool,
+    /// Postgres connection string (the same DB the `indexer` writes to), e.g.
+    /// postgres://bridge:bridge@localhost:5432/bridge. Enables the `history`/
+    /// `swapHistory` queries; without it they return a clear error.
+    #[arg(long, env = "DATABASE_URL")]
+    db_url: Option<String>,
 }
 
 #[tokio::main]
@@ -117,12 +122,19 @@ async fn main() -> anyhow::Result<()> {
     }
     let swap_ids = swaps.configured();
 
+    let db = match &args.db_url {
+        Some(url) => Some(bridge_db::Db::connect(url).await?),
+        None => None,
+    };
+    let db_configured = db.is_some();
+
     let state = ApiState {
         backend: Arc::new(backend),
         threshold: args.threshold,
         chains,
         registry,
         swaps,
+        db,
     };
 
     // Depth/complexity caps so one request can't fan out to hundreds of store
@@ -156,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         mutations = args.allow_mutations,
         on_chain_status_for = ?chain_ids,
         swap_pools_for = ?swap_ids,
+        history = db_configured,
         "graphql-api listening (GraphiQL at /)"
     );
     axum::serve(listener, app).await?;

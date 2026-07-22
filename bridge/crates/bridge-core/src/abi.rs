@@ -75,6 +75,14 @@ sol! {
     contract SwapPool {
         event TokenListed(address indexed token, uint256 price, uint8 decimals);
         event TokenDelisted(address indexed token);
+        event Swapped(
+            address indexed sender,
+            address indexed tokenIn,
+            address indexed tokenOut,
+            uint256 amountIn,
+            uint256 amountOut,
+            address to
+        );
 
         function stable() external view returns (address);
         /// Public getter for the `tokens` mapping (fields in declaration order).
@@ -90,5 +98,31 @@ sol! {
             external
             view
             returns (uint256 reserve, uint256 usdValue);
+    }
+
+    /// Composes {SwapPool} + {Gate} for cross-chain "swap on arrival" transfers.
+    /// Signatures MUST match `contracts/src/SwapRouter.sol` (event subset used by
+    /// the indexer to correlate a bridge submission with its swap intent/outcome).
+    #[sol(rpc)]
+    contract SwapRouter {
+        event SwapBridged(
+            bytes32 indexed submissionId,
+            address indexed sender,
+            address tokenIn,
+            uint256 amountIn,
+            uint256 stableOut,
+            uint256 chainIdTo,
+            address finalToken,
+            address finalReceiver
+        );
+        event Finalized(
+            bytes32 indexed submissionId,
+            address indexed finalReceiver,
+            address finalToken,
+            uint256 stableIn,
+            uint256 amountOut,
+            bool swapped
+        );
+        event FinalizeFallback(bytes32 indexed submissionId, address indexed finalReceiver, uint256 stableAmount);
     }
 }

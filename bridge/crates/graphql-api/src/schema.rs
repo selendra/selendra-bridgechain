@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Object, SimpleObject};
+use bridge_core::allow::{SubmissionHistory, SwapBridgeInfo, SwapRecord};
 use bridge_core::store::{SignerSig, SubmissionRecord};
+use bridge_db::Db;
 
 use crate::backend::Backend;
 use crate::chain::{ChainInfo, Chains};
@@ -31,6 +33,11 @@ pub struct ApiState {
     /// Optional same-chain `SwapPool` RPCs, so `pools`/`swapQuote` can report
     /// live pool state. Empty => those fields are null.
     pub swaps: Swaps,
+    /// Optional Postgres connection (the same DB the `indexer` writes to), for
+    /// the `history`/`swapHistory` queries. `None` when started without
+    /// `--db-url` — those queries then return a clear error instead of silently
+    /// reporting empty data.
+    pub db: Option<Db>,
 }
 
 /// A network the bridge UI can target. Mirrors [`ChainInfo`] for the wire.
@@ -258,6 +265,142 @@ fn state<'c>(ctx: &Context<'c>) -> &'c ApiState {
     ctx.data_unchecked::<ApiState>()
 }
 
+/// Look up the configured DB, or a clear error telling the operator how to fix it.
+fn require_db<'c>(ctx: &Context<'c>) -> async_graphql::Result<&'c Db> {
+    state(ctx)
+        .db
+        .as_ref()
+        .ok_or_else(|| async_graphql::Error::new("transaction history not configured — start graphql-api with --db-url"))
+}
+
+/// The swap intent (and destination outcome, once known) of a
+/// `SwapRouter.swapAndBridge` transfer — a plain bridge send has none.
+#[derive(SimpleObject)]
+pub struct SwapIntent {
+    pub token_in: String,
+    pub amount_in: String,
+    pub stable_out: String,
+    pub final_token: String,
+    pub final_receiver: String,
+    /// Destination-chain finalize tx, once the swap-back leg has run.
+    pub finalize_tx: Option<String>,
+    pub finalize_amount_out: Option<String>,
+    /// True if the destination swap failed and the stable was delivered as-is.
+    pub finalize_fallback: Option<bool>,
+    pub finalized_at: Option<String>,
+}
+
+impl From<SwapBridgeInfo> for SwapIntent {
+    fn from(i: SwapBridgeInfo) -> Self {
+        SwapIntent {
+            token_in: i.token_in,
+            amount_in: i.amount_in,
+            stable_out: i.stable_out,
+            final_token: i.final_token,
+            final_receiver: i.final_receiver,
+            finalize_tx: i.finalize_tx,
+            finalize_amount_out: i.finalize_amount_out,
+            finalize_fallback: i.finalize_fallback,
+            finalized_at: i.finalized_at,
+        }
+    }
+}
+
+/// One row of the database-backed transaction-history view: every bridge
+/// transfer the `indexer` has observed, regardless of whether it ever got a
+/// validator signature — unlike `submissions`/`submission` (signature-store
+/// view), this is where a stuck/failed transfer is visible.
+#[derive(SimpleObject)]
+pub struct HistoryEntry {
+    pub submission_id: String,
+    pub debridge_id: String,
+    pub amount: String,
+    pub chain_id_from: u64,
+    pub chain_id_to: u64,
+    pub nonce: u64,
+    pub receiver: String,
+    pub status: String,
+    pub claim_tx: Option<String>,
+    pub signature_count: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    /// True once this transfer has sat unclaimed past the indexer's refund
+    /// timeout. Informational only — no on-chain refund exists yet.
+    pub stuck: bool,
+    /// `none` | `eligible` | `refunded`.
+    pub refund_status: String,
+    pub refund_tx: Option<String>,
+    /// Set when this transfer originated from `SwapRouter.swapAndBridge`.
+    pub swap_intent: Option<SwapIntent>,
+}
+
+impl From<SubmissionHistory> for HistoryEntry {
+    fn from(h: SubmissionHistory) -> Self {
+        HistoryEntry {
+            submission_id: h.submission_id,
+            debridge_id: h.debridge_id,
+            amount: h.amount,
+            chain_id_from: h.chain_id_from,
+            chain_id_to: h.chain_id_to,
+            nonce: h.nonce,
+            receiver: h.receiver,
+            status: h.status,
+            claim_tx: h.claim_tx,
+            signature_count: h.signature_count as u64,
+            created_at: h.created_at,
+            updated_at: h.updated_at,
+            stuck: h.stuck,
+            refund_status: h.refund_status,
+            refund_tx: h.refund_tx,
+            swap_intent: h.swap_intent.map(Into::into),
+        }
+    }
+}
+
+/// Optional filters for `history`. All supplied fields must match (AND).
+#[derive(InputObject, Default)]
+pub struct HistoryFilter {
+    pub chain_id_from: Option<u64>,
+    pub chain_id_to: Option<u64>,
+    /// Keep only transfers flagged stuck (refund-eligible).
+    pub stuck_only: Option<bool>,
+    /// Exact-match one submissionId (e.g. to look up refund/stuck status for a
+    /// detail view already loaded via `submission`). Case-insensitive.
+    pub submission_id: Option<String>,
+}
+
+/// One completed same-chain swap (`SwapPool.Swapped`), mirrored by the indexer.
+#[derive(SimpleObject)]
+pub struct SwapHistoryEntry {
+    pub chain_id: u64,
+    pub tx_hash: String,
+    pub sender: String,
+    pub receiver: String,
+    pub token_in: String,
+    pub token_out: String,
+    pub amount_in: String,
+    pub amount_out: String,
+    pub block_number: u64,
+    pub created_at: String,
+}
+
+impl From<SwapRecord> for SwapHistoryEntry {
+    fn from(s: SwapRecord) -> Self {
+        SwapHistoryEntry {
+            chain_id: s.chain_id,
+            tx_hash: s.tx_hash,
+            sender: s.sender,
+            receiver: s.receiver,
+            token_in: s.token_in,
+            token_out: s.token_out,
+            amount_in: s.amount_in,
+            amount_out: s.amount_out,
+            block_number: s.block_number,
+            created_at: s.created_at,
+        }
+    }
+}
+
 pub struct Query;
 
 #[Object]
@@ -396,6 +539,41 @@ impl Query {
                 })
                 .collect(),
         })
+    }
+
+    /// Database-backed transaction history: every bridge transfer the `indexer`
+    /// has observed on-chain, including ones stuck at zero signatures (which
+    /// `submissions` can never show, since that view only exists once a
+    /// validator has signed). Requires `--db-url`. Newest first.
+    async fn history(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<HistoryFilter>,
+    ) -> async_graphql::Result<Vec<HistoryEntry>> {
+        let db = require_db(ctx)?;
+        let f = filter.unwrap_or_default();
+        let rows = db.history().await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| f.chain_id_from.is_none_or(|c| r.chain_id_from == c))
+            .filter(|r| f.chain_id_to.is_none_or(|c| r.chain_id_to == c))
+            .filter(|r| f.stuck_only.is_none_or(|want| r.stuck == want))
+            .filter(|r| f.submission_id.as_deref().is_none_or(|id| r.submission_id.eq_ignore_ascii_case(id)))
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Same-chain swap history (`SwapPool.Swapped`), mirrored by the `indexer`.
+    /// Requires `--db-url`. Newest first, optionally scoped to one chain.
+    async fn swap_history(
+        &self,
+        ctx: &Context<'_>,
+        chain_id: Option<u64>,
+        limit: Option<u64>,
+    ) -> async_graphql::Result<Vec<SwapHistoryEntry>> {
+        let db = require_db(ctx)?;
+        let rows = db.list_swaps(chain_id, limit.unwrap_or(100).min(1000) as i64).await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 }
 

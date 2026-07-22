@@ -4,9 +4,12 @@
 
 import type {
   Chain,
+  HistoryEntry,
+  HistoryFilter,
   Stats,
   Submission,
   SubmissionFilter,
+  SwapHistoryEntry,
   SwapPoolInfo,
 } from "./types";
 
@@ -70,6 +73,43 @@ export function fetchSubmission(submissionId: string): Promise<Submission | null
      }`,
     { id: submissionId }
   ).then((d) => d.submission);
+}
+
+// --- transaction history (database-backed, requires graphql-api --db-url) -
+
+export function fetchHistory(filter?: HistoryFilter): Promise<HistoryEntry[]> {
+  return gql<{ history: HistoryEntry[] }>(
+    `query Hist($filter: HistoryFilter) {
+       history(filter: $filter) {
+         submissionId debridgeId amount chainIdFrom chainIdTo nonce receiver
+         status claimTx signatureCount createdAt updatedAt
+         stuck refundStatus refundTx
+         swapIntent {
+           tokenIn amountIn stableOut finalToken finalReceiver
+           finalizeTx finalizeAmountOut finalizeFallback finalizedAt
+         }
+       }
+     }`,
+    { filter }
+  ).then((d) => d.history);
+}
+
+export function fetchSwapHistory(chainId?: number, limit?: number): Promise<SwapHistoryEntry[]> {
+  // chainId/limit are u64 args (not InputObject fields), which — like
+  // swapQuote's chainId — don't have a convenient GraphQL variable scalar
+  // name, so inline them as validated integer literals rather than variables.
+  const args = [
+    chainId != null ? `chainId: ${chainId}` : null,
+    limit != null ? `limit: ${limit}` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  return gql<{ swapHistory: SwapHistoryEntry[] }>(
+    `{ swapHistory(${args}) {
+         chainId txHash sender receiver tokenIn tokenOut amountIn amountOut
+         blockNumber createdAt
+       } }`
+  ).then((d) => d.swapHistory);
 }
 
 // --- swap (same-chain SwapPool) -----------------------------------------

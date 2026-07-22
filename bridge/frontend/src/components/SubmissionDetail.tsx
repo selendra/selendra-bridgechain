@@ -1,10 +1,10 @@
 import { useEffect, type ReactNode } from "react";
-import { StatusBadge } from "./StatusBadge";
+import { StatusBadge, RefundBadge } from "./StatusBadge";
 import { Glyph, ArrowRight } from "./icons";
 import { chainViz, formatUnits, shortHex } from "../data/format";
-import { fetchSubmission } from "../api/client";
+import { fetchHistory, fetchSubmission } from "../api/client";
 import { usePoll } from "../api/hooks";
-import type { Chain, Submission } from "../api/types";
+import type { Chain, HistoryEntry, Submission } from "../api/types";
 import { useChainDecimals } from "./useChainDecimals";
 
 interface Props {
@@ -33,6 +33,14 @@ export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
     6000
   );
   const decimalsByChain = useChainDecimals(chains);
+
+  // Best-effort: only populated when graphql-api was started with --db-url.
+  const { data: historyRows } = usePoll<HistoryEntry[]>(
+    () => fetchHistory({ submissionId }).catch(() => []),
+    [submissionId],
+    6000
+  );
+  const refund = historyRows?.[0];
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -71,9 +79,18 @@ export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
                 </span>
               )}
               <StatusBadge status={data.status} />
+              {refund && refund.refundStatus !== "none" && <RefundBadge refundStatus={refund.refundStatus} />}
             </div>
 
             <Row label="Amount">{formatUnits(data.amount, decimalsByChain[data.chainIdFrom] ?? 18)} </Row>
+            {refund && refund.refundStatus !== "none" && (
+              <Row label="Refund status">
+                {refund.refundStatus === "eligible"
+                  ? "Stuck past the refund timeout — not yet claimed"
+                  : "Refunded"}
+                {refund.refundTx && <> ({shortHex(refund.refundTx, 8, 6)})</>}
+              </Row>
+            )}
             <Row label="Nonce">{data.nonce}</Row>
             <Row label="Receiver" mono>
               {data.receiver}

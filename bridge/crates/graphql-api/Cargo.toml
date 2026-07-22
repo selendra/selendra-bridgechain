@@ -8,6 +8,7 @@ license.workspace = true
 # `abi` lets a dir-backed mutation reuse the store trust boundary (id<->params +
 # signature auth); `http` lets us front the remote sig-store instead of a dir.
 bridge-core = { workspace = true, features = ["abi", "http"] }
+bridge-db = { workspace = true }
 alloy = { workspace = true }
 alloy-primitives = { workspace = true }
 tokio = { workspace = true }
