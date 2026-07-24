@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use bridge_core::allow::Allowlist;
 use bridge_core::remote::RemoteStore;
-use bridge_core::store::{self, SignerSig, SubmissionRecord};
+use bridge_core::store::{self, SigKind, SignerSig, SubmissionRecord};
 
 use crate::config::Store;
 
@@ -46,6 +46,34 @@ impl Sink {
             }
         }
         Ok(())
+    }
+
+    /// Post a cancel/refund attestation for an already-stored submission.
+    pub async fn upsert_attestation(
+        &self,
+        submission_id: &str,
+        kind: SigKind,
+        sig: SignerSig,
+    ) -> anyhow::Result<()> {
+        match self {
+            Sink::File(dir) => {
+                store::upsert_attestation(dir, submission_id, kind, sig)?;
+            }
+            Sink::Remote(remote) => {
+                remote.upsert_attestation(submission_id, kind, sig).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Submissions the refund loop should examine. In file mode there is no
+    /// server-side lifecycle, so every stored record is offered and the loop's
+    /// own on-chain checks do all the filtering.
+    pub async fn refund_candidates(&self) -> anyhow::Result<Vec<SubmissionRecord>> {
+        match self {
+            Sink::File(dir) => Ok(store::load_all(dir)?),
+            Sink::Remote(remote) => Ok(remote.refund_candidates().await?),
+        }
     }
 
     /// Fetch the current allowlists from the sig-store, or `None` in legacy file

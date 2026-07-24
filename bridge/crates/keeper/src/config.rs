@@ -14,6 +14,22 @@ pub struct Config {
     /// (raw dev key, env var, or an encrypted keystore). See [`SignerConfig`].
     pub keeper: SignerConfig,
     pub store: Store,
+    /// Source chains this keeper can submit `refund()` to. Refunds execute on the
+    /// chain the funds were locked on, which is the *source* of a transfer — so
+    /// they need their own blocks, separate from the claim targets. Empty (the
+    /// default) means this keeper never submits refunds.
+    #[serde(default)]
+    pub sources: Vec<SourceChain>,
+}
+
+/// A source chain the keeper can submit `refund()` transactions to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceChain {
+    pub chain_id: u64,
+    pub rpc: String,
+    pub gate: String,
+    #[serde(default = "default_interval")]
+    pub poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +76,17 @@ impl Config {
                     anyhow::bail!(
                         "duplicate target chain_id {} in config",
                         cfg.targets[i].chain_id
+                    );
+                }
+            }
+        }
+
+        for i in 0..cfg.sources.len() {
+            for j in (i + 1)..cfg.sources.len() {
+                if cfg.sources[i].chain_id == cfg.sources[j].chain_id {
+                    anyhow::bail!(
+                        "duplicate source chain_id {} in config",
+                        cfg.sources[i].chain_id
                     );
                 }
             }

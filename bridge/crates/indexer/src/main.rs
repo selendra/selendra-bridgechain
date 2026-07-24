@@ -203,7 +203,10 @@ async fn handle_gate_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()> 
             receiver: format!("0x{}", hex::encode(&ev.receiver)),
             auto_params: format!("0x{}", hex::encode(&ev.autoParams)),
             native_sender: format!("0x{}", hex::encode(&ev.nativeSender)),
+            token: format!("{:#x}", ev.token),
             signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
         };
         let id = record.submission_id.clone();
         db.observe_submission(record).await?;
@@ -216,6 +219,26 @@ async fn handle_gate_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()> 
         let id = format!("{:#x}", ev.submissionId);
         db.mark_claimed(&id, &tx).await?;
         info!(chain_id, submission_id = %id, %tx, "observed Claimed");
+        return Ok(());
+    }
+    // Refund path. These are observed from the chain rather than taken on a
+    // relayer's word, so the recorded lifecycle always reflects what actually
+    // happened on-chain — which is what the UI and the validators' candidate
+    // list both read.
+    if let Ok(decoded) = Gate::Cancelled::decode_log(&log.inner) {
+        let ev = &decoded.data;
+        let tx = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+        let id = format!("{:#x}", ev.submissionId);
+        db.mark_cancelled(&id, &tx).await?;
+        info!(chain_id, submission_id = %id, %tx, "observed Cancelled (destination burned)");
+        return Ok(());
+    }
+    if let Ok(decoded) = Gate::Refunded::decode_log(&log.inner) {
+        let ev = &decoded.data;
+        let tx = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+        let id = format!("{:#x}", ev.submissionId);
+        db.mark_refunded(&id, &tx).await?;
+        info!(chain_id, submission_id = %id, %tx, "observed Refunded (source repaid)");
     }
     Ok(())
 }

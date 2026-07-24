@@ -60,4 +60,20 @@ impl Source {
             Source::Remote(remote) => Ok(remote.mark_claimed(submission_id, claim_tx).await?),
         }
     }
+
+    /// Record a destination-chain `cancel()` (no-op in file mode).
+    pub async fn mark_cancelled(&self, submission_id: &str, tx: &str) -> anyhow::Result<()> {
+        match self {
+            Source::File(_) => Ok(()),
+            Source::Remote(remote) => Ok(remote.mark_cancelled(submission_id, tx).await?),
+        }
+    }
+
+    /// Record a source-chain `refund()` (no-op in file mode).
+    pub async fn mark_refunded(&self, submission_id: &str, tx: &str) -> anyhow::Result<()> {
+        match self {
+            Source::File(_) => Ok(()),
+            Source::Remote(remote) => Ok(remote.mark_refunded(submission_id, tx).await?),
+        }
+    }
 }

@@ -84,12 +84,28 @@ export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
 
             <Row label="Amount">{formatUnits(data.amount, decimalsByChain[data.chainIdFrom] ?? 18)} </Row>
             {refund && refund.refundStatus !== "none" && (
-              <Row label="Refund status">
-                {refund.refundStatus === "eligible"
-                  ? "Stuck past the refund timeout — not yet claimed"
-                  : "Refunded"}
-                {refund.refundTx && <> ({shortHex(refund.refundTx, 8, 6)})</>}
-              </Row>
+              <>
+                <Row label="Refund status">
+                  {refund.refundStatus === "eligible" &&
+                    "Stuck past the refund timeout — validators are attesting a cancel"}
+                  {refund.refundStatus === "cancelled" &&
+                    "Burned on the destination — it can no longer be delivered; the source-chain repayment is pending"}
+                  {refund.refundStatus === "refunded" && "Returned to the original sender on the source chain"}
+                </Row>
+                {refund.cancelTx && (
+                  <Row label="Cancel tx" mono>
+                    {shortHex(refund.cancelTx, 8, 6)}
+                  </Row>
+                )}
+                {refund.refundTx && (
+                  <Row label="Refund tx" mono>
+                    {shortHex(refund.refundTx, 8, 6)}
+                  </Row>
+                )}
+                <Row label="Refund attestations">
+                  {refund.cancelSignatureCount} cancel / {refund.refundSignatureCount} refund
+                </Row>
+              </>
             )}
             <Row label="Nonce">{data.nonce}</Row>
             <Row label="Receiver" mono>

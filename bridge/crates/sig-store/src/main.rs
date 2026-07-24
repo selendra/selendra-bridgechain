@@ -15,6 +15,15 @@
 //!   POST   /submissions/:id/claimed      -> mark claimed (body: {"claim_tx": "0x.."})
 //!   GET    /history                      -> history view (status, counts, timestamps)
 //!
+//!   # refund path (two-phase: burn on the destination, then repay on the source)
+//!   POST   /submissions/:id/attestations -> a validator's cancel/refund signature
+//!                                           (body: {"kind":"cancel"|"refund",
+//!                                                   "signer":"0x..","signature":"0x.."})
+//!   GET    /refund-candidates            -> submissions a refund relayer should
+//!                                           examine (still requires on-chain checks)
+//!   POST   /submissions/:id/cancelled    -> record the destination cancel tx
+//!   POST   /submissions/:id/refunded     -> record the source refund tx
+//!
 //!   # allowlists
 //!   GET    /allowed/tokens               -> whitelisted tokens
 //!   POST   /allowed/tokens               -> add (body: {"chain_id":..,"token":"0x..","symbol":".."})
@@ -30,9 +39,12 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use bridge_core::allow::{AddTokenRequest, AllowedChain, AllowedToken, ClaimedRequest, SubmissionHistory};
+use bridge_core::allow::{
+    AddTokenRequest, AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest,
+    RefundTxRequest, SubmissionHistory,
+};
 use bridge_core::auth::require_auth;
-use bridge_core::store::SubmissionRecord;
+use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
 use bridge_db::{Db, DbError};
 use clap::Parser;
 use tracing::{info, warn};
@@ -79,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/submissions", post(post_submission).get(list_submissions))
         .route("/submissions/:id", get(get_submission))
         .route("/submissions/:id/claimed", post(post_claimed))
+        .route("/submissions/:id/attestations", post(post_attestation))
+        .route("/submissions/:id/cancelled", post(post_cancelled))
+        .route("/submissions/:id/refunded", post(post_refunded))
+        .route("/refund-candidates", get(get_refund_candidates))
         .route("/history", get(get_history))
         .route("/allowed/tokens", get(list_tokens).post(add_token))
         .route("/allowed/tokens/:chain/:token", delete(remove_token))
@@ -183,6 +199,63 @@ async fn get_history(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<SubmissionHistory>>, (StatusCode, String)> {
     Ok(Json(s.db.history().await.map_err(db_err)?))
+}
+
+// --- refund path ----------------------------------------------------------
+
+/// Store one validator's cancel/refund attestation.
+///
+/// The signature is checked against the digest for `kind` specifically, so a
+/// transfer signature posted here as a `cancel` recovers to the wrong address
+/// and is rejected — the three quorums stay independent.
+async fn post_attestation(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AttestationRequest>,
+) -> Result<Json<SubmissionRecord>, (StatusCode, String)> {
+    let kind = SigKind::parse(&req.kind)
+        .filter(|k| *k != SigKind::Transfer)
+        .ok_or((StatusCode::BAD_REQUEST, format!("unknown attestation kind {:?}", req.kind)))?;
+
+    let rec = s
+        .db
+        .upsert_attestation(&id, kind, SignerSig { signer: req.signer, signature: req.signature })
+        .await
+        .map_err(db_err)?;
+
+    let count = match kind {
+        SigKind::Cancel => rec.cancel_signatures.len(),
+        SigKind::Refund => rec.refund_signatures.len(),
+        SigKind::Transfer => unreachable!("filtered above"),
+    };
+    info!(submission_id = %rec.submission_id, kind = kind.as_str(), count, "stored attestation");
+    Ok(Json(rec))
+}
+
+async fn get_refund_candidates(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<SubmissionRecord>>, (StatusCode, String)> {
+    Ok(Json(s.db.refund_candidates().await.map_err(db_err)?))
+}
+
+async fn post_cancelled(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RefundTxRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    s.db.mark_cancelled(&id, &body.tx_hash).await.map_err(db_err)?;
+    info!(submission_id = %id, tx = %body.tx_hash, "marked cancelled on destination");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_refunded(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RefundTxRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    s.db.mark_refunded(&id, &body.tx_hash).await.map_err(db_err)?;
+    info!(submission_id = %id, tx = %body.tx_hash, "marked refunded on source");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- allowlists -----------------------------------------------------------

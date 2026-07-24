@@ -15,7 +15,7 @@ use std::str::FromStr;
 
 use alloy_primitives::{Address, U256};
 use bridge_core::allow::{AllowedChain, AllowedToken, SubmissionHistory, SwapBridgeInfo, SwapRecord};
-use bridge_core::store::{self, SignerSig, StoreError, SubmissionRecord};
+use bridge_core::store::{self, SigKind, SignerSig, StoreError, SubmissionRecord};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, PgPool};
 
@@ -69,6 +69,8 @@ struct SubmissionRow {
     updated_at: chrono::DateTime<chrono::Utc>,
     refund_status: String,
     refund_tx: Option<String>,
+    cancel_tx: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -137,12 +139,14 @@ impl SwapRow {
 #[derive(FromRow)]
 struct SigRow {
     submission_id: String,
+    /// `transfer` (from the `signatures` table) | `cancel` | `refund`.
+    kind: String,
     signer: String,
     signature: String,
 }
 
 impl SubmissionRow {
-    fn into_record(self, signatures: Vec<SignerSig>) -> SubmissionRecord {
+    fn into_record(self, sigs: Attestations) -> SubmissionRecord {
         SubmissionRecord {
             submission_id: self.submission_id,
             debridge_id: self.debridge_id,
@@ -153,11 +157,20 @@ impl SubmissionRow {
             receiver: self.receiver,
             auto_params: self.auto_params,
             native_sender: self.native_sender,
-            signatures,
+            token: self.token.unwrap_or_default(),
+            signatures: sigs.transfer,
+            cancel_signatures: sigs.cancel,
+            refund_signatures: sigs.refund,
         }
     }
 
-    fn into_history(self, signature_count: i64, swap_intent: Option<SwapBridgeInfo>) -> SubmissionHistory {
+    fn into_history(
+        self,
+        signature_count: i64,
+        cancel_signature_count: i64,
+        refund_signature_count: i64,
+        swap_intent: Option<SwapBridgeInfo>,
+    ) -> SubmissionHistory {
         SubmissionHistory {
             submission_id: self.submission_id,
             debridge_id: self.debridge_id,
@@ -174,7 +187,29 @@ impl SubmissionRow {
             stuck: self.refund_status != "none",
             refund_status: self.refund_status,
             refund_tx: self.refund_tx,
+            cancel_tx: self.cancel_tx,
+            token: self.token,
+            cancel_signature_count,
+            refund_signature_count,
             swap_intent,
+        }
+    }
+}
+
+/// A submission's signatures split by the domain they authorise.
+#[derive(Default)]
+struct Attestations {
+    transfer: Vec<SignerSig>,
+    cancel: Vec<SignerSig>,
+    refund: Vec<SignerSig>,
+}
+
+impl Attestations {
+    fn push(&mut self, kind: &str, sig: SignerSig) {
+        match SigKind::parse(kind) {
+            Some(SigKind::Transfer) | None => self.transfer.push(sig),
+            Some(SigKind::Cancel) => self.cancel.push(sig),
+            Some(SigKind::Refund) => self.refund.push(sig),
         }
     }
 }
@@ -241,6 +276,9 @@ impl Db {
             .into());
         }
         store::verify_signature(computed, &sig)?;
+        // `token` is not covered by the submissionId, so it gets its own exact
+        // binding (debridge_id == keccak(chain_id_from, token)) before storage.
+        store::verify_token_binding(&record)?;
 
         let id = norm_id(&record.submission_id);
         let mut tx = self.pool.begin().await?;
@@ -260,15 +298,27 @@ impl Db {
             // lowercase) — `record.submission_id` itself may lack the prefix.
             let mut incoming = record.clone();
             incoming.submission_id = id.clone();
-            if !store::same_params(&row.into_record(Vec::new()), &incoming) {
+            if !store::same_params(&row.into_record(Attestations::default()), &incoming) {
                 return Err(StoreError::ParamsConflict(record.submission_id.clone()).into());
+            }
+            // Backfill `token` if this row predates it (e.g. inserted by an older
+            // indexer). Verified above, and only ever written once — never
+            // overwritten, so it stays as immutable as the rest of the params.
+            if !record.token.is_empty() {
+                sqlx::query(
+                    "UPDATE submissions SET token = $2 WHERE submission_id = $1 AND token IS NULL",
+                )
+                .bind(&id)
+                .bind(record.token.to_ascii_lowercase())
+                .execute(&mut *tx)
+                .await?;
             }
         } else {
             sqlx::query(
                 "INSERT INTO submissions \
                  (submission_id, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
-                  receiver, auto_params, native_sender) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                  receiver, auto_params, native_sender, token) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             )
             .bind(&id)
             .bind(record.debridge_id.to_ascii_lowercase())
@@ -279,6 +329,7 @@ impl Db {
             .bind(record.receiver.to_ascii_lowercase())
             .bind(record.auto_params.to_ascii_lowercase())
             .bind(record.native_sender.to_ascii_lowercase())
+            .bind(Some(record.token.to_ascii_lowercase()).filter(|t| !t.is_empty()))
             .execute(&mut *tx)
             .await?;
         }
@@ -320,17 +371,22 @@ impl Db {
         let Some(row) = row else { return Ok(None) };
 
         let sigs: Vec<SigRow> = sqlx::query_as(
-            "SELECT submission_id, signer, signature FROM signatures \
-             WHERE submission_id = $1 ORDER BY signer",
+            "SELECT submission_id, 'transfer' AS kind, signer, signature FROM signatures \
+               WHERE submission_id = $1 \
+             UNION ALL \
+             SELECT submission_id, kind, signer, signature FROM attestations \
+               WHERE submission_id = $1 \
+             ORDER BY kind, signer",
         )
         .bind(&id)
         .fetch_all(&self.pool)
         .await?;
-        let sigs = sigs
-            .into_iter()
-            .map(|s| SignerSig { signer: s.signer, signature: s.signature })
-            .collect();
-        Ok(Some(row.into_record(sigs)))
+
+        let mut collected = Attestations::default();
+        for s in sigs {
+            collected.push(&s.kind, SignerSig { signer: s.signer, signature: s.signature });
+        }
+        Ok(Some(row.into_record(collected)))
     }
 
     /// Load every record (params + signatures). Two queries + an in-memory join,
@@ -339,17 +395,20 @@ impl Db {
         let rows: Vec<SubmissionRow> =
             sqlx::query_as("SELECT * FROM submissions ORDER BY created_at").fetch_all(&self.pool).await?;
         let sigs: Vec<SigRow> = sqlx::query_as(
-            "SELECT submission_id, signer, signature FROM signatures ORDER BY submission_id, signer",
+            "SELECT submission_id, 'transfer' AS kind, signer, signature FROM signatures \
+             UNION ALL \
+             SELECT submission_id, kind, signer, signature FROM attestations \
+             ORDER BY submission_id, kind, signer",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let mut by_id: std::collections::HashMap<String, Vec<SignerSig>> = std::collections::HashMap::new();
+        let mut by_id: std::collections::HashMap<String, Attestations> = std::collections::HashMap::new();
         for s in sigs {
             by_id
                 .entry(s.submission_id)
                 .or_default()
-                .push(SignerSig { signer: s.signer, signature: s.signature });
+                .push(&s.kind, SignerSig { signer: s.signer, signature: s.signature });
         }
         Ok(rows
             .into_iter()
@@ -360,22 +419,114 @@ impl Db {
             .collect())
     }
 
+    /// Merge a cancel/refund attestation into an existing submission.
+    ///
+    /// Trust boundary, exactly like [`Db::upsert_signature`] but for the other
+    /// two domains: the signature must recover to its claimed signer over
+    /// `kind`'s own digest. That is what stops a validator's transfer signature
+    /// from being replayed to burn (`cancel`) or claw back (`refund`) a healthy
+    /// transfer — those are different messages entirely.
+    ///
+    /// Never creates a submission: an attestation about a transfer we have never
+    /// observed is meaningless, and the id⇄params binding stays the only way a
+    /// row comes into existence.
+    pub async fn upsert_attestation(
+        &self,
+        submission_id: &str,
+        kind: SigKind,
+        sig: SignerSig,
+    ) -> Result<SubmissionRecord, DbError> {
+        if !store::is_valid_submission_id(submission_id) {
+            return Err(StoreError::BadField("submission_id").into());
+        }
+        if kind == SigKind::Transfer {
+            // Transfer signatures carry the full params and go through the
+            // id<->params binding; they must not sneak in via this route.
+            return Err(DbError::BadField("kind"));
+        }
+        let id = norm_id(submission_id);
+
+        let existing = self.load(&id).await?.ok_or(DbError::BadField("submission_id"))?;
+        let parsed = alloy_primitives::B256::from_str(&existing.submission_id)
+            .map_err(|_| StoreError::BadField("submission_id"))?;
+        store::verify_attestation(parsed, kind, &sig)?;
+
+        sqlx::query(
+            "INSERT INTO attestations (submission_id, kind, signer, signature) \
+             VALUES ($1,$2,$3,$4) ON CONFLICT (submission_id, kind, signer) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(kind.as_str())
+        .bind(sig.signer.to_ascii_lowercase())
+        .bind(&sig.signature)
+        .execute(&self.pool)
+        .await?;
+
+        self.load(&id).await?.ok_or(DbError::BadField("submission_id"))
+    }
+
     // ---------------------------------------------------------------------
     // Transaction history (status).
     // ---------------------------------------------------------------------
 
     /// Mark a submission `claimed`, recording the target-chain claim tx hash.
+    ///
+    /// Also clears an `eligible` refund flag: a transfer that sat past the
+    /// timeout and then got claimed after all is not stuck, and leaving it
+    /// flagged would show a permanent false "refund eligible" in the UI and keep
+    /// validators considering it for a cancel attestation. `cancelled`/`refunded`
+    /// are terminal and never reset — a claim cannot follow them (the on-chain
+    /// `executed` flag makes that impossible), so seeing one would mean the two
+    /// chains disagree, and quietly overwriting it would hide that.
     pub async fn mark_claimed(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
         if !store::is_valid_submission_id(submission_id) {
             return Err(DbError::BadField("submission_id"));
         }
         let id = norm_id(submission_id);
         sqlx::query(
-            "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now() \
+            "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now(), \
+                    refund_status = CASE WHEN refund_status = 'eligible' THEN 'none' \
+                                         ELSE refund_status END \
              WHERE submission_id = $1",
         )
         .bind(&id)
         .bind(claim_tx)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that the destination gate burned this transfer (`Gate.Cancelled`).
+    /// This is the state that unlocks refund attestations, so it is only ever
+    /// written from an observed on-chain event, never from a relayer's say-so.
+    pub async fn mark_cancelled(&self, submission_id: &str, cancel_tx: &str) -> Result<(), DbError> {
+        if !store::is_valid_submission_id(submission_id) {
+            return Err(DbError::BadField("submission_id"));
+        }
+        let id = norm_id(submission_id);
+        sqlx::query(
+            "UPDATE submissions SET refund_status = 'cancelled', cancel_tx = $2, updated_at = now() \
+             WHERE submission_id = $1 AND refund_status <> 'refunded'",
+        )
+        .bind(&id)
+        .bind(cancel_tx)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that the source gate returned the funds (`Gate.Refunded`).
+    pub async fn mark_refunded(&self, submission_id: &str, refund_tx: &str) -> Result<(), DbError> {
+        if !store::is_valid_submission_id(submission_id) {
+            return Err(DbError::BadField("submission_id"));
+        }
+        let id = norm_id(submission_id);
+        sqlx::query(
+            "UPDATE submissions SET refund_status = 'refunded', refund_tx = $2, updated_at = now() \
+             WHERE submission_id = $1",
+        )
+        .bind(&id)
+        .bind(refund_tx)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -394,6 +545,28 @@ impl Db {
         .await?;
         let counts: std::collections::HashMap<String, i64> = counts.into_iter().collect();
 
+        // Cancel/refund quorum progress, counted per domain so the UI can show
+        // how far a stuck transfer has got through the refund path.
+        let att_counts: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT submission_id, kind, COUNT(*)::BIGINT FROM attestations \
+             GROUP BY submission_id, kind",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut cancel_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut refund_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for (id, kind, n) in att_counts {
+            match SigKind::parse(&kind) {
+                Some(SigKind::Cancel) => {
+                    cancel_counts.insert(id, n);
+                }
+                Some(SigKind::Refund) => {
+                    refund_counts.insert(id, n);
+                }
+                _ => {}
+            }
+        }
+
         let swap_bridges: Vec<SwapBridgeRow> = sqlx::query_as("SELECT * FROM swap_bridges")
             .fetch_all(&self.pool)
             .await?;
@@ -406,8 +579,10 @@ impl Db {
             .into_iter()
             .map(|r| {
                 let n = counts.get(&r.submission_id).copied().unwrap_or(0);
+                let c = cancel_counts.get(&r.submission_id).copied().unwrap_or(0);
+                let f = refund_counts.get(&r.submission_id).copied().unwrap_or(0);
                 let intent = swap_bridges.remove(&r.submission_id);
-                r.into_history(n, intent)
+                r.into_history(n, c, f, intent)
             })
             .collect())
     }
@@ -437,13 +612,16 @@ impl Db {
             .into());
         }
 
+        store::verify_token_binding(&record)?;
+
         let id = norm_id(&record.submission_id);
+        let token = Some(record.token.to_ascii_lowercase()).filter(|t| !t.is_empty());
         sqlx::query(
             "INSERT INTO submissions \
              (submission_id, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
-              receiver, auto_params, native_sender) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
-             ON CONFLICT (submission_id) DO NOTHING",
+              receiver, auto_params, native_sender, token) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (submission_id) DO UPDATE SET token = COALESCE(submissions.token, EXCLUDED.token)",
         )
         .bind(&id)
         .bind(record.debridge_id.to_ascii_lowercase())
@@ -454,6 +632,7 @@ impl Db {
         .bind(record.receiver.to_ascii_lowercase())
         .bind(record.auto_params.to_ascii_lowercase())
         .bind(record.native_sender.to_ascii_lowercase())
+        .bind(token)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -574,19 +753,47 @@ impl Db {
     }
 
     /// Flip `refund_status` from `'none'` to `'eligible'` for submissions that
-    /// are still unclaimed and older than `timeout`. Purely informational — sets
-    /// the flag the (future) refund mechanism and the UI's "stuck" badge read;
-    /// no funds move.
+    /// are still unclaimed and older than `timeout`.
+    ///
+    /// This only nominates candidates — it moves no funds and authorises nothing.
+    /// A validator independently re-checks the destination gate (`executed` must
+    /// still be false) before it will attest a cancel, so a wrong or manipulated
+    /// timestamp here can at most cause a needless look, never a payout.
     pub async fn sweep_refund_eligible(&self, timeout: chrono::Duration) -> Result<u64, DbError> {
         let cutoff = chrono::Utc::now() - timeout;
         let res = sqlx::query(
-            "UPDATE submissions SET refund_status = 'eligible' \
+            "UPDATE submissions SET refund_status = 'eligible', updated_at = now() \
              WHERE status <> 'claimed' AND refund_status = 'none' AND created_at < $1",
         )
         .bind(cutoff)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Submissions a refund relayer should look at: flagged stuck, not yet
+    /// refunded, and destined for / originating from the given chain.
+    ///
+    /// Deliberately returns candidates rather than decisions — the caller must
+    /// still verify both chains on-chain before signing anything.
+    pub async fn refund_candidates(&self) -> Result<Vec<SubmissionRecord>, DbError> {
+        let rows: Vec<SubmissionRow> = sqlx::query_as(
+            "SELECT * FROM submissions \
+             WHERE status <> 'claimed' AND refund_status IN ('eligible','cancelled') \
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.submission_id.clone();
+            // reuse `load` so each record arrives with all three signature sets
+            if let Some(rec) = self.load(&id).await? {
+                out.push(rec);
+            }
+        }
+        Ok(out)
     }
 
     /// Resume cursor for one chain (indexer). `None` if never persisted.

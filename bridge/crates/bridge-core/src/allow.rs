@@ -56,6 +56,25 @@ pub struct ClaimedRequest {
     pub claim_tx: String,
 }
 
+/// Request body to post a cancel/refund attestation (validator → sig-store).
+/// The signature is verified against `kind`'s own digest server-side, so a
+/// mislabelled or replayed signature is rejected rather than miscounted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttestationRequest {
+    /// `cancel` | `refund`.
+    pub kind: String,
+    pub signer: String,
+    pub signature: String,
+}
+
+/// Request body to record a completed refund-path transaction
+/// (keeper → sig-store).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefundTxRequest {
+    /// `0x`-prefixed transaction hash on the relevant chain.
+    pub tx_hash: String,
+}
+
 /// A submission as it appears in the transaction-history view: the transfer
 /// parameters plus its lifecycle status and timing. Distinct from
 /// [`crate::store::SubmissionRecord`] (which carries the raw signatures the
@@ -80,19 +99,34 @@ pub struct SubmissionHistory {
     /// RFC-3339 timestamps.
     pub created_at: String,
     pub updated_at: String,
-    /// True once `created_at` is older than the indexer's refund timeout and the
-    /// transfer still isn't `claimed` — a candidate for the (separate) refund
-    /// mechanism. Purely informational: no funds move because of this flag.
+    /// True once this transfer has entered the refund lifecycle at all — i.e.
+    /// `refund_status != "none"`. A nomination, not an authorisation.
     #[serde(default)]
     pub stuck: bool,
-    /// `none` | `eligible` | `refunded` — see [`crate::allow`] module docs on the
-    /// planned refund flow. Set by the indexer's periodic sweep; `refunded` is
-    /// reserved for the future on-chain refund mechanism (unused for now).
+    /// Refund lifecycle: `none` | `eligible` | `cancelled` | `refunded`.
+    ///
+    /// `eligible` — past the timeout and still unclaimed, so validators may
+    /// attest a cancel. `cancelled` — burned on the destination chain, which is
+    /// what unlocks refund attestations. `refunded` — funds returned on the
+    /// source chain. Cleared back to `none` if a stuck transfer is claimed after
+    /// all.
     #[serde(default = "default_refund_status")]
     pub refund_status: String,
-    /// Source-chain refund tx hash, once refunded (future mechanism; unused for now).
+    /// Source-chain `Gate.refund` tx hash, once refunded.
     #[serde(default)]
     pub refund_tx: Option<String>,
+    /// Destination-chain `Gate.cancel` tx hash, once burned.
+    #[serde(default)]
+    pub cancel_tx: Option<String>,
+    /// The source-chain ERC-20 that was locked (needed to build `Gate.refund`).
+    #[serde(default)]
+    pub token: Option<String>,
+    /// How many validators have attested the destination cancel.
+    #[serde(default)]
+    pub cancel_signature_count: i64,
+    /// How many validators have attested the source refund.
+    #[serde(default)]
+    pub refund_signature_count: i64,
     /// If this transfer was a `SwapRouter.swapAndBridge` (swap-then-bridge) rather
     /// than a plain bridge send, its swap intent/outcome.
     #[serde(default)]

@@ -237,10 +237,82 @@ the SPL is released to the receiver, a replay is rejected, and a **1-of-3
 (below-threshold) claim is refused** — no funds move without quorum. The
 signatures are the exact EIP-191 secp256k1 signatures the EVM validators produce.
 
+## Refunds — two-phase, cancel then repay
+
+A transfer can strand: the destination gate may hold no liquidity for the asset,
+the corridor may be de-listed after the funds were locked, or the target chain
+may be down long enough that nobody claims. The locked funds must be
+recoverable — but a refund that simply waits out a timeout is a **double-spend**:
+the transfer's validator signatures still exist, so a keeper can `claim()` on the
+destination in the very window the source pays the refund.
+
+So the refund is ordered, and the ordering is enforced on-chain rather than by
+any timing assumption:
+
+```
+chain B (destination)   cancel(id, cancelSigs)
+                          -> executed[id] = true, cancelled[id] = true
+                          -> emits Cancelled; claim(id) now reverts, forever
+                                 |
+                                 |  validators observe Cancelled on-chain
+                                 v
+chain A (source)        refund(id, refundSigs)
+                          -> pays sentBy[id] (recorded at lock time)
+                          -> emits Refunded
+```
+
+If a keeper delivers first, `cancel` reverts with `AlreadyExecuted` and no refund
+is ever authorised. There is no interleaving that pays out twice.
+
+**Three independent quorums.** `BridgeHash` derives `cancelId` and `refundId`
+under distinct domain prefixes, so a validator's transfer signature — which
+authorises *paying a transfer out* — can never be replayed to burn it or claw it
+back. The store enforces the same split off-chain: attestations are verified
+against their own digest, never merely against the submissionId.
+
+**Why `sentBy`.** `nativeSender` is only folded into the submissionId when
+`autoParams` is non-empty, so for a plain transfer the sender is **not** bound by
+the hash and calldata could name anyone. `send()` therefore records
+`sentBy[submissionId] = msg.sender`, which is both the authoritative refund
+recipient and the proof that this gate really locked these funds — without it a
+validator quorum could authorise a refund for a transfer that never happened
+here.
+
+**What the validators check** before attesting, all from on-chain reads at a
+confirmed block (`crates/validator/src/refund.rs`):
+
+| | condition | consequence |
+|---|---|---|
+| cancel | destination `executed == false` | never burn a delivered transfer |
+| cancel | source `sentBy != 0` | never vote on a transfer this gate didn't send |
+| refund | destination `cancelled == true` | the burn must already be on-chain |
+| both | corridor's *both* ends configured | never trust the store for delivery |
+
+The store's `refund_status`/timeout only **nominates** candidates; it authorises
+nothing, so a wrong timestamp there costs at most a wasted look. Enable the loop
+with a `[refund]` block on the validator and `[[sources]]` on the keeper (see
+`docker/configs/`); omit them and the node simply never votes.
+
+> **Honest limit:** the source gate cannot read the destination, so `refund()`
+> does not itself verify the cancel — a valid refund quorum pays out regardless.
+> What guarantees the ordering is that the quorum never *forms* until the burn is
+> an observed on-chain fact. That is the same trust assumption the bridge already
+> makes for `Sent`, but it means the validators' attestation rule is load-bearing,
+> not a convenience.
+
+Verify it:
+
+```bash
+cd contracts && forge test --match-contract Refund -vv   # security suite
+bash scripts/refund-e2e.sh                               # two live chains
+```
+
 ## What's next (per the build plan)
 
 - **P8+** deploy `solana-gate` to a **localnet** ✓ (done — `scripts/build-solana.sh`
   + `scripts/solana-localnet-e2e.sh`); next, a public **devnet** deploy and wiring
   the live validator/keeper to a Solana RPC (scan program logs / submit claims).
+- **Refunds** on Solana — `crates/solana-gate` has no `cancel`/`refund` yet, so
+  an EVM→Solana transfer still cannot be refunded (the EVM↔EVM path can).
 - **P8** asset registry + wrapped-token minting (`deployId`).
 - **P9** testnet soak, chaos, audit.

@@ -83,7 +83,8 @@ export function fetchHistory(filter?: HistoryFilter): Promise<HistoryEntry[]> {
        history(filter: $filter) {
          submissionId debridgeId amount chainIdFrom chainIdTo nonce receiver
          status claimTx signatureCount createdAt updatedAt
-         stuck refundStatus refundTx
+         stuck refundStatus refundTx cancelTx token
+         cancelSignatureCount refundSignatureCount
          swapIntent {
            tokenIn amountIn stableOut finalToken finalReceiver
            finalizeTx finalizeAmountOut finalizeFallback finalizedAt

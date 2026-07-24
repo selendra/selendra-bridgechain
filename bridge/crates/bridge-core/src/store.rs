@@ -54,7 +54,70 @@ pub struct SubmissionRecord {
     pub auto_params: String,
     /// `0x`-prefixed hex; packed source sender
     pub native_sender: String,
+    /// `0x`-prefixed source-chain ERC-20 that was locked. NOT part of the
+    /// submissionId — `debridge_id` is a one-way hash of it — so it is carried
+    /// alongside for the refund relayer, and pinned by [`verify_token_binding`]
+    /// (`debridge_id == keccak(chain_id_from, token)`) rather than trusted.
+    ///
+    /// Empty for records written before the refund path existed; such a record
+    /// simply can't be refunded until the indexer re-observes its `Sent`.
+    #[serde(default)]
+    pub token: String,
     pub signatures: Vec<SignerSig>,
+    /// Validator attestations authorising `Gate.cancel` on the DESTINATION chain
+    /// (signed over `cancel_id`, a separate domain from the transfer signatures).
+    #[serde(default)]
+    pub cancel_signatures: Vec<SignerSig>,
+    /// Validator attestations authorising `Gate.refund` on the SOURCE chain
+    /// (signed over `refund_id`). A quorum here only forms after the destination
+    /// `Cancelled` event is on-chain — that ordering is what makes the refund
+    /// safe against a concurrent claim.
+    #[serde(default)]
+    pub refund_signatures: Vec<SignerSig>,
+}
+
+/// Which digest domain a signature authorises. Each maps to a different
+/// on-chain effect, so they are stored and counted separately — a transfer
+/// quorum must never be usable as a cancel or refund quorum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SigKind {
+    /// Authorises `claim()` — signed over the raw submissionId.
+    Transfer,
+    /// Authorises `cancel()` on the destination — signed over `cancel_id`.
+    Cancel,
+    /// Authorises `refund()` on the source — signed over `refund_id`.
+    Refund,
+}
+
+impl SigKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SigKind::Transfer => "transfer",
+            SigKind::Cancel => "cancel",
+            SigKind::Refund => "refund",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<SigKind> {
+        match s {
+            "transfer" => Some(SigKind::Transfer),
+            "cancel" => Some(SigKind::Cancel),
+            "refund" => Some(SigKind::Refund),
+            _ => None,
+        }
+    }
+
+    /// The 32-byte message a validator actually signs for this domain, given the
+    /// transfer's submissionId.
+    #[cfg(feature = "abi")]
+    pub fn digest(self, submission_id: alloy_primitives::B256) -> alloy_primitives::B256 {
+        match self {
+            SigKind::Transfer => submission_id,
+            SigKind::Cancel => crate::cancel_id(submission_id),
+            SigKind::Refund => crate::refund_id(submission_id),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +136,8 @@ pub enum StoreError {
     BadSignature,
     #[error("signature recovers to {recovered}, not the claimed signer {claimed}")]
     SignerMismatch { claimed: String, recovered: String },
+    #[error("token {token} does not hash to debridgeId {debridge_id} on chain {chain_id}")]
+    TokenMismatch { token: String, debridge_id: String, chain_id: u64 },
 }
 
 /// True iff `s` is a well-formed submissionId: an optional `0x` followed by
@@ -187,6 +252,52 @@ pub fn verify_signature(
     Ok(recovered)
 }
 
+/// Pin a record's `token` to its `debridge_id`.
+///
+/// The source gate always emits `debridgeId = keccak256(chainIdFrom, token)`, so
+/// this recomputes that and rejects any other value. It makes `token`
+/// self-certifying: although it is not covered by the submissionId, a caller
+/// still cannot substitute a different (more valuable) asset — which matters
+/// because `token` is what the keeper feeds to `Gate.refund`.
+///
+/// An empty `token` is accepted as "not recorded" (pre-refund-path records); the
+/// refund relayer treats such a record as un-refundable rather than guessing.
+#[cfg(feature = "abi")]
+pub fn verify_token_binding(rec: &SubmissionRecord) -> Result<(), StoreError> {
+    use alloy_primitives::{Address, B256, U256};
+    use std::str::FromStr;
+
+    if rec.token.is_empty() {
+        return Ok(());
+    }
+    let token = Address::from_str(&rec.token).map_err(|_| StoreError::BadField("token"))?;
+    let debridge_id = B256::from_str(&rec.debridge_id).map_err(|_| StoreError::BadField("debridge_id"))?;
+    let computed = crate::debridge_id(U256::from(rec.chain_id_from), token);
+    if computed != debridge_id {
+        return Err(StoreError::TokenMismatch {
+            token: format!("{token:#x}"),
+            debridge_id: format!("{debridge_id:#x}"),
+            chain_id: rec.chain_id_from,
+        });
+    }
+    Ok(())
+}
+
+/// Verify an attestation for a given domain: the signature must recover to its
+/// claimed signer over `kind`'s digest, not merely over the submissionId.
+///
+/// This is what keeps the three quorums independent. Feeding a validator's
+/// transfer signature in as a cancel attestation fails here, because a cancel is
+/// signed over `cancel_id(submissionId)` — a different message entirely.
+#[cfg(feature = "abi")]
+pub fn verify_attestation(
+    submission_id: alloy_primitives::B256,
+    kind: SigKind,
+    sig: &SignerSig,
+) -> Result<alloy_primitives::Address, StoreError> {
+    verify_signature(kind.digest(submission_id), sig)
+}
+
 /// Insert or update a record, merging in `sig` (deduped by signer, case-insensitive).
 /// Returns the resulting record (with all known signatures).
 ///
@@ -221,6 +332,8 @@ pub fn upsert_signature(
             });
         }
         verify_signature(computed, &sig)?;
+        // (4) `token` isn't covered by the submissionId, so pin it separately.
+        verify_token_binding(&record)?;
     }
 
     let path = file_path(dir, &record.submission_id);
@@ -233,6 +346,15 @@ pub fn upsert_signature(
             return Err(StoreError::ParamsConflict(record.submission_id.clone()));
         }
         record.signatures = existing.signatures;
+        // Attestations are never supplied through this path — preserve whatever
+        // `upsert_attestation` has collected.
+        record.cancel_signatures = existing.cancel_signatures;
+        record.refund_signatures = existing.refund_signatures;
+        // `token` is verified above, so a previously-empty one may be filled in;
+        // a stored non-empty value is immutable like the rest of the params.
+        if !existing.token.is_empty() {
+            record.token = existing.token;
+        }
     }
 
     let already = record
@@ -241,6 +363,50 @@ pub fn upsert_signature(
         .any(|s| s.signer.eq_ignore_ascii_case(&sig.signer));
     if !already {
         record.signatures.push(sig);
+    }
+
+    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+    Ok(record)
+}
+
+/// Merge a cancel/refund attestation into an already-stored record.
+///
+/// Unlike [`upsert_signature`] this never creates a record: an attestation is
+/// only meaningful for a transfer we have already seen, and refusing to
+/// bootstrap one from attestation data alone keeps the id⇄params binding the
+/// sole way a record can come into existence.
+pub fn upsert_attestation(
+    dir: &Path,
+    submission_id: &str,
+    kind: SigKind,
+    sig: SignerSig,
+) -> Result<SubmissionRecord, StoreError> {
+    if !is_valid_submission_id(submission_id) {
+        return Err(StoreError::BadField("submission_id"));
+    }
+    let path = file_path(dir, submission_id);
+    if !path.exists() {
+        return Err(StoreError::BadField("submission_id"));
+    }
+    let mut record: SubmissionRecord = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+
+    // Authenticate against THIS domain's digest — a transfer signature replayed
+    // here recovers to the wrong address and is rejected.
+    #[cfg(feature = "abi")]
+    {
+        use std::str::FromStr;
+        let id = alloy_primitives::B256::from_str(&record.submission_id)
+            .map_err(|_| StoreError::BadField("submission_id"))?;
+        verify_attestation(id, kind, &sig)?;
+    }
+
+    let bucket = match kind {
+        SigKind::Transfer => &mut record.signatures,
+        SigKind::Cancel => &mut record.cancel_signatures,
+        SigKind::Refund => &mut record.refund_signatures,
+    };
+    if !bucket.iter().any(|s| s.signer.eq_ignore_ascii_case(&sig.signer)) {
+        bucket.push(sig);
     }
 
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
@@ -294,9 +460,14 @@ mod tests {
         format!("0x{}", hex::encode(out))
     }
 
+    /// The ERC-20 `make_record` pretends was locked on chain 1337.
+    fn token() -> Address {
+        Address::repeat_byte(0x11)
+    }
+
     // Build a well-formed record (id == keccak(params)) for a plain transfer.
     fn make_record() -> SubmissionRecord {
-        let debridge_id = crate::debridge_id(U256::from(1337u64), Address::repeat_byte(0x11));
+        let debridge_id = crate::debridge_id(U256::from(1337u64), token());
         let amount = U256::from(100u64);
         let chain_from = U256::from(1337u64);
         let chain_to = U256::from(1338u64);
@@ -313,13 +484,24 @@ mod tests {
             receiver: format!("0x{}", hex::encode(&receiver)),
             auto_params: "0x".to_string(),
             native_sender: "0x".to_string(),
+            token: format!("{:#x}", token()),
             signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
         }
     }
 
     fn sign(signer: &PrivateKeySigner, id_hex: &str) -> SignerSig {
         let id = B256::from_str(id_hex).unwrap();
         let sig = signer.sign_message_sync(id.as_slice()).unwrap();
+        SignerSig { signer: format!("{:#x}", signer.address()), signature: encode_sig(&sig) }
+    }
+
+    /// Sign the digest for a specific domain (what the validator does for a
+    /// cancel/refund attestation).
+    fn sign_kind(signer: &PrivateKeySigner, id_hex: &str, kind: SigKind) -> SignerSig {
+        let id = B256::from_str(id_hex).unwrap();
+        let sig = signer.sign_message_sync(kind.digest(id).as_slice()).unwrap();
         SignerSig { signer: format!("{:#x}", signer.address()), signature: encode_sig(&sig) }
     }
 
@@ -401,6 +583,89 @@ mod tests {
         bad.signer = format!("{:#x}", v1.address()); // claim to be V1
         let err = upsert_signature(&dir, rec.clone(), bad).unwrap_err();
         assert!(matches!(err, StoreError::SignerMismatch { .. }), "got {err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_token_not_matching_debridge_id() {
+        // `token` rides outside the submissionId, so it gets its own binding:
+        // swapping in a different (e.g. more valuable) asset must be rejected,
+        // or the keeper would build a refund against the wrong token.
+        let dir = tmp_dir("tokenbind");
+        let v1 = PrivateKeySigner::random();
+        let mut rec = make_record();
+        rec.token = format!("{:#x}", Address::repeat_byte(0x22));
+        let err = upsert_signature(&dir, rec.clone(), sign(&v1, &rec.submission_id)).unwrap_err();
+        assert!(matches!(err, StoreError::TokenMismatch { .. }), "got {err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attestations_are_domain_separated() {
+        // THE refund-path invariant: a validator's transfer signature must not be
+        // usable as a cancel (which burns the transfer on the destination) or as a
+        // refund (which pays out on the source). Each domain is its own quorum.
+        let dir = tmp_dir("domains");
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+        upsert_signature(&dir, rec.clone(), sign(&v1, &rec.submission_id)).unwrap();
+
+        for kind in [SigKind::Cancel, SigKind::Refund] {
+            // the transfer signature replayed into another domain
+            let replay = sign(&v1, &rec.submission_id);
+            let err = upsert_attestation(&dir, &rec.submission_id, kind, replay).unwrap_err();
+            assert!(
+                matches!(err, StoreError::SignerMismatch { .. } | StoreError::BadSignature),
+                "{kind:?} accepted a replayed transfer signature: {err:?}"
+            );
+
+            // the correctly-domained signature is accepted
+            let good = sign_kind(&v1, &rec.submission_id, kind);
+            let out = upsert_attestation(&dir, &rec.submission_id, kind, good.clone()).unwrap();
+            let bucket = match kind {
+                SigKind::Cancel => &out.cancel_signatures,
+                SigKind::Refund => &out.refund_signatures,
+                SigKind::Transfer => unreachable!(),
+            };
+            assert_eq!(bucket.len(), 1, "{kind:?} attestation not stored");
+
+            // and deduped by signer
+            let again = upsert_attestation(&dir, &rec.submission_id, kind, good).unwrap();
+            let bucket = match kind {
+                SigKind::Cancel => &again.cancel_signatures,
+                SigKind::Refund => &again.refund_signatures,
+                SigKind::Transfer => unreachable!(),
+            };
+            assert_eq!(bucket.len(), 1, "{kind:?} attestation not deduped");
+        }
+
+        // a cancel attestation must not count as a refund attestation either
+        let cancel_sig = sign_kind(&v1, &rec.submission_id, SigKind::Cancel);
+        let err = upsert_attestation(&dir, &rec.submission_id, SigKind::Refund, cancel_sig);
+        // v1 already has a refund attestation stored, so dedupe would mask a
+        // failure — assert on a fresh signer instead.
+        drop(err);
+        let v2 = PrivateKeySigner::random();
+        let cancel_sig = sign_kind(&v2, &rec.submission_id, SigKind::Cancel);
+        let err = upsert_attestation(&dir, &rec.submission_id, SigKind::Refund, cancel_sig).unwrap_err();
+        assert!(
+            matches!(err, StoreError::SignerMismatch { .. } | StoreError::BadSignature),
+            "a cancel attestation was accepted as a refund: {err:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attestation_requires_an_existing_record() {
+        // An attestation must never bootstrap a record: the id<->params binding
+        // is the only way one comes into existence.
+        let dir = tmp_dir("noboot");
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+        let sig = sign_kind(&v1, &rec.submission_id, SigKind::Cancel);
+        let err = upsert_attestation(&dir, &rec.submission_id, SigKind::Cancel, sig).unwrap_err();
+        assert!(matches!(err, StoreError::BadField("submission_id")), "got {err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

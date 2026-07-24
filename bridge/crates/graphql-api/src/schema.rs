@@ -134,6 +134,10 @@ pub enum SubmissionStatus {
     Ready,
     /// `executed(submissionId) == true` on the destination gate — delivered.
     Executed,
+    /// Burned on the destination by `Gate.cancel` so the source could refund it.
+    /// Also sets `executed`, hence the separate state: the funds went BACK, they
+    /// did not arrive.
+    Cancelled,
     /// Can't be determined (no `--threshold` and/or no destination RPC configured).
     Unknown,
 }
@@ -175,11 +179,20 @@ pub struct Submission {
     pub auto_params: String,
     /// `0x`-prefixed packed source sender.
     pub native_sender: String,
+    /// The source-chain ERC-20 that was locked (empty on rows predating the
+    /// refund path). Needed to build `Gate.refund`.
+    pub token: String,
     pub signatures: Vec<Signature>,
     /// Convenience: `signatures.len()`.
     pub signature_count: u64,
     /// `signatureCount >= threshold`, or null if the API has no threshold set.
     pub meets_threshold: Option<bool>,
+    /// Validators attesting the DESTINATION burn (`Gate.cancel`). A separate
+    /// quorum from `signatures` — a transfer signature can never count here.
+    pub cancel_signature_count: u64,
+    /// Validators attesting the SOURCE payout (`Gate.refund`). Only forms after
+    /// the burn is observed on-chain.
+    pub refund_signature_count: u64,
 }
 
 impl Submission {
@@ -196,6 +209,9 @@ impl Submission {
             receiver: rec.receiver,
             auto_params: rec.auto_params,
             native_sender: rec.native_sender,
+            token: rec.token,
+            cancel_signature_count: rec.cancel_signatures.len() as u64,
+            refund_signature_count: rec.refund_signatures.len() as u64,
             signatures: rec.signatures.into_iter().map(Into::into).collect(),
             signature_count,
             meets_threshold,
@@ -211,11 +227,24 @@ impl Submission {
         state(ctx).chains.executed(self.chain_id_to, &self.submission_id).await
     }
 
-    /// Combined lifecycle: EXECUTED if the destination gate confirms it,
-    /// otherwise READY/PENDING from the signature count, or UNKNOWN if neither
-    /// a threshold nor a destination RPC is configured.
+    /// On-chain `cancelled(submissionId)`: the transfer was burned on the
+    /// destination so it could be refunded on the source, rather than delivered.
+    async fn cancelled(&self, ctx: &Context<'_>) -> Option<bool> {
+        state(ctx).chains.cancelled(self.chain_id_to, &self.submission_id).await
+    }
+
+    /// Combined lifecycle: CANCELLED if the destination burned it, EXECUTED if
+    /// the destination gate confirms delivery, otherwise READY/PENDING from the
+    /// signature count, or UNKNOWN if neither a threshold nor a destination RPC
+    /// is configured.
     async fn status(&self, ctx: &Context<'_>) -> SubmissionStatus {
-        if state(ctx).chains.executed(self.chain_id_to, &self.submission_id).await == Some(true) {
+        let chains = &state(ctx).chains;
+        if chains.executed(self.chain_id_to, &self.submission_id).await == Some(true) {
+            // `cancel` sets `executed` too, so check which one it was before
+            // telling anyone their funds were delivered.
+            if chains.cancelled(self.chain_id_to, &self.submission_id).await == Some(true) {
+                return SubmissionStatus::Cancelled;
+            }
             return SubmissionStatus::Executed;
         }
         match self.meets_threshold {
@@ -324,12 +353,22 @@ pub struct HistoryEntry {
     pub signature_count: u64,
     pub created_at: String,
     pub updated_at: String,
-    /// True once this transfer has sat unclaimed past the indexer's refund
-    /// timeout. Informational only — no on-chain refund exists yet.
+    /// True once this transfer has entered the refund lifecycle at all.
     pub stuck: bool,
-    /// `none` | `eligible` | `refunded`.
+    /// `none` | `eligible` | `cancelled` | `refunded`. `cancelled` means the
+    /// destination was burned so the source could repay; `refunded` means the
+    /// funds are back with the sender.
     pub refund_status: String,
+    /// Source-chain `Gate.refund` tx hash.
     pub refund_tx: Option<String>,
+    /// Destination-chain `Gate.cancel` tx hash.
+    pub cancel_tx: Option<String>,
+    /// The source-chain ERC-20 that was locked.
+    pub token: Option<String>,
+    /// Validators attesting the destination burn.
+    pub cancel_signature_count: u64,
+    /// Validators attesting the source payout.
+    pub refund_signature_count: u64,
     /// Set when this transfer originated from `SwapRouter.swapAndBridge`.
     pub swap_intent: Option<SwapIntent>,
 }
@@ -352,6 +391,10 @@ impl From<SubmissionHistory> for HistoryEntry {
             stuck: h.stuck,
             refund_status: h.refund_status,
             refund_tx: h.refund_tx,
+            cancel_tx: h.cancel_tx,
+            token: h.token,
+            cancel_signature_count: h.cancel_signature_count as u64,
+            refund_signature_count: h.refund_signature_count as u64,
             swap_intent: h.swap_intent.map(Into::into),
         }
     }
@@ -590,6 +633,10 @@ pub struct SubmissionInput {
     /// `0x` when there is no execution payload.
     pub auto_params: String,
     pub native_sender: String,
+    /// The source-chain ERC-20 that was locked, `0x`-prefixed. Optional, but a
+    /// record without it can never be refunded. Verified against `debridgeId`
+    /// server-side, so it cannot be used to point a refund at another asset.
+    pub token: Option<String>,
     /// The signer address for the attached signature, `0x`-prefixed.
     pub signer: String,
     /// 65-byte ECDSA signature (r||s||v), `0x`-prefixed.
@@ -620,7 +667,10 @@ impl Mutation {
             receiver: input.receiver,
             auto_params: input.auto_params,
             native_sender: input.native_sender,
+            token: input.token.unwrap_or_default(),
             signatures: Vec::new(),
+            cancel_signatures: Vec::new(),
+            refund_signatures: Vec::new(),
         };
         let merged = st.backend.upsert(record, sig).await?;
         Ok(Submission::from_record(merged, st.threshold))

@@ -1,6 +1,6 @@
 // Wire types mirroring the graphql-api schema (crates/graphql-api/src/schema.rs).
 
-export type SubmissionStatus = "PENDING" | "READY" | "EXECUTED" | "UNKNOWN";
+export type SubmissionStatus = "PENDING" | "READY" | "EXECUTED" | "CANCELLED" | "UNKNOWN";
 
 export interface Chain {
   chainId: number;
@@ -106,10 +106,25 @@ export interface HistoryEntry {
   signatureCount: number;
   createdAt: string;
   updatedAt: string;
-  /** Past the refund timeout and still unclaimed. Informational — no refund mechanism exists yet. */
+  /** True once this transfer has entered the refund lifecycle at all. */
   stuck: boolean;
-  refundStatus: string; // 'none' | 'eligible' | 'refunded'
+  /**
+   * 'none' | 'eligible' | 'cancelled' | 'refunded'.
+   *
+   * 'cancelled' means the transfer was burned on the destination chain so the
+   * source could repay it — the funds did NOT arrive; they went back.
+   */
+  refundStatus: string;
+  /** Source-chain Gate.refund tx hash. */
   refundTx: string | null;
+  /** Destination-chain Gate.cancel tx hash. */
+  cancelTx: string | null;
+  /** The source-chain ERC-20 that was locked. */
+  token: string | null;
+  /** Validators attesting the destination burn. */
+  cancelSignatureCount: number;
+  /** Validators attesting the source payout. */
+  refundSignatureCount: number;
   swapIntent: SwapIntent | null;
 }
 

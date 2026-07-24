@@ -5,6 +5,16 @@
 //! isn't yet executed, build and submit `claim()` (signatures sorted by signer
 //! ascending, as the Gate requires). Configuring several `[[targets]]` lets a
 //! single keeper deliver A->B and A->C transfers from the same source.
+//!
+//! It also relays the two-phase refund, which runs on both sides:
+//!   * on a `[[targets]]` chain, a **cancel** quorum burns a stranded transfer
+//!     (`cancel()`), taking precedence over claiming it;
+//!   * on a `[[sources]]` chain, a **refund** quorum returns the locked funds
+//!     (`refund()`).
+//!
+//! The keeper decides nothing here — it only relays quorums the validators
+//! formed after checking both chains themselves. It holds no authority the
+//! signatures don't already carry.
 
 mod config;
 mod source;
@@ -19,7 +29,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use bridge_core::abi::Gate;
-use bridge_core::store::SubmissionRecord;
+use bridge_core::store::{SignerSig, SubmissionRecord};
 use config::{Config, TargetChain};
 use source::Source;
 use tracing::{info, warn};
@@ -56,6 +66,14 @@ async fn main() -> anyhow::Result<()> {
         let signer = signer.clone();
         let source = source.clone();
         tasks.spawn(async move { run_target(target, signer, source).await });
+    }
+
+    // And one refund loop per SOURCE chain. Refunds pay out where the funds were
+    // locked, so they belong to the source side, not the claim targets.
+    for src in cfg.sources {
+        let signer = signer.clone();
+        let store = source.clone();
+        tasks.spawn(async move { run_source_refunds(src, signer, store).await });
     }
 
     let total = tasks.len();
@@ -137,6 +155,38 @@ async fn run_target(
             if rec.chain_id_to != target.chain_id {
                 continue;
             }
+            // Cancels are handled BEFORE the transfer-threshold and allowlist
+            // gates, and deliberately so. Both of those exist to protect payouts,
+            // and a cancel is the opposite of a payout — it releases nothing and
+            // only burns the transfer so the source can repay the sender.
+            //
+            // Checking them first would strand precisely the transfers that need
+            // refunding most: a transfer the allowlist rejects never collects
+            // transfer signatures at all, so it would fail the threshold check,
+            // never reach this branch, and its funds would stay locked forever.
+            if (rec.cancel_signatures.len() as u64) >= threshold {
+                match try_cancel(&gate, &rec).await {
+                    Ok(Some(tx)) => {
+                        if let Err(e) = source.mark_cancelled(&rec.submission_id, &tx).await {
+                            warn!(
+                                chain_id = target.chain_id,
+                                submission_id = %rec.submission_id,
+                                error = %e,
+                                "cancelled on-chain but failed to record status"
+                            );
+                        }
+                    }
+                    Ok(None) => {} // already executed (claimed or cancelled)
+                    Err(e) => warn!(
+                        chain_id = target.chain_id,
+                        submission_id = %rec.submission_id,
+                        error = %e,
+                        "cancel failed"
+                    ),
+                }
+                continue;
+            }
+
             if (rec.signatures.len() as u64) < threshold {
                 continue;
             }
@@ -154,6 +204,7 @@ async fn run_target(
                     continue;
                 }
             }
+
             match try_claim(&gate, &rec).await {
                 Ok(Some(tx)) => {
                     if let Err(e) = source.mark_claimed(&rec.submission_id, &tx).await {
@@ -178,6 +229,87 @@ async fn run_target(
     }
 }
 
+/// Refund loop for a single SOURCE chain: submit `refund()` for transfers whose
+/// destination has already been burned and which have a refund quorum.
+///
+/// The keeper does not decide anything here — it only relays quorums the
+/// validators formed. Both the "was it really burned?" and "was it really sent
+/// from this gate?" questions are answered by the validators' on-chain checks
+/// and by the Gate's own `sentBy` guard respectively.
+async fn run_source_refunds(
+    src: config::SourceChain,
+    signer: PrivateKeySigner,
+    store: Arc<Source>,
+) -> anyhow::Result<()> {
+    let wallet = EthereumWallet::from(signer.clone());
+    let gate_addr: Address = src.gate.parse().context("bad gate address")?;
+    let retry = Duration::from_millis(src.poll_interval_ms.max(1000));
+
+    let provider = ProviderBuilder::new().wallet(wallet).connect_http(src.rpc.parse()?);
+
+    loop {
+        match provider.get_chain_id().await {
+            Ok(id) if id == src.chain_id => break,
+            Ok(id) => anyhow::bail!("RPC chainId {id} != configured {} for {}", src.chain_id, src.rpc),
+            Err(e) => {
+                warn!(chain_id = src.chain_id, error = %e, "get_chain_id failed; retrying");
+                tokio::time::sleep(retry).await;
+            }
+        }
+    }
+
+    let gate = Gate::new(gate_addr, &provider);
+    let threshold: u64 = loop {
+        match gate.threshold().call().await {
+            Ok(t) => break t.try_into().unwrap_or(u64::MAX),
+            Err(e) => {
+                warn!(chain_id = src.chain_id, error = %e, "read threshold failed; retrying");
+                tokio::time::sleep(retry).await;
+            }
+        }
+    };
+
+    info!(
+        keeper = %signer.address(),
+        gate = %gate_addr,
+        chain_id = src.chain_id,
+        threshold,
+        "source refund loop started"
+    );
+
+    loop {
+        let records = store.load_all().await.unwrap_or_default();
+        for rec in records {
+            if rec.chain_id_from != src.chain_id {
+                continue;
+            }
+            if (rec.refund_signatures.len() as u64) < threshold {
+                continue;
+            }
+            match try_refund(&gate, &rec).await {
+                Ok(Some(tx)) => {
+                    if let Err(e) = store.mark_refunded(&rec.submission_id, &tx).await {
+                        warn!(
+                            chain_id = src.chain_id,
+                            submission_id = %rec.submission_id,
+                            error = %e,
+                            "refunded on-chain but failed to record status"
+                        );
+                    }
+                }
+                Ok(None) => {} // already refunded, or never sent from this gate
+                Err(e) => warn!(
+                    chain_id = src.chain_id,
+                    submission_id = %rec.submission_id,
+                    error = %e,
+                    "refund failed"
+                ),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(src.poll_interval_ms)).await;
+    }
+}
+
 /// Submit `claim()` for one record. Returns `Some(tx_hash)` on a fresh claim,
 /// `None` if it was already executed (by us or another keeper).
 async fn try_claim<P: Provider>(
@@ -197,16 +329,7 @@ async fn try_claim<P: Provider>(
     let native_sender = bytes_of(&rec.native_sender)?;
 
     // signatures MUST be ordered by signer address, strictly ascending
-    let mut sigs = rec.signatures.clone();
-    sigs.sort_by(|a, b| {
-        let aa = Address::from_str(&a.signer).unwrap_or(Address::ZERO);
-        let bb = Address::from_str(&b.signer).unwrap_or(Address::ZERO);
-        aa.cmp(&bb)
-    });
-    let signatures: Vec<Bytes> = sigs
-        .iter()
-        .map(|s| bytes_of(&s.signature))
-        .collect::<anyhow::Result<_>>()?;
+    let signatures = sorted_signatures(&rec.signatures)?;
 
     info!(submission_id = %rec.submission_id, sigs = signatures.len(), "submitting claim()");
 
@@ -233,6 +356,117 @@ async fn try_claim<P: Provider>(
         "CLAIMED"
     );
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
+}
+
+/// Submit `cancel()` on the destination. `None` if it is already executed
+/// (claimed or cancelled) — either way there is nothing to burn.
+async fn try_cancel<P: Provider>(
+    gate: &Gate::GateInstance<P>,
+    rec: &SubmissionRecord,
+) -> anyhow::Result<Option<String>> {
+    let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
+    if gate.executed(submission_id).call().await? {
+        return Ok(None);
+    }
+
+    let debridge_id = B256::from_str(&rec.debridge_id).context("bad debridge_id")?;
+    let amount = U256::from_str(&rec.amount).context("bad amount")?;
+
+    info!(
+        submission_id = %rec.submission_id,
+        sigs = rec.cancel_signatures.len(),
+        "submitting cancel() — burning the transfer on the destination"
+    );
+
+    let pending = gate
+        .cancel(
+            debridge_id,
+            amount,
+            U256::from(rec.chain_id_from),
+            U256::from(rec.nonce),
+            bytes_of(&rec.receiver)?,
+            bytes_of(&rec.auto_params)?,
+            bytes_of(&rec.native_sender)?,
+            sorted_signatures(&rec.cancel_signatures)?,
+        )
+        .send()
+        .await
+        .context("send cancel")?;
+
+    let receipt = pending.get_receipt().await.context("await receipt")?;
+    info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "CANCELLED");
+    Ok(Some(format!("{:#x}", receipt.transaction_hash)))
+}
+
+/// Submit `refund()` on the source. `None` if already refunded, if this gate
+/// never emitted the id, or if we don't know which token was locked.
+async fn try_refund<P: Provider>(
+    gate: &Gate::GateInstance<P>,
+    rec: &SubmissionRecord,
+) -> anyhow::Result<Option<String>> {
+    let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
+
+    if gate.refunded(submission_id).call().await? {
+        return Ok(None);
+    }
+    // `sentBy` is the gate's own record that it locked these funds; zero means
+    // there is nothing to return (and `refund()` would revert with NotSent).
+    if gate.sentBy(submission_id).call().await? == Address::ZERO {
+        return Ok(None);
+    }
+
+    // The locked ERC-20 is not derivable from debridgeId (a one-way hash), so it
+    // is carried on the record — and re-checked on-chain, which is why supplying
+    // it from the store is safe: a wrong token reverts rather than paying out.
+    if rec.token.is_empty() {
+        warn!(
+            submission_id = %rec.submission_id,
+            "refund quorum reached but the locked token is unknown for this record \
+             (pre-refund-path row); re-index its Sent event to populate it"
+        );
+        return Ok(None);
+    }
+    let token = Address::from_str(&rec.token).context("bad token")?;
+    let debridge_id = B256::from_str(&rec.debridge_id).context("bad debridge_id")?;
+    let amount = U256::from_str(&rec.amount).context("bad amount")?;
+
+    info!(
+        submission_id = %rec.submission_id,
+        sigs = rec.refund_signatures.len(),
+        "submitting refund() — returning locked funds on the source"
+    );
+
+    let pending = gate
+        .refund(
+            token,
+            debridge_id,
+            amount,
+            U256::from(rec.chain_id_to),
+            U256::from(rec.nonce),
+            bytes_of(&rec.receiver)?,
+            bytes_of(&rec.auto_params)?,
+            bytes_of(&rec.native_sender)?,
+            sorted_signatures(&rec.refund_signatures)?,
+        )
+        .send()
+        .await
+        .context("send refund")?;
+
+    let receipt = pending.get_receipt().await.context("await receipt")?;
+    info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "REFUNDED");
+    Ok(Some(format!("{:#x}", receipt.transaction_hash)))
+}
+
+/// Signatures ordered by recovered signer ascending, as every Gate entry point
+/// requires (the ordering is what dedupes signers on-chain).
+fn sorted_signatures(sigs: &[SignerSig]) -> anyhow::Result<Vec<Bytes>> {
+    let mut sigs = sigs.to_vec();
+    sigs.sort_by(|a, b| {
+        let aa = Address::from_str(&a.signer).unwrap_or(Address::ZERO);
+        let bb = Address::from_str(&b.signer).unwrap_or(Address::ZERO);
+        aa.cmp(&bb)
+    });
+    sigs.iter().map(|s| bytes_of(&s.signature)).collect()
 }
 
 fn bytes_of(hex_str: &str) -> anyhow::Result<Bytes> {

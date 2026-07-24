@@ -124,4 +124,16 @@ impl Chains {
         let id = B256::from_str(submission_id).ok()?;
         Gate::new(*gate, provider).executed(id).call().await.ok()
     }
+
+    /// `cancelled(submissionId)` on the destination gate.
+    ///
+    /// `executed` alone cannot distinguish "delivered" from "burned so it could
+    /// be refunded" — `cancel` sets the same flag. Reporting a cancelled
+    /// transfer as EXECUTED would tell a user their funds arrived when in fact
+    /// they were returned on the source chain, so the two are read together.
+    pub async fn cancelled(&self, chain_id_to: u64, submission_id: &str) -> Option<bool> {
+        let (provider, gate) = self.gates.get(&chain_id_to)?;
+        let id = B256::from_str(submission_id).ok()?;
+        Gate::new(*gate, provider).cancelled(id).call().await.ok()
+    }
 }

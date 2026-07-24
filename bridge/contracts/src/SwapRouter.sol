@@ -217,7 +217,16 @@ contract SwapRouter is ReentrancyGuard {
         );
         // Delivery proof: the Gate only sets this after verifying the validator
         // threshold, and the amount + intent are bound into the id it signed.
-        if (!gate.executed(submissionId)) revert NotDelivered(submissionId);
+        //
+        // `executed` alone is NOT delivery: `Gate.cancel` also sets it, to burn a
+        // stranded transfer so it can be refunded on the source chain. In that
+        // case no stable ever reached this router, so settling would pay the
+        // receiver out of another transfer's in-flight liquidity — while the
+        // source chain separately refunds the original sender. Both legs must be
+        // checked together.
+        if (!gate.executed(submissionId) || gate.cancelled(submissionId)) {
+            revert NotDelivered(submissionId);
+        }
         _settle(submissionId, debridgeId, amount, receiver, autoParams);
     }
 

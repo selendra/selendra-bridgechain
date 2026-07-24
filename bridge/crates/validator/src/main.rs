@@ -14,6 +14,7 @@
 mod api;
 mod config;
 mod provider;
+mod refund;
 mod sink;
 mod state;
 
@@ -87,6 +88,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut tasks = tokio::task::JoinSet::new();
+
+    // Refund attestations, if this validator is configured to verify destination
+    // chains. Spawned alongside the scan loops and isolated the same way: a dead
+    // refund loop must never stop the validator from signing live transfers.
+    if let Some(refund_cfg) = cfg.refund.clone() {
+        let sources: Vec<(u64, String, Vec<String>)> = cfg
+            .sources
+            .iter()
+            .map(|s| Ok((s.chain_id, s.gate.clone(), s.endpoints()?)))
+            .collect::<anyhow::Result<_>>()?;
+        let signer = signer.clone();
+        let sink = sink.clone();
+        tasks.spawn(async move { refund::run(refund_cfg, sources, signer, sink).await });
+    } else {
+        info!("no [refund] block — this validator will not attest cancels or refunds");
+    }
+
     for source in cfg.sources {
         let signer = signer.clone();
         let sink = sink.clone();
@@ -318,7 +336,12 @@ async fn handle_log(
         receiver: format!("0x{}", hex::encode(&ev.receiver)),
         auto_params: format!("0x{}", hex::encode(&ev.autoParams)),
         native_sender: format!("0x{}", hex::encode(&ev.nativeSender)),
+        // The locked asset, for the refund path. Not covered by the submissionId,
+        // so the store re-derives debridgeId from it before accepting.
+        token: format!("{:#x}", ev.token),
         signatures: vec![],
+        cancel_signatures: vec![],
+        refund_signatures: vec![],
     };
 
     sink.upsert(record, SignerSig { signer: format!("{signer_addr:#x}"), signature: sig_hex })

@@ -39,6 +39,10 @@ struct Fixture {
     native_sender: String,
     #[serde(rename = "submissionId")]
     submission_id: String,
+    #[serde(rename = "cancelId")]
+    cancel_id: String,
+    #[serde(rename = "refundId")]
+    refund_id: String,
 }
 
 fn bytes(hex_str: &str) -> Vec<u8> {
@@ -100,5 +104,30 @@ fn rust_matches_solidity_for_all_fixtures() {
             "submissionId mismatch for fixture '{}': rust={got:#x} solidity={expected:#x}",
             f.name
         );
+
+        // The refund path's two attestation domains must agree with Solidity too,
+        // or a validator's cancel/refund signature would never verify on-chain.
+        let expected_cancel = f.cancel_id.parse::<B256>().expect("bad cancelId");
+        let got_cancel = bridge_core::cancel_id(got);
+        assert_eq!(
+            got_cancel, expected_cancel,
+            "cancelId mismatch for fixture '{}': rust={got_cancel:#x} solidity={expected_cancel:#x}",
+            f.name
+        );
+
+        let expected_refund = f.refund_id.parse::<B256>().expect("bad refundId");
+        let got_refund = bridge_core::refund_id(got);
+        assert_eq!(
+            got_refund, expected_refund,
+            "refundId mismatch for fixture '{}': rust={got_refund:#x} solidity={expected_refund:#x}",
+            f.name
+        );
+
+        // Domain separation is the whole defence against replaying a transfer
+        // signature as a cancel/refund authorisation. Assert the three digests
+        // for one submission are pairwise distinct.
+        assert_ne!(got_cancel, got, "cancelId collides with its submissionId");
+        assert_ne!(got_refund, got, "refundId collides with its submissionId");
+        assert_ne!(got_cancel, got_refund, "cancelId collides with refundId");
     }
 }

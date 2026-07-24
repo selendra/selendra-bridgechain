@@ -22,7 +22,8 @@ contract SendTest is Test {
         bytes receiver,
         uint256 nonce,
         bytes autoParams,
-        bytes nativeSender
+        bytes nativeSender,
+        address token
     );
 
     function setUp() public {
@@ -50,7 +51,16 @@ contract SendTest is Test {
 
         vm.expectEmit(true, true, true, true);
         emit Sent(
-            expectedId, debridgeId, amount, block.chainid, CHAIN_TO, receiver, 0, autoParams, nativeSender
+            expectedId,
+            debridgeId,
+            amount,
+            block.chainid,
+            CHAIN_TO,
+            receiver,
+            0,
+            autoParams,
+            nativeSender,
+            address(token)
         );
 
         vm.prank(user);

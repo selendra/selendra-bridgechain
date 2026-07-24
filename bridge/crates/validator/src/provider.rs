@@ -19,6 +19,31 @@ pub struct Failover {
     active: usize,
 }
 
+/// Connect to the first endpoint that answers AND reports `expected_chain_id`.
+///
+/// Used by the refund loop, which needs a plain provider for `eth_call` reads of
+/// gate state rather than the log-scanning surface [`Failover`] exposes. The
+/// chainId guard matters more here than anywhere: attesting a refund on the
+/// strength of a *different* chain's `executed` flag would be exactly the
+/// mistake that lets a delivered transfer also be refunded.
+pub async fn connect_checked(urls: &[String], expected_chain_id: u64) -> anyhow::Result<DynProvider> {
+    for url in urls {
+        let provider = match url.parse() {
+            Ok(parsed) => ProviderBuilder::new().connect_http(parsed).erased(),
+            Err(e) => {
+                warn!(%url, error = %e, "skipping unparseable RPC url");
+                continue;
+            }
+        };
+        match provider.get_chain_id().await {
+            Ok(id) if id == expected_chain_id => return Ok(provider),
+            Ok(id) => warn!(%url, got = id, want = expected_chain_id, "skipping RPC: chainId mismatch"),
+            Err(e) => warn!(%url, error = %e, "skipping RPC: unreachable"),
+        }
+    }
+    anyhow::bail!("no healthy RPC endpoints for chain {expected_chain_id}")
+}
+
 impl Failover {
     /// Connect to every URL, keep only those whose `eth_chainId` matches
     /// `expected_chain_id`. Errors if none survive.

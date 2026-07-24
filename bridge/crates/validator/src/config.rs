@@ -17,6 +17,62 @@ pub struct Config {
     /// Optional operator HTTP API (pause/resume/rescan/status).
     #[serde(default)]
     pub api: Option<Api>,
+    /// Optional refund attestation loop. Absent => this validator never attests
+    /// cancels or refunds, and stuck transfers stay stuck (safe default: a
+    /// validator that cannot see the destination chain must not vote on whether
+    /// a transfer was delivered).
+    #[serde(default)]
+    pub refund: Option<RefundConfig>,
+}
+
+/// Drives the two-phase refund attestation loop.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefundConfig {
+    /// How long a transfer must sit unclaimed before this validator will attest
+    /// a cancel. A liveness knob, not a safety one — the destination `executed`
+    /// check is what actually prevents attesting a delivered transfer — but it
+    /// should comfortably exceed target-chain finality plus keeper latency.
+    #[serde(default = "default_refund_timeout")]
+    pub timeout_secs: i64,
+    #[serde(default = "default_refund_interval")]
+    pub poll_interval_ms: u64,
+    /// Finality buffer for the destination reads. `executed`/`cancelled` are
+    /// read at `latest - block_confirmation` so a reorg cannot make a claimed
+    /// transfer look unclaimed.
+    #[serde(default)]
+    pub block_confirmation: u64,
+    /// Every destination chain this validator can independently verify. A
+    /// transfer bound for a chain not listed here is never attested.
+    #[serde(default)]
+    pub destinations: Vec<RefundChain>,
+}
+
+/// One chain the refund loop can read gate state from.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefundChain {
+    pub chain_id: u64,
+    #[serde(default)]
+    pub rpc: Option<String>,
+    #[serde(default)]
+    pub rpcs: Vec<String>,
+    pub gate: String,
+}
+
+impl RefundChain {
+    pub fn endpoints(&self) -> anyhow::Result<Vec<String>> {
+        let mut out = self.rpcs.clone();
+        if let Some(rpc) = &self.rpc {
+            if !out.iter().any(|u| u == rpc) {
+                out.insert(0, rpc.clone());
+            }
+        }
+        anyhow::ensure!(
+            !out.is_empty(),
+            "refund destination {} has no RPC endpoints (set `rpc` or `rpcs`)",
+            self.chain_id
+        );
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +152,12 @@ fn default_range() -> u64 {
 fn default_state_file() -> String {
     "validator-state.json".into()
 }
+fn default_refund_timeout() -> i64 {
+    3600
+}
+fn default_refund_interval() -> u64 {
+    15_000
+}
 
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
@@ -125,6 +187,27 @@ impl Config {
                         cfg.sources[j].chain_id,
                         cfg.sources[i].state_file
                     );
+                }
+            }
+        }
+
+        // A refund block with no destinations can never attest anything; that is
+        // almost certainly a misconfiguration rather than an intent to disable.
+        if let Some(refund) = &cfg.refund {
+            if refund.destinations.is_empty() {
+                anyhow::bail!(
+                    "[refund] has no [[refund.destinations]]; remove the block to disable \
+                     refund attestation, or list the destination chains to verify"
+                );
+            }
+            for i in 0..refund.destinations.len() {
+                for j in (i + 1)..refund.destinations.len() {
+                    if refund.destinations[i].chain_id == refund.destinations[j].chain_id {
+                        anyhow::bail!(
+                            "duplicate refund destination chain_id {}",
+                            refund.destinations[i].chain_id
+                        );
+                    }
                 }
             }
         }

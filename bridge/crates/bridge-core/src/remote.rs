@@ -4,8 +4,8 @@
 //! The validator POSTs its signature; the keeper GETs all records. The server
 //! dedupes by signer, so multiple validators converge on one record per id.
 
-use crate::allow::{AllowedChain, AllowedToken, ClaimedRequest};
-use crate::store::{SignerSig, SubmissionRecord};
+use crate::allow::{AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest, RefundTxRequest};
+use crate::store::{SigKind, SignerSig, SubmissionRecord};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
@@ -109,6 +109,55 @@ impl RemoteStore {
         self.client
             .post(url)
             .json(&ClaimedRequest { claim_tx: claim_tx.to_string() })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    // --- refund path ------------------------------------------------------
+
+    /// Post this validator's cancel/refund attestation. The server re-verifies it
+    /// against `kind`'s own digest before counting it.
+    pub async fn upsert_attestation(
+        &self,
+        submission_id: &str,
+        kind: SigKind,
+        sig: SignerSig,
+    ) -> Result<SubmissionRecord, RemoteError> {
+        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
+        let url = format!("{}/submissions/{id}/attestations", self.base);
+        let body = AttestationRequest {
+            kind: kind.as_str().to_string(),
+            signer: sig.signer,
+            signature: sig.signature,
+        };
+        Ok(self.client.post(url).json(&body).send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Submissions the refund relayer should examine. Candidates only — the
+    /// caller still verifies both chains on-chain before signing anything.
+    pub async fn refund_candidates(&self) -> Result<Vec<SubmissionRecord>, RemoteError> {
+        let url = format!("{}/refund-candidates", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Record the destination-chain `cancel()` tx.
+    pub async fn mark_cancelled(&self, submission_id: &str, tx_hash: &str) -> Result<(), RemoteError> {
+        self.post_tx(submission_id, "cancelled", tx_hash).await
+    }
+
+    /// Record the source-chain `refund()` tx.
+    pub async fn mark_refunded(&self, submission_id: &str, tx_hash: &str) -> Result<(), RemoteError> {
+        self.post_tx(submission_id, "refunded", tx_hash).await
+    }
+
+    async fn post_tx(&self, submission_id: &str, path: &str, tx_hash: &str) -> Result<(), RemoteError> {
+        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
+        let url = format!("{}/submissions/{id}/{path}", self.base);
+        self.client
+            .post(url)
+            .json(&RefundTxRequest { tx_hash: tx_hash.to_string() })
             .send()
             .await?
             .error_for_status()?;

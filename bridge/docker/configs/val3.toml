@@ -14,3 +14,17 @@ private_key = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a
 
 [store]
 url = "http://sig-store:8080"
+
+# Refund attestation loop. Without this block the validator never votes on
+# whether a stranded transfer may be cancelled/refunded — a deliberate default,
+# since a node that cannot read the destination chain must not have an opinion
+# on whether a transfer was delivered.
+[refund]
+timeout_secs = 60          # short, for local bring-up; use hours in production
+poll_interval_ms = 2000
+block_confirmation = 0
+
+[[refund.destinations]]
+chain_id = 1338
+rpcs = ["http://anvil-dst:8545"]
+gate = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"

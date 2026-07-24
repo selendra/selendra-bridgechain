@@ -35,7 +35,8 @@ contract SolanaBridgeTest is Test {
         bytes receiver,
         uint256 nonce,
         bytes autoParams,
-        bytes nativeSender
+        bytes nativeSender,
+        address token
     );
 
     function setUp() public {
@@ -70,7 +71,8 @@ contract SolanaBridgeTest is Test {
             SOLANA_RECEIVER,
             0,
             autoParams,
-            nativeSender
+            nativeSender,
+            address(token)
         );
 
         vm.prank(user);

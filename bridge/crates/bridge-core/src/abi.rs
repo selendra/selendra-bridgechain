@@ -24,13 +24,28 @@ sol! {
             bytes receiver,
             uint256 nonce,
             bytes autoParams,
-            bytes nativeSender
+            bytes nativeSender,
+            address token
         );
 
         event Claimed(
             bytes32 indexed submissionId,
             bytes32 indexed debridgeId,
             address indexed receiver,
+            uint256 amount
+        );
+
+        event Cancelled(
+            bytes32 indexed submissionId,
+            bytes32 indexed debridgeId,
+            uint256 chainIdFrom,
+            uint256 nonce
+        );
+
+        event Refunded(
+            bytes32 indexed submissionId,
+            bytes32 indexed debridgeId,
+            address indexed sender,
             uint256 amount
         );
 
@@ -53,7 +68,40 @@ sol! {
             bytes[] signatures
         ) external returns (bytes32 submissionId);
 
+        /// DESTINATION side: burn a stranded transfer so it can never be claimed,
+        /// which is the precondition for refunding it on the source chain.
+        function cancel(
+            bytes32 debridgeId,
+            uint256 amount,
+            uint256 chainIdFrom,
+            uint256 nonce,
+            bytes receiver,
+            bytes autoParams,
+            bytes nativeSender,
+            bytes[] signatures
+        ) external returns (bytes32 submissionId);
+
+        /// SOURCE side: return locked funds to the original sender.
+        function refund(
+            address token,
+            bytes32 debridgeId,
+            uint256 amount,
+            uint256 chainIdTo,
+            uint256 nonce,
+            bytes receiver,
+            bytes autoParams,
+            bytes nativeSender,
+            bytes[] signatures
+        ) external returns (bytes32 submissionId);
+
         function executed(bytes32 submissionId) external view returns (bool);
+        /// True when `executed` was set by `cancel` rather than `claim` — i.e. the
+        /// transfer was burned, not delivered.
+        function cancelled(bytes32 submissionId) external view returns (bool);
+        /// Source-side: who locked the funds. Nonzero proves this gate emitted the
+        /// submissionId and is still able to refund it; cleared on payout.
+        function sentBy(bytes32 submissionId) external view returns (address);
+        function refunded(bytes32 submissionId) external view returns (bool);
         function threshold() external view returns (uint256);
         function nonceTo(uint256 chainIdTo) external view returns (uint256);
         function setLocalToken(bytes32 debridgeId, address localToken) external;

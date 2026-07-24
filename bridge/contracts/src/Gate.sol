@@ -42,13 +42,40 @@ contract Gate {
     // --- source-side state ---
     /// @dev per-target-chain monotonic nonce
     mapping(uint256 chainIdTo => uint256) public nonceTo;
+    /// @dev who locked the funds for each submissionId this gate emitted.
+    ///
+    ///      Two jobs, both essential to `refund`:
+    ///        1. **origin proof** — a nonzero entry is the only evidence that this
+    ///           gate really sent `submissionId`. Without it a validator quorum
+    ///           could authorise a refund for a transfer that never happened here.
+    ///        2. **refund recipient** — `nativeSender` is only folded into the
+    ///           submissionId when `autoParams` is non-empty, so for a plain
+    ///           transfer it is NOT bound by the hash and a caller could name any
+    ///           address. Storage is authoritative; the calldata is not trusted.
+    ///
+    ///      Cleared on `refund` (and left set otherwise, so it doubles as the
+    ///      "still refundable" flag).
+    mapping(bytes32 submissionId => address sender) public sentBy;
+    /// @dev source-side replay guard: a submissionId may only be refunded once
+    mapping(bytes32 submissionId => bool) public refunded;
 
     // --- target-side state ---
-    /// @dev replay guard: a submissionId may only ever be executed once
+    /// @dev replay guard: a submissionId may only ever be executed once.
+    ///      Set by `claim` (funds released) AND by `cancel` (funds permanently
+    ///      NOT released) — check `cancelled` to tell the two apart.
     mapping(bytes32 submissionId => bool) public executed;
+    /// @dev target-side: this submissionId was burned by `cancel`, not claimed.
+    ///      Consumers that treat `executed` as "delivered" (e.g. SwapRouter's
+    ///      `finalize`) MUST also check this, or they will act on a delivery that
+    ///      never happened.
+    mapping(bytes32 submissionId => bool) public cancelled;
     /// @dev asset registry: which local ERC-20 backs a given debridgeId on THIS chain
     mapping(bytes32 debridgeId => address localToken) public tokenOf;
 
+    /// @param token the ERC-20 locked on THIS chain. Not part of the submissionId
+    ///        (which commits to `debridgeId`, a one-way hash of it), so it is
+    ///        emitted explicitly — the refund relayer needs the concrete address
+    ///        to build `refund()`, and keccak is not invertible.
     event Sent(
         bytes32 indexed submissionId,
         bytes32 indexed debridgeId,
@@ -58,13 +85,31 @@ contract Gate {
         bytes receiver,
         uint256 nonce,
         bytes autoParams,
-        bytes nativeSender
+        bytes nativeSender,
+        address token
     );
 
     event Claimed(
         bytes32 indexed submissionId,
         bytes32 indexed debridgeId,
         address indexed receiver,
+        uint256 amount
+    );
+
+    /// @notice Emitted on the DESTINATION chain when a transfer is burned so it
+    ///         can never be claimed — the precondition for a source-side refund.
+    event Cancelled(
+        bytes32 indexed submissionId,
+        bytes32 indexed debridgeId,
+        uint256 chainIdFrom,
+        uint256 nonce
+    );
+
+    /// @notice Emitted on the SOURCE chain when locked funds are returned.
+    event Refunded(
+        bytes32 indexed submissionId,
+        bytes32 indexed debridgeId,
+        address indexed sender,
         uint256 amount
     );
 
@@ -91,6 +136,12 @@ contract Gate {
     error InvalidThreshold(uint256 threshold, uint256 validatorCount);
     error EnforcedPause();
     error NotAuthorizedToPause();
+    /// @dev refund asked for a submissionId this gate never emitted (or one
+    ///      already refunded — `sentBy` is cleared on payout)
+    error NotSent(bytes32 submissionId);
+    error AlreadyRefunded(bytes32 submissionId);
+    /// @dev the `token` passed to `refund` is not the one `debridgeId` commits to
+    error TokenMismatch(bytes32 debridgeId, address token);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -241,6 +292,9 @@ contract Gate {
         // token with a transfer hook could reenter send(), read the same nonce,
         // and emit a colliding `Sent` — desyncing the off-chain nonce sequence.
         nonceTo[chainIdTo] = nonce + 1;
+        // Bind the refund recipient at lock time. The monotonic per-corridor
+        // nonce makes submissionId unique, so this never overwrites a live entry.
+        sentBy[submissionId] = msg.sender;
         emit Sent(
             submissionId,
             debridgeId,
@@ -250,7 +304,8 @@ contract Gate {
             receiver,
             nonce,
             autoParams,
-            nativeSender
+            nativeSender,
+            token
         );
 
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
@@ -293,6 +348,116 @@ contract Gate {
         IERC20(localToken).safeTransfer(to, amount);
 
         emit Claimed(submissionId, debridgeId, to, amount);
+    }
+
+    // ---------------------------------------------------------------------
+    // Refund path: cancel on the destination, then refund on the source
+    // ---------------------------------------------------------------------
+    //
+    // A transfer can strand: the destination gate may lack liquidity for the
+    // asset, the corridor may be de-listed after the funds were locked, or the
+    // target chain may be down long enough that nobody ever claims. The locked
+    // funds must be returnable — but a refund that merely waits out a timeout is
+    // a DOUBLE-SPEND: the transfer's validator signatures still exist, so a
+    // keeper can `claim()` on the destination in the same window the source pays
+    // the refund, and the same tokens are released twice.
+    //
+    // So the two legs are ordered, and the ordering is enforced on-chain rather
+    // than by any timing assumption:
+    //
+    //   1. `cancel()` on the DESTINATION burns `executed[submissionId]`. From
+    //      that moment `claim()` reverts with AlreadyExecuted — the destination
+    //      can never pay out, permanently and verifiably.
+    //   2. Validators observe the resulting `Cancelled` event (an ordinary
+    //      on-chain fact, attested exactly like a `Sent` is) and only then sign
+    //      the refund digest.
+    //   3. `refund()` on the SOURCE returns the funds.
+    //
+    // If a keeper wins the race and claims first, step 1 simply reverts and no
+    // refund is ever authorised. There is no interleaving that pays out twice.
+
+    /// @notice DESTINATION side. Burn a transfer so it can never be claimed here,
+    ///         unlocking a source-chain refund. Moves no funds.
+    /// @dev    Requires a threshold of validator signatures over
+    ///         `BridgeHash.getCancelId(submissionId)` — a distinct signing domain,
+    ///         so the validators' original transfer signatures (which authorise
+    ///         *paying* this submissionId) can never be replayed to burn it.
+    function cancel(
+        bytes32 debridgeId,
+        uint256 amount,
+        uint256 chainIdFrom,
+        uint256 nonce,
+        bytes calldata receiver,
+        bytes calldata autoParams,
+        bytes calldata nativeSender,
+        bytes[] calldata signatures
+    ) external whenNotPaused returns (bytes32 submissionId) {
+        submissionId = _idFor(
+            debridgeId, amount, chainIdFrom, block.chainid, nonce, receiver, autoParams, nativeSender
+        );
+
+        // Already claimed (or already cancelled) — either way it is spent here,
+        // and re-cancelling must not re-authorise a second refund.
+        if (executed[submissionId]) revert AlreadyExecuted();
+
+        _verifySignatures(BridgeHash.getCancelId(submissionId), signatures);
+
+        executed[submissionId] = true;
+        cancelled[submissionId] = true;
+
+        emit Cancelled(submissionId, debridgeId, chainIdFrom, nonce);
+    }
+
+    /// @notice SOURCE side. Return locked funds to the original sender after the
+    ///         destination has been cancelled.
+    /// @dev    Three independent guards stand between a caller and the vault:
+    ///           * `sentBy[submissionId]` must be set — proof THIS gate locked
+    ///             these funds, and the authoritative recipient (the calldata's
+    ///             `nativeSender` is not hash-bound for a plain transfer, so it is
+    ///             never trusted for the payout address);
+    ///           * a validator threshold over `BridgeHash.getRefundId(...)`, whose
+    ///             quorum only forms after `Cancelled` is observed on the target;
+    ///           * `token` must be exactly the asset `debridgeId` commits to.
+    /// @param token the ERC-20 originally locked. `debridgeId` is a one-way hash
+    ///        of it, so it is supplied by the caller and checked here rather than
+    ///        stored — untrusted input, exactly verified.
+    function refund(
+        address token,
+        bytes32 debridgeId,
+        uint256 amount,
+        uint256 chainIdTo,
+        uint256 nonce,
+        bytes calldata receiver,
+        bytes calldata autoParams,
+        bytes calldata nativeSender,
+        bytes[] calldata signatures
+    ) external whenNotPaused returns (bytes32 submissionId) {
+        submissionId = _idFor(
+            debridgeId, amount, block.chainid, chainIdTo, nonce, receiver, autoParams, nativeSender
+        );
+
+        if (refunded[submissionId]) revert AlreadyRefunded(submissionId);
+
+        // Origin proof AND payout address, both from storage this gate wrote at
+        // lock time. Zero means "we never sent this" (or it is already refunded).
+        address sender = sentBy[submissionId];
+        if (sender == address(0)) revert NotSent(submissionId);
+
+        // debridgeId = keccak(thisChain, token): an exact binding, so a caller
+        // cannot name a different (more valuable) asset held by this gate.
+        if (BridgeHash.getDebridgeId(block.chainid, token) != debridgeId) {
+            revert TokenMismatch(debridgeId, token);
+        }
+
+        _verifySignatures(BridgeHash.getRefundId(submissionId), signatures);
+
+        // effects before interactions
+        refunded[submissionId] = true;
+        delete sentBy[submissionId];
+
+        IERC20(token).safeTransfer(sender, amount);
+
+        emit Refunded(submissionId, debridgeId, sender, amount);
     }
 
     /// @notice Recompute a submissionId without executing (hash-equivalence tests).
@@ -348,12 +513,19 @@ contract Gate {
         );
     }
 
-    /// @dev Validators sign the EIP-191 `eth_sign` digest of the raw submissionId.
-    function _verifySignatures(bytes32 submissionId, bytes[] calldata signatures)
+    /// @dev Verify a validator threshold over the EIP-191 `eth_sign` digest of a
+    ///      raw 32-byte message.
+    /// @param message one of three domain-separated values — a `submissionId`
+    ///        (authorises paying a transfer out), a `cancelId` (authorises
+    ///        burning it on the destination), or a `refundId` (authorises
+    ///        returning it on the source). `BridgeHash` derives the latter two
+    ///        under distinct prefixes, so a quorum for one is never a quorum for
+    ///        another.
+    function _verifySignatures(bytes32 message, bytes[] calldata signatures)
         internal
         view
     {
-        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(submissionId);
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(message);
 
         address last = address(0);
         uint256 count = 0;

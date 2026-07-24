@@ -188,6 +188,38 @@ contract SwapRouterTest is Test {
     }
 
     // ------------------------------------------------------------------
+    // A cancelled transfer is NOT a delivered one
+    // ------------------------------------------------------------------
+    function test_Finalize_AfterCancel_Reverts() public {
+        // `Gate.cancel` burns a stranded transfer by setting `executed` — without
+        // ever releasing the stable. `finalize` used to read `executed` as proof
+        // of delivery, so it would have paid `finalReceiver` out of whatever
+        // liquidity happened to be resting at the router (another user's in-flight
+        // transfer), while the source chain separately refunded the sender.
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+
+        vm.chainId(CHAIN_B);
+        bytes32 cancelId = BridgeHash.getCancelId(leg.id);
+        gateB.cancel(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams,
+            leg.nativeSender, _sign(v1pk, cancelId)
+        );
+        assertTrue(gateB.executed(leg.id), "cancel did not burn the transfer");
+        assertTrue(gateB.cancelled(leg.id), "cancelled flag not set");
+
+        // strand some stable at the router, so a buggy finalize WOULD have paid out
+        usdB.mint(address(routerB), leg.amount);
+
+        vm.expectRevert(abi.encodeWithSelector(SwapRouter.NotDelivered.selector, leg.id));
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+
+        assertEq(tt.balanceOf(finalReceiver), 0, "receiver paid for a cancelled transfer");
+        assertFalse(routerB.finalized(leg.id), "cancelled transfer marked finalized");
+    }
+
+    // ------------------------------------------------------------------
     // Two-step: keeper claims via the Gate, then anyone calls finalize
     // ------------------------------------------------------------------
     function test_CrossChain_Finalize_AfterPlainClaim() public {

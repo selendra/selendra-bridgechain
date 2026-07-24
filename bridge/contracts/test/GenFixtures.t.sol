@@ -64,7 +64,11 @@ contract GenFixturesTest is Test {
             '"fallbackAddress":"', vm.toString(f.fallbackAddress), '",',
             '"data":"', vm.toString(f.data), '",',
             '"nativeSender":"', vm.toString(f.nativeSender), '",',
-            '"submissionId":"', vm.toString(_id(f)), '"',
+            '"submissionId":"', vm.toString(_id(f)), '",',
+            // The cancel/refund attestation digests derived from the same id, so
+            // the Rust side is locked to Solidity for those domains too.
+            '"cancelId":"', vm.toString(BridgeHash.getCancelId(_id(f))), '",',
+            '"refundId":"', vm.toString(BridgeHash.getRefundId(_id(f))), '"',
             "}"
         );
     }

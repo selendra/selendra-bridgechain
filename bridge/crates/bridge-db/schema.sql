@@ -18,18 +18,48 @@ CREATE TABLE IF NOT EXISTS submissions (
     claim_tx        TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- Refund groundwork (see crates/indexer): 'none' | 'eligible' | 'refunded'.
-    -- Flipped to 'eligible' by the indexer's periodic sweep once a transfer is
-    -- past the refund timeout and still unclaimed. Purely informational today —
-    -- no on-chain refund mechanism exists yet; 'refunded'/refund_tx are reserved
-    -- for that follow-up.
+    -- Refund lifecycle:
+    --   none      -- healthy, or already delivered
+    --   eligible  -- past the timeout and still unclaimed; validators may attest
+    --                a cancel (set by the indexer's periodic sweep, cleared again
+    --                if the transfer is claimed after all)
+    --   cancelled -- burned on the DESTINATION chain, so `claim` can never land.
+    --                This is what unlocks refund attestations.
+    --   refunded  -- funds returned to the sender on the SOURCE chain
     refund_status   TEXT        NOT NULL DEFAULT 'none',
-    refund_tx       TEXT
+    refund_tx       TEXT,
+    -- Destination-chain `Gate.cancel` tx hash, once burned.
+    cancel_tx       TEXT,
+    -- The source-chain ERC-20 that was locked. Not derivable from debridge_id
+    -- (a one-way hash), and the refund relayer needs the concrete address to
+    -- build `Gate.refund`. Written from the `Sent` event; verified against
+    -- debridge_id before it is ever stored (see bridge_core::store).
+    token           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_submissions_to     ON submissions (chain_id_to);
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions (status);
+CREATE INDEX IF NOT EXISTS idx_submissions_refund ON submissions (refund_status);
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS refund_status TEXT NOT NULL DEFAULT 'none';
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS refund_tx TEXT;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS cancel_tx TEXT;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS token TEXT;
+
+-- Validator attestations for the refund path, kept apart from `signatures`
+-- because each domain authorises a DIFFERENT on-chain effect and therefore
+-- needs its own independent quorum:
+--   'cancel'  -- burn the transfer on the destination gate (releases nothing)
+--   'refund'  -- return the locked funds on the source gate
+-- Mixing them would let a transfer quorum burn or claw back a healthy transfer.
+-- Each row's signature is verified against its own digest before insert.
+CREATE TABLE IF NOT EXISTS attestations (
+    submission_id   TEXT        NOT NULL REFERENCES submissions (submission_id) ON DELETE CASCADE,
+    kind            TEXT        NOT NULL,
+    signer          TEXT        NOT NULL,
+    signature       TEXT        NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (submission_id, kind, signer)
+);
+CREATE INDEX IF NOT EXISTS idx_attestations_kind ON attestations (kind);
 
 -- Collected validator signatures, deduped by signer per submission.
 CREATE TABLE IF NOT EXISTS signatures (

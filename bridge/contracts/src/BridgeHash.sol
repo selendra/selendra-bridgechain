@@ -10,6 +10,14 @@ pragma solidity 0.8.24;
 library BridgeHash {
     /// @dev domain-separating prefix, as in deBridge.
     uint256 internal constant SUBMISSION_PREFIX = 1;
+    /// @dev domain prefix for a destination-side CANCEL attestation. A validator
+    ///      signature over a cancelId authorises burning `executed[submissionId]`
+    ///      on the target gate so the transfer can never be claimed.
+    uint256 internal constant CANCEL_PREFIX = 2;
+    /// @dev domain prefix for a source-side REFUND attestation. A validator
+    ///      signature over a refundId authorises returning the locked funds to
+    ///      the original sender on the source gate.
+    uint256 internal constant REFUND_PREFIX = 3;
 
     /// @notice Optional execution payload attached to a transfer.
     /// @dev    `nativeSender` is meaningful only on the claim (From) side; on the
@@ -80,5 +88,23 @@ library BridgeHash {
                 keccak256(autoParams.nativeSender)
             )
         );
+    }
+
+    /// @notice Digest a validator signs to authorise CANCELLING a transfer on the
+    ///         destination chain (burning it so `claim` can never release funds).
+    /// @dev    Domain-separated from a submissionId two ways: a different prefix,
+    ///         and a 64-byte preimage where a submissionId's is >= 224 bytes. So a
+    ///         validator's transfer signature can never be replayed as a cancel
+    ///         (and vice-versa) short of a keccak256 preimage collision.
+    function getCancelId(bytes32 submissionId) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(CANCEL_PREFIX, submissionId));
+    }
+
+    /// @notice Digest a validator signs to authorise REFUNDING a cancelled
+    ///         transfer on the source chain. Domain-separated exactly as
+    ///         {getCancelId} is, so a cancel attestation can never be replayed as
+    ///         a refund authorisation — the two are independent quorums.
+    function getRefundId(bytes32 submissionId) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(REFUND_PREFIX, submissionId));
     }
 }

@@ -29,6 +29,10 @@ pub mod auth;
 
 /// Domain-separating prefix, matching `BridgeHash.SUBMISSION_PREFIX` in Solidity.
 pub const SUBMISSION_PREFIX: u64 = 1;
+/// Prefix for a destination-side CANCEL attestation (`BridgeHash.CANCEL_PREFIX`).
+pub const CANCEL_PREFIX: u64 = 2;
+/// Prefix for a source-side REFUND attestation (`BridgeHash.REFUND_PREFIX`).
+pub const REFUND_PREFIX: u64 = 3;
 
 /// Optional execution payload attached to a transfer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -105,5 +109,29 @@ pub fn submission_id_with_auto(
     packed.extend_from_slice(keccak256(&auto.fallback_address).as_slice());
     packed.extend_from_slice(keccak256(&auto.data).as_slice());
     packed.extend_from_slice(keccak256(&auto.native_sender).as_slice());
+    keccak256(packed)
+}
+
+/// Digest a validator signs to authorise CANCELLING a transfer on the
+/// destination chain — byte-identical to `BridgeHash.getCancelId`.
+///
+/// The domain prefix (and the 64-byte preimage, against a submissionId's >= 224)
+/// is what stops a validator's transfer signature from being replayed as a
+/// cancel authorisation. See [`refund_id`] for the source-side counterpart.
+pub fn cancel_id(submission_id: B256) -> B256 {
+    domain_id(CANCEL_PREFIX, submission_id)
+}
+
+/// Digest a validator signs to authorise REFUNDING a cancelled transfer on the
+/// source chain — byte-identical to `BridgeHash.getRefundId`.
+pub fn refund_id(submission_id: B256) -> B256 {
+    domain_id(REFUND_PREFIX, submission_id)
+}
+
+/// `keccak256(abi.encodePacked(uint256(prefix), submissionId))`.
+fn domain_id(prefix: u64, submission_id: B256) -> B256 {
+    let mut packed = Vec::with_capacity(64);
+    packed.extend_from_slice(&U256::from(prefix).to_be_bytes::<32>());
+    packed.extend_from_slice(submission_id.as_slice());
     keccak256(packed)
 }
