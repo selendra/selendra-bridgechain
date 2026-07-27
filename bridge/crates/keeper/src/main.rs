@@ -97,8 +97,19 @@ async fn run_target(
     let gate_addr: Address = target.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
 
+    // SimpleNonceManager fetches the pending nonce from the chain for every tx,
+    // instead of the default CachedNonceManager which keeps a local counter.
+    //
+    // The cached manager is unsafe here: a tx whose gas estimation reverts (e.g.
+    // a claim for an asset the destination hasn't registered — exactly the
+    // stranded transfers this keeper is meant to cancel) still advances the
+    // cached nonce before failing to send. After a run of such failures the
+    // cache sits far ahead of the chain, so the NEXT real tx (a cancel, say)
+    // broadcasts with a gap and hangs pending forever. The keeper submits txs
+    // one at a time and awaits each receipt, so a fresh per-tx fetch is correct.
     let provider = ProviderBuilder::new()
         .wallet(wallet)
+        .with_simple_nonce_management()
         .connect_http(target.rpc.parse()?);
 
     // Verify the RPC is on the expected chain. Unreachable => transient, retry.
@@ -245,7 +256,12 @@ async fn run_source_refunds(
     let gate_addr: Address = src.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(src.poll_interval_ms.max(1000));
 
-    let provider = ProviderBuilder::new().wallet(wallet).connect_http(src.rpc.parse()?);
+    // Fresh per-tx nonce fetch — see the note in run_target on why the default
+    // cached manager corrupts the sequence after a reverting send.
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .with_simple_nonce_management()
+        .connect_http(src.rpc.parse()?);
 
     loop {
         match provider.get_chain_id().await {
@@ -323,6 +339,17 @@ async fn try_claim<P: Provider>(
     }
 
     let debridge_id = B256::from_str(&rec.debridge_id).context("bad debridge_id")?;
+
+    // Skip a claim that would certainly revert with UnknownAsset: if the
+    // destination gate has no local token registered for this debridgeId, there
+    // is nothing to release. This is exactly the stranded-transfer case the
+    // refund path handles — without this guard the keeper would re-attempt the
+    // claim every tick, hammering the RPC and flooding the logs, until the
+    // transfer is cancelled. If the asset is registered later, the claim resumes.
+    if gate.tokenOf(debridge_id).call().await? == Address::ZERO {
+        return Ok(None);
+    }
+
     let amount = U256::from_str(&rec.amount).context("bad amount")?;
     let receiver = bytes_of(&rec.receiver)?;
     let auto_params = bytes_of(&rec.auto_params)?;

@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     info!(chains = cfg.chains.len(), "indexer started");
 
     let refund_timeout = chrono::Duration::seconds(cfg.refund_timeout_secs);
+    let sweep_interval = Duration::from_secs(cfg.sweep_interval_secs);
     let sweep_db = db.clone();
     tokio::spawn(async move {
         loop {
@@ -57,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(_) => {}
                 Err(e) => warn!(error = %e, "refund-eligibility sweep failed"),
             }
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(sweep_interval).await;
         }
     });
 

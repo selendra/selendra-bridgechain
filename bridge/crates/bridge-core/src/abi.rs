@@ -95,6 +95,9 @@ sol! {
         ) external returns (bytes32 submissionId);
 
         function executed(bytes32 submissionId) external view returns (bool);
+        /// The local ERC-20 backing a debridgeId on this chain, or address(0) if
+        /// the asset isn't registered (a claim would revert with UnknownAsset).
+        function tokenOf(bytes32 debridgeId) external view returns (address);
         /// True when `executed` was set by `cancel` rather than `claim` — i.e. the
         /// transfer was burned, not delivered.
         function cancelled(bytes32 submissionId) external view returns (bool);

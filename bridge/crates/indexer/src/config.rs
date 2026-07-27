@@ -7,10 +7,16 @@ pub struct Config {
     pub database_url: Option<String>,
     /// One block per chain to mirror events from.
     pub chains: Vec<ChainCfg>,
-    /// How long an unclaimed transfer sits before being flagged refund-eligible
-    /// (informational only — see `bridge_db::Db::sweep_refund_eligible`).
+    /// How long an unclaimed transfer sits before being flagged refund-eligible,
+    /// which nominates it for a validator cancel attestation (the validators
+    /// re-check the destination on-chain before acting). See
+    /// `bridge_db::Db::sweep_refund_eligible`.
     #[serde(default = "default_refund_timeout_secs")]
     pub refund_timeout_secs: i64,
+    /// How often the eligibility sweep runs. The default suits production; tests
+    /// lower it so a stranded transfer is nominated promptly.
+    #[serde(default = "default_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +52,9 @@ fn default_range() -> u64 {
 }
 fn default_refund_timeout_secs() -> i64 {
     24 * 60 * 60
+}
+fn default_sweep_interval_secs() -> u64 {
+    60
 }
 
 impl Config {
