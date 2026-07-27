@@ -4,7 +4,7 @@
 //! The validator POSTs its signature; the keeper GETs all records. The server
 //! dedupes by signer, so multiple validators converge on one record per id.
 
-use crate::allow::{AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest, RefundTxRequest};
+use crate::allow::{AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest};
 use crate::store::{SigKind, SignerSig, SubmissionRecord};
 
 #[derive(Debug, thiserror::Error)]
@@ -142,25 +142,8 @@ impl RemoteStore {
         Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
     }
 
-    /// Record the destination-chain `cancel()` tx.
-    pub async fn mark_cancelled(&self, submission_id: &str, tx_hash: &str) -> Result<(), RemoteError> {
-        self.post_tx(submission_id, "cancelled", tx_hash).await
-    }
-
-    /// Record the source-chain `refund()` tx.
-    pub async fn mark_refunded(&self, submission_id: &str, tx_hash: &str) -> Result<(), RemoteError> {
-        self.post_tx(submission_id, "refunded", tx_hash).await
-    }
-
-    async fn post_tx(&self, submission_id: &str, path: &str, tx_hash: &str) -> Result<(), RemoteError> {
-        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
-        let url = format!("{}/submissions/{id}/{path}", self.base);
-        self.client
-            .post(url)
-            .json(&RefundTxRequest { tx_hash: tx_hash.to_string() })
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
-    }
+    // The `cancelled`/`refunded` lifecycle is written only by the indexer from
+    // observed on-chain events, so the keeper/relayer client intentionally has no
+    // method to set it (that would be reporting a candidate-gating state on the
+    // caller's word). See sig-store's router note.
 }

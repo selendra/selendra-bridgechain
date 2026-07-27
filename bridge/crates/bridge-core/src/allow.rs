@@ -67,13 +67,6 @@ pub struct AttestationRequest {
     pub signature: String,
 }
 
-/// Request body to record a completed refund-path transaction
-/// (keeper → sig-store).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RefundTxRequest {
-    /// `0x`-prefixed transaction hash on the relevant chain.
-    pub tx_hash: String,
-}
 
 /// A submission as it appears in the transaction-history view: the transfer
 /// parameters plus its lifecycle status and timing. Distinct from

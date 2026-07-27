@@ -5,6 +5,7 @@ rpcs = ["http://anvil-src:8545"]
 gate = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 start_block = 0
 block_confirmation = 0
+allow_zero_confirmation = true   # anvil has instant finality; NEVER set on a real chain
 poll_interval_ms = 500
 max_block_range = 1000
 state_file = "/data/val3-state.json"
@@ -23,6 +24,7 @@ url = "http://sig-store:8080"
 timeout_secs = 60          # short, for local bring-up; use hours in production
 poll_interval_ms = 2000
 block_confirmation = 0
+allow_zero_confirmation = true   # anvil has instant finality; NEVER set on a real chain
 
 [[refund.destinations]]
 chain_id = 1338

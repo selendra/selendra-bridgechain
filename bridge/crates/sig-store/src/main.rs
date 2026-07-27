@@ -21,8 +21,11 @@
 //!                                                   "signer":"0x..","signature":"0x.."})
 //!   GET    /refund-candidates            -> submissions a refund relayer should
 //!                                           examine (still requires on-chain checks)
-//!   POST   /submissions/:id/cancelled    -> record the destination cancel tx
-//!   POST   /submissions/:id/refunded     -> record the source refund tx
+//!
+//! The `cancelled`/`refunded` lifecycle has NO write route: those states gate the
+//! refund-candidate list, so they are set only by the indexer from observed
+//! on-chain `Cancelled`/`Refunded` events, never on a caller's word (a forged
+//! "refunded" would hide a stuck transfer from the relayers).
 //!
 //!   # allowlists
 //!   GET    /allowed/tokens               -> whitelisted tokens
@@ -41,7 +44,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bridge_core::allow::{
     AddTokenRequest, AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest,
-    RefundTxRequest, SubmissionHistory,
+    SubmissionHistory,
 };
 use bridge_core::auth::require_auth;
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
@@ -92,8 +95,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/submissions/:id", get(get_submission))
         .route("/submissions/:id/claimed", post(post_claimed))
         .route("/submissions/:id/attestations", post(post_attestation))
-        .route("/submissions/:id/cancelled", post(post_cancelled))
-        .route("/submissions/:id/refunded", post(post_refunded))
+        // NOTE: there is deliberately no write route for the `cancelled`/`refunded`
+        // lifecycle. Those states gate the refund-candidate list, so allowing a
+        // caller to set them (a bearer-token holder, or anyone in unauthenticated
+        // dev mode) would let a forged "refunded" permanently hide a genuinely
+        // stuck transfer from the relayers. They are written ONLY by the indexer,
+        // from observed on-chain `Cancelled`/`Refunded` events — never on a
+        // caller's word.
         .route("/refund-candidates", get(get_refund_candidates))
         .route("/history", get(get_history))
         .route("/allowed/tokens", get(list_tokens).post(add_token))
@@ -238,25 +246,9 @@ async fn get_refund_candidates(
     Ok(Json(s.db.refund_candidates().await.map_err(db_err)?))
 }
 
-async fn post_cancelled(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<RefundTxRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    s.db.mark_cancelled(&id, &body.tx_hash).await.map_err(db_err)?;
-    info!(submission_id = %id, tx = %body.tx_hash, "marked cancelled on destination");
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn post_refunded(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<RefundTxRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    s.db.mark_refunded(&id, &body.tx_hash).await.map_err(db_err)?;
-    info!(submission_id = %id, tx = %body.tx_hash, "marked refunded on source");
-    Ok(StatusCode::NO_CONTENT)
-}
+// `cancelled`/`refunded` are written only by the indexer from observed on-chain
+// events (see the router note), so there are intentionally no HTTP handlers for
+// them here.
 
 // --- allowlists -----------------------------------------------------------
 

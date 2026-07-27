@@ -34,6 +34,13 @@ use config::{Config, TargetChain};
 use source::Source;
 use tracing::{info, warn};
 
+/// Upper bound on waiting for a submitted tx's receipt. A tx that never confirms
+/// within this window (stuck/underpriced/replaced) makes `get_receipt` return an
+/// error instead of blocking the whole per-chain loop forever; the record is
+/// retried next tick, and each `try_*` re-checks on-chain state first so a retry
+/// after a tx actually landed is a no-op.
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -53,9 +60,28 @@ async fn main() -> anyhow::Result<()> {
     info!(
         keeper = %signer.address(),
         targets = cfg.targets.len(),
+        sources = cfg.sources.len(),
         source = %source.describe(),
         "keeper started"
     );
+
+    // A chain listed as BOTH a claim target and a refund source (a bidirectional
+    // corridor) gets two loops submitting from the same account on the same chain
+    // concurrently. Each has its own fresh-nonce provider, so under simultaneous
+    // load they can fetch the same pending nonce and one tx is rejected
+    // (nonce-too-low) — self-healing on the next tick, but worth flagging. For a
+    // busy bidirectional keeper, run the target and source roles as separate
+    // processes (or separate signer accounts) to avoid the contention.
+    for t in &cfg.targets {
+        if cfg.sources.iter().any(|s| s.chain_id == t.chain_id) {
+            warn!(
+                chain_id = t.chain_id,
+                "chain is both a claim target and a refund source; the two loops share one \
+                 account and may briefly contend on nonces under load (self-healing). Consider \
+                 separate keeper processes for the two roles."
+            );
+        }
+    }
 
     // Spawn one independent claim loop per destination chain. A loop only returns
     // on a permanent misconfig (e.g. wrong chainId); transient RPC failures are
@@ -177,16 +203,11 @@ async fn run_target(
             // never reach this branch, and its funds would stay locked forever.
             if (rec.cancel_signatures.len() as u64) >= threshold {
                 match try_cancel(&gate, &rec).await {
-                    Ok(Some(tx)) => {
-                        if let Err(e) = source.mark_cancelled(&rec.submission_id, &tx).await {
-                            warn!(
-                                chain_id = target.chain_id,
-                                submission_id = %rec.submission_id,
-                                error = %e,
-                                "cancelled on-chain but failed to record status"
-                            );
-                        }
-                    }
+                    // The DB `refund_status` is advanced by the indexer when it
+                    // observes the resulting `Cancelled` event on-chain, not
+                    // reported here — the keeper's word is not authoritative for a
+                    // state that gates the refund-candidate list.
+                    Ok(Some(_tx)) => {}
                     Ok(None) => {} // already executed (claimed or cancelled)
                     Err(e) => warn!(
                         chain_id = target.chain_id,
@@ -303,16 +324,10 @@ async fn run_source_refunds(
                 continue;
             }
             match try_refund(&gate, &rec).await {
-                Ok(Some(tx)) => {
-                    if let Err(e) = store.mark_refunded(&rec.submission_id, &tx).await {
-                        warn!(
-                            chain_id = src.chain_id,
-                            submission_id = %rec.submission_id,
-                            error = %e,
-                            "refunded on-chain but failed to record status"
-                        );
-                    }
-                }
+                // As with cancel, the indexer records `refund_status = refunded`
+                // from the observed on-chain `Refunded` event; the keeper does not
+                // report a state that gates the candidate list.
+                Ok(Some(_tx)) => {}
                 Ok(None) => {} // already refunded, or never sent from this gate
                 Err(e) => warn!(
                     chain_id = src.chain_id,
@@ -375,7 +390,11 @@ async fn try_claim<P: Provider>(
         .await
         .context("send claim")?;
 
-    let receipt = pending.get_receipt().await.context("await receipt")?;
+    let receipt = pending
+        .with_timeout(Some(RECEIPT_TIMEOUT))
+        .get_receipt()
+        .await
+        .context("await receipt")?;
     info!(
         submission_id = %rec.submission_id,
         tx = %receipt.transaction_hash,
@@ -420,7 +439,11 @@ async fn try_cancel<P: Provider>(
         .await
         .context("send cancel")?;
 
-    let receipt = pending.get_receipt().await.context("await receipt")?;
+    let receipt = pending
+        .with_timeout(Some(RECEIPT_TIMEOUT))
+        .get_receipt()
+        .await
+        .context("await receipt")?;
     info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "CANCELLED");
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
 }
@@ -479,7 +502,11 @@ async fn try_refund<P: Provider>(
         .await
         .context("send refund")?;
 
-    let receipt = pending.get_receipt().await.context("await receipt")?;
+    let receipt = pending
+        .with_timeout(Some(RECEIPT_TIMEOUT))
+        .get_receipt()
+        .await
+        .context("await receipt")?;
     info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "REFUNDED");
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
 }

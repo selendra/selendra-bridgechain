@@ -174,6 +174,7 @@ url = "$STORE_URL"
 timeout_secs = 5
 poll_interval_ms = 1000
 block_confirmation = 0
+allow_zero_confirmation = true   # anvil is instant-final; a real chain MUST set block_confirmation
 
 [[refund.destinations]]
 chain_id = $DST_CHAIN

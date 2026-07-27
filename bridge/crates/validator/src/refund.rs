@@ -163,21 +163,32 @@ pub async fn run(
     let signer_addr = signer.address();
     let retry = Duration::from_millis(cfg.poll_interval_ms.max(1000));
 
-    // Connect every chain up front; a validator that cannot read a chain must not
-    // vote on transfers touching it, so a failure here is fatal to the loop
-    // rather than something to paper over.
+    // Connect every chain up front. A validator that cannot read a chain must not
+    // vote on transfers touching it, so we don't paper over a bad endpoint — but a
+    // transient RPC hiccup at startup must not permanently kill the loop (it would
+    // stay dead until the process is bounced, stranding refunds). Retry connect,
+    // exactly as the transfer scanner does.
+    let connect = |chain_id: u64, gate: String, endpoints: Vec<String>| async move {
+        loop {
+            match GateReader::connect(chain_id, &gate, &endpoints, cfg.block_confirmation).await {
+                Ok(reader) => break reader,
+                Err(e) => {
+                    warn!(chain_id, error = %e, "refund loop: connecting RPC failed; retrying");
+                    tokio::time::sleep(retry).await;
+                }
+            }
+        }
+    };
+
     let mut source_readers: BTreeMap<u64, GateReader> = BTreeMap::new();
     for (chain_id, gate, endpoints) in &sources {
-        let reader = GateReader::connect(*chain_id, gate, endpoints, cfg.block_confirmation).await?;
-        source_readers.insert(*chain_id, reader);
+        source_readers.insert(*chain_id, connect(*chain_id, gate.clone(), endpoints.clone()).await);
     }
 
     let mut dest_readers: BTreeMap<u64, GateReader> = BTreeMap::new();
     for dest in &cfg.destinations {
         let endpoints = dest.endpoints()?;
-        let reader =
-            GateReader::connect(dest.chain_id, &dest.gate, &endpoints, cfg.block_confirmation).await?;
-        dest_readers.insert(dest.chain_id, reader);
+        dest_readers.insert(dest.chain_id, connect(dest.chain_id, dest.gate.clone(), endpoints).await);
     }
 
     info!(

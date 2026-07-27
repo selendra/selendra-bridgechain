@@ -207,9 +207,17 @@ struct Attestations {
 impl Attestations {
     fn push(&mut self, kind: &str, sig: SignerSig) {
         match SigKind::parse(kind) {
-            Some(SigKind::Transfer) | None => self.transfer.push(sig),
+            Some(SigKind::Transfer) => self.transfer.push(sig),
             Some(SigKind::Cancel) => self.cancel.push(sig),
             Some(SigKind::Refund) => self.refund.push(sig),
+            // An unrecognized kind must NOT fall into a quorum bucket — least of
+            // all `transfer`, which authorises a claim. Today unreachable (the
+            // write path constrains `kind` to cancel/refund and the signatures
+            // table contributes the literal 'transfer'), so this is defensive
+            // against a future writer or a hand-edited row.
+            None => {
+                tracing::warn!(kind, "ignoring signature with unrecognized attestation kind");
+            }
         }
     }
 }

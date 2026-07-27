@@ -28,19 +28,34 @@ pub struct Config {
 /// Drives the two-phase refund attestation loop.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RefundConfig {
-    /// How long a transfer must sit unclaimed before this validator will attest
-    /// a cancel. A liveness knob, not a safety one — the destination `executed`
-    /// check is what actually prevents attesting a delivered transfer — but it
-    /// should comfortably exceed target-chain finality plus keeper latency.
+    /// Advisory only, surfaced in the startup log. The unclaimed-timeout that
+    /// actually gates cancel attestations is enforced upstream by the indexer's
+    /// eligibility sweep (`indexer.refund_timeout_secs`), which flips a transfer
+    /// to `refund_status = 'eligible'`; this loop only ever sees candidates the
+    /// store has already nominated. Kept so the intended window is visible in one
+    /// place; set it to match the indexer's value.
     #[serde(default = "default_refund_timeout")]
     pub timeout_secs: i64,
     #[serde(default = "default_refund_interval")]
     pub poll_interval_ms: u64,
-    /// Finality buffer for the destination reads. `executed`/`cancelled` are
-    /// read at `latest - block_confirmation` so a reorg cannot make a claimed
-    /// transfer look unclaimed.
+    /// **Finality buffer — SECURITY CRITICAL.** `executed`/`cancelled`/`sentBy`
+    /// are read at `latest - block_confirmation`. A refund on the source chain is
+    /// irreversible once it pays out, and it is authorised solely on having read
+    /// `cancelled == true` on the destination. If that read is at the chain tip
+    /// (buffer 0) and the destination later reorgs the `cancel` away, the
+    /// original claim signatures become live again → the transfer is paid on the
+    /// destination AND refunded on the source (a double-spend of bridge
+    /// liquidity). This MUST exceed the destination chain's maximum reorg depth
+    /// (its finality). `Config::load` refuses to start with a 0 buffer unless
+    /// `allow_zero_confirmation` is set (only safe on instant-finality dev chains
+    /// such as anvil).
     #[serde(default)]
     pub block_confirmation: u64,
+    /// Opt out of the non-zero `block_confirmation` requirement. ONLY for
+    /// instant-finality local chains (anvil) that never reorg. Never set this
+    /// against a real network.
+    #[serde(default)]
+    pub allow_zero_confirmation: bool,
     /// Every destination chain this validator can independently verify. A
     /// transfer bound for a chain not listed here is never attested.
     #[serde(default)]
@@ -209,6 +224,36 @@ impl Config {
                         );
                     }
                 }
+            }
+
+            // SECURITY: a source-chain refund is irreversible and is authorised
+            // only on a destination `cancelled` read. Reading at the chain tip
+            // lets a destination reorg re-enable the original claim after the
+            // refund is signed → double-spend. Refuse to start at buffer 0 unless
+            // the operator explicitly opts out for an instant-finality dev chain.
+            if refund.block_confirmation == 0 && !refund.allow_zero_confirmation {
+                anyhow::bail!(
+                    "[refund] block_confirmation is 0 — refund attestations would read the \
+                     destination at the chain tip, so a reorg could enable a double-spend. \
+                     Set block_confirmation to exceed the destination chain's finality depth, \
+                     or set allow_zero_confirmation = true ONLY for an instant-finality dev \
+                     chain (e.g. anvil)."
+                );
+            }
+
+            // SECURITY / liveness: the refund timeout that stops validators from
+            // cancelling a still-deliverable transfer lives in the DB-backed
+            // eligibility sweep (indexer + sig-store). In file-store mode there is
+            // no such gate — refund_candidates would return every record and the
+            // loop would attest a cancel for fresh, undelivered transfers. Require
+            // the HTTP store for the refund path.
+            if cfg.store.url.is_none() {
+                anyhow::bail!(
+                    "[refund] requires an HTTP [store] (url = \"http://sig-store…\"): the \
+                     unclaimed-timeout gate is enforced by the DB-backed eligibility sweep, \
+                     which the local file store does not provide. Without it the loop would \
+                     cancel transfers before the keeper can deliver them."
+                );
             }
         }
 
