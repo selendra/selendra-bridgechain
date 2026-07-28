@@ -263,7 +263,7 @@ Cursor and per-corridor nonce state persist to `state_file` so a restart resumes
 
 An operator HTTP API (`validator/src/api.rs`) exposes `/status`, and `/pause`, `/resume`, `/rescan`, each optionally per chain.
 
-> **Known gaps.** A batch whose `handle_log` returns `Err` still advances the cursor, so that transfer is never signed and never retried. The `paused` flag is runtime-only and a restart clears it. `block_confirmation` defaults to 0 with no validation, and the `allow_zero_confirmation` key present in all three shipped configs is not a field on the config struct, so serde discards it silently. See `report.md` M2 and M4.
+> **Known gaps.** A batch whose `handle_log` returns `Err` still advances the cursor, so that transfer is never signed and never retried. The `paused` flag is runtime-only and a restart clears it. On a source chain `block_confirmation` defaults to 0 with no validation, and the `allow_zero_confirmation` key in the shipped `[source]` blocks is not a field on `SourceChain`, so serde discards it silently. The `[refund]` block of the same files sets the same key where it **is** a real field and **is** enforced. See `report.md` M2 and M4.
 
 ### 4.3 validator refund attestation
 
@@ -466,7 +466,7 @@ Requires Foundry, plus `forge install foundry-rs/forge-std@v1.9.4 OpenZeppelin/o
 If you touch `BridgeHash.sol`, run `forge test` **and** `cargo test --workspace`.
 The first regenerates the fixtures, the second checks Rust still agrees.
 
-> **Known gaps.** `forge coverage` does not run on this project (stack-too-deep at `Gate.sol:308`), so coverage has never been measured. The `scripts/testing/*.sh` suite is currently broken: the scripts resolve their root as `dirname/..`, but they live in `scripts/testing/`, so the path lands one directory short. See `report.md` L12 and section 8.2.
+> **Known gap.** `forge coverage` does not run on this project (stack-too-deep at `Gate.sol:308`), so coverage has never been measured. See `report.md` L12.
 
 ---
 
