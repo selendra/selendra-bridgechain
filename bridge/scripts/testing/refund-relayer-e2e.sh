@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Two-phase refund, driven by the REAL relayers (not cast).
 #
-# scripts/refund-e2e.sh proves the on-chain protocol by signing with `cast`.
+# scripts/testing/refund-e2e.sh proves the on-chain protocol by signing with `cast`.
 # This proves the off-chain automation actually wires together end to end:
 #
 #   indexer   observes Sent (records the locked token), sweeps a long-unclaimed
@@ -18,12 +18,12 @@
 # hand — the script only does the initial send() and then watches the sender get
 # made whole.
 #
-# Run from anywhere:  bash scripts/refund-relayer-e2e.sh
+# Run from anywhere:  bash scripts/testing/refund-relayer-e2e.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.e2e-logs"
 mkdir -p "$LOGS"

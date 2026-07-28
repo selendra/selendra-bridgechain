@@ -5,7 +5,7 @@
 #   * a solana-test-validator container listening on 127.0.0.1:8899, e.g.:
 #       docker run -d --name solana-node -p 8899:8899 -p 8900:8900 \
 #         solanalabs/solana:v1.18.26 solana-test-validator --ledger /tmp/ledger --quiet
-#   * the BPF program built:  bash scripts/build-solana.sh
+#   * the BPF program built:  bash scripts/testing/build-solana.sh
 #   * the WSL Solana CLI + a native (nvm) node toolchain installed.
 #
 # This deploys solana_gate.so, then drives tools/localnet/claim.mjs: create an SPL
@@ -14,7 +14,7 @@
 # signatures — asserting the SPL is released on-chain and a replay is rejected.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SOLANA_BIN="$HOME/.local/share/solana/install/active_release/bin"
 NODE_BIN="$HOME/.nvm/versions/node/v25.9.0/bin"
 export PATH="$SOLANA_BIN:$NODE_BIN:$HOME/.cargo/bin:$PATH"

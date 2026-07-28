@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for the React dashboard (bridge/web). Proves the whole
+# End-to-end smoke test for the React dashboard (frontend/). Proves the whole
 # wiring works without a browser:
 #   1. boot graphql-api against a seeded dir store
 #   2. boot the Vite dev server (which proxies /graphql -> the API)
@@ -7,14 +7,14 @@
 #   4. issue the exact stats/submissions/by-id queries the app sends, THROUGH the
 #      dev-server proxy, and assert the shapes the UI relies on come back
 #
-# Run from anywhere:  bash scripts/web-smoke.sh
+# Run from anywhere:  bash scripts/testing/web-smoke.sh
 set -euo pipefail
 
 # Native Linux node (nvm) — the Windows node on PATH can't handle WSL paths.
 export PATH="$HOME/.nvm/versions/node/v25.9.0/bin:$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WEB="$ROOT/web"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WEB="$ROOT/frontend"
 API_BIND=127.0.0.1:8093
 WEB_PORT=5199
 BASE="$(mktemp -d)"

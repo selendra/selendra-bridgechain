@@ -23,14 +23,14 @@
 #
 # Signatures are produced with `cast wallet sign` rather than by running the
 # validator, so the script tests the on-chain protocol directly and stays
-# independent of relayer timing. scripts/phase7.sh covers the relayer path.
+# independent of relayer timing. scripts/testing/phase7.sh covers the relayer path.
 #
-# Run from anywhere:  bash scripts/refund-e2e.sh
+# Run from anywhere:  bash scripts/testing/refund-e2e.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.refund-e2e-logs"
 mkdir -p "$LOGS"

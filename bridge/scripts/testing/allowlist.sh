@@ -4,14 +4,14 @@
 # truth; this is just curl with friendly subcommands.
 #
 # Usage:
-#   scripts/allowlist.sh tokens                              # list allowed tokens
-#   scripts/allowlist.sh add-token <chainId> <token> [sym]   # allow a token
-#   scripts/allowlist.sh del-token <chainId> <token>         # remove a token
-#   scripts/allowlist.sh chains                              # list allowed pairs
-#   scripts/allowlist.sh add-chain <from> <to>               # allow a chain pair
-#   scripts/allowlist.sh del-chain <from> <to>               # remove a chain pair
-#   scripts/allowlist.sh history                             # transaction history
-#   scripts/allowlist.sh seed                                # local-dev defaults
+#   scripts/testing/allowlist.sh tokens                              # list allowed tokens
+#   scripts/testing/allowlist.sh add-token <chainId> <token> [sym]   # allow a token
+#   scripts/testing/allowlist.sh del-token <chainId> <token>         # remove a token
+#   scripts/testing/allowlist.sh chains                              # list allowed pairs
+#   scripts/testing/allowlist.sh add-chain <from> <to>               # allow a chain pair
+#   scripts/testing/allowlist.sh del-chain <from> <to>               # remove a chain pair
+#   scripts/testing/allowlist.sh history                             # transaction history
+#   scripts/testing/allowlist.sh seed                                # local-dev defaults
 #
 # Env: SIG_STORE=http://127.0.0.1:8080 (override to point elsewhere).
 #      SIG_STORE_TOKEN=...  bearer token, sent if the server requires auth.

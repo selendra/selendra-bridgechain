@@ -16,9 +16,9 @@ set -euo pipefail
 
 export PATH="$HOME/.nvm/versions/node/v25.9.0/bin:$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
-WEB="$ROOT/web"
+WEB="$ROOT/frontend"
 LOG=/tmp/bridge-run
 mkdir -p "$LOG"
 
@@ -171,7 +171,7 @@ echo "=== boot graphql-api (live store + BOTH gates + mutations) ==="
 spawn "$ROOT/target/debug/graphql-api --bind $GQL_BIND --store-url $STORE_URL --threshold 2 --gate $SRC_CHAIN=$SRC_RPC,$GATE_SRC --gate $DST_CHAIN=$DST_RPC,$GATE_DST --allow-mutations" graphql-api.log
 for _ in $(seq 1 40); do curl -s "http://$GQL_BIND/health" >/dev/null 2>&1 && break; sleep 0.25; done
 
-echo "=== seed the frontend with the deployed addresses (web/.env.local) ==="
+echo "=== seed the frontend with the deployed addresses (frontend/.env.local) ==="
 cat > "$WEB/.env.local" <<ENV
 VITE_BRIDGE_CHAINS=[{"chainId":$SRC_CHAIN,"name":"Anvil A","rpcUrl":"$SRC_RPC","gate":"$GATE_SRC","token":"$TOKEN_SRC"},{"chainId":$DST_CHAIN,"name":"Anvil B","rpcUrl":"$DST_RPC","gate":"$GATE_DST","token":"$TOKEN_DST"}]
 ENV

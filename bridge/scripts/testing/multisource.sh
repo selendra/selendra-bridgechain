@@ -6,12 +6,12 @@
 #
 # Also smoke-tests the per-chain operator API (/status/<chain_id>).
 #
-# Run from anywhere:  bash scripts/multisource.sh
+# Run from anywhere:  bash scripts/testing/multisource.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 STORE="$ROOT/sig-store-data"
 LOGS="$ROOT/.e2e-logs"

@@ -7,12 +7,12 @@
 # validator-signed records: stats, filters, by-id, and meetsThreshold all track
 # live state. Also checks read-only mode, GraphiQL, health, and bad-query handling.
 #
-# Run from anywhere:  bash scripts/graphql-live.sh
+# Run from anywhere:  bash scripts/testing/graphql-live.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.e2e-logs"
 mkdir -p "$LOGS"

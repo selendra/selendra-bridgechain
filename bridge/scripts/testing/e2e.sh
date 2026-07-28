@@ -5,12 +5,12 @@
 # validator + keeper, performs a send() on the source chain, and asserts the
 # receiver is paid on the target chain (and that a replayed claim reverts).
 #
-# Run from anywhere:  bash scripts/e2e.sh
+# Run from anywhere:  bash scripts/testing/e2e.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 STORE="$ROOT/sig-store-data"
 LOGS="$ROOT/.e2e-logs"

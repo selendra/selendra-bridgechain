@@ -17,12 +17,12 @@
 # any mismatch in our reconstructed autoParams makes claim() revert — the test
 # self-validates the encoding.
 #
-# Run from anywhere:  bash scripts/xswap.sh
+# Run from anywhere:  bash scripts/testing/xswap.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.xswap-logs"
 mkdir -p "$LOGS"

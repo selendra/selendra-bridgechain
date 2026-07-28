@@ -7,12 +7,12 @@
 #   * pause actually halts processing; resume drains the backlog
 #
 # Validator-only: we boot just the source chain (the target need not exist for
-# the validator to scan/sign). Run from anywhere:  bash scripts/phase6.sh
+# the validator to scan/sign). Run from anywhere:  bash scripts/testing/phase6.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 STORE="$ROOT/sig-store-data-p6"
 LOGS="$ROOT/.e2e-logs"

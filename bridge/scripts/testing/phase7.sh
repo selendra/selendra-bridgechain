@@ -10,12 +10,12 @@
 #   * 1-of-3 SAFETY: a single signature never executes (keeper waits)
 #   * recovery: a 2nd validator comes back online -> threshold met -> claim
 #
-# Run from anywhere:  bash scripts/phase7.sh
+# Run from anywhere:  bash scripts/testing/phase7.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.e2e-logs"
 mkdir -p "$LOGS"

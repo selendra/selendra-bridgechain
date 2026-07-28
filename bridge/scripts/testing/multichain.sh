@@ -6,12 +6,12 @@
 # (watching A) and one multi-target keeper, then sends A->B and A->C and asserts
 # BOTH receivers are paid on their respective chains.
 #
-# Run from anywhere:  bash scripts/multichain.sh
+# Run from anywhere:  bash scripts/testing/multichain.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 STORE="$ROOT/sig-store-data"
 LOGS="$ROOT/.e2e-logs"

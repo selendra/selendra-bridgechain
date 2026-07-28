@@ -4,12 +4,12 @@
 # validator process survives. Pre-fix, C's RPC error propagated through the
 # JoinSet and exited the whole validator, silently stopping B too.
 #
-# Run from anywhere:  bash scripts/resilience.sh
+# Run from anywhere:  bash scripts/testing/resilience.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 STORE="$ROOT/sig-store-data"
 LOGS="$ROOT/.e2e-logs"

@@ -9,12 +9,12 @@
 #   3. a swap that would exceed the output token's locked reserve REVERTS
 #      (the "max swap up to token lock" rule).
 #
-# Run from anywhere:  bash scripts/swap.sh
+# Run from anywhere:  bash scripts/testing/swap.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.swap-logs"
 mkdir -p "$LOGS"

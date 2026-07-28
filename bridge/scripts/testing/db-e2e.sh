@@ -13,11 +13,11 @@
 #            restart), a fresh transfer of it now bridges and is claimed.
 #   CHECK 4  a NON-allowlisted CHAIN pair is BLOCKED the same way.
 #
-# Run from anywhere:  bash scripts/db-e2e.sh
+# Run from anywhere:  bash scripts/testing/db-e2e.sh
 set -euo pipefail
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.e2e-logs"
 mkdir -p "$LOGS"
@@ -138,7 +138,7 @@ echo "✅ sig-store healthy (connected to Postgres, schema applied)"
 
 echo "=== seeding allowlist: GOOD token + chain pair $SRC_CHAIN->$DST_CHAIN only ==="
 SIG_STORE="$STORE_URL" TOKEN="$TOKEN_GOOD" CHAIN_A=$SRC_CHAIN CHAIN_B=$DST_CHAIN \
-  bash "$ROOT/scripts/allowlist.sh" add-token $SRC_CHAIN "$TOKEN_GOOD" GOOD >/dev/null
+  bash "$ROOT/scripts/testing/allowlist.sh" add-token $SRC_CHAIN "$TOKEN_GOOD" GOOD >/dev/null
 curl -fsS -X POST "$STORE_URL/allowed/chains" -H 'content-type: application/json' \
   -d "{\"chain_id_from\":$SRC_CHAIN,\"chain_id_to\":$DST_CHAIN}" >/dev/null
 echo "  allowed tokens:"; curl -fsS "$STORE_URL/allowed/tokens"
@@ -212,7 +212,7 @@ echo "✅ non-allowlisted token attested by nobody → no record, no claim (fund
 
 echo
 echo "########## CHECK 3: allowlist the token (live) → next transfer bridges ##########"
-SIG_STORE="$STORE_URL" bash "$ROOT/scripts/allowlist.sh" add-token $SRC_CHAIN "$TOKEN_BAD" BAD >/dev/null
+SIG_STORE="$STORE_URL" bash "$ROOT/scripts/testing/allowlist.sh" add-token $SRC_CHAIN "$TOKEN_BAD" BAD >/dev/null
 echo "  added BAD token to allowlist; sending again"
 send "$TOKEN_BAD" $DST_CHAIN
 wait_status "$DID_BAD" claimed || fail "token did not bridge after being allowlisted"

@@ -8,12 +8,12 @@
 #   2. `swapQuote(...)` matches the on-chain `SwapPool.quote` (the pegged rate),
 #   3. an unconfigured chain / unlisted token degrades to null (never an error).
 #
-# Read-only: the API never executes a swap. Run from anywhere:  bash scripts/swap-gql.sh
+# Read-only: the API never executes a swap. Run from anywhere:  bash scripts/testing/swap-gql.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOGS="$ROOT/.swap-logs"; mkdir -p "$LOGS"
 STORE="$(mktemp -d)"                 # graphql-api needs a store even for pool reads

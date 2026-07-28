@@ -10,12 +10,12 @@
 #         expensive fields in one request) must be rejected by depth/complexity
 #         limits instead of fanning out to hundreds of store loads / RPC calls.
 #
-# Run from anywhere:  bash scripts/graphql-sec.sh
+# Run from anywhere:  bash scripts/testing/graphql-sec.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIND=127.0.0.1:8091
 URL="http://$BIND/graphql"
 BASE="$(mktemp -d)"

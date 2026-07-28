@@ -7,12 +7,12 @@
 # both receivers are paid on A. Demonstrates the topology is symmetric: any chain
 # can be a source as long as a validator watches it.
 #
-# Run from anywhere:  bash scripts/anytoany.sh
+# Run from anywhere:  bash scripts/testing/anytoany.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 STORE="$ROOT/sig-store-data"
 LOGS="$ROOT/.e2e-logs"

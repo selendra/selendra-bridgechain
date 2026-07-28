@@ -6,12 +6,12 @@
 # Self-contained: no anvil needed (the read path never touches a chain). Uses a
 # real signed record so the mutation's signature check has something valid to add.
 #
-# Run from anywhere:  bash scripts/graphql.sh
+# Run from anywhere:  bash scripts/testing/graphql.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOGS="$ROOT/.e2e-logs"; mkdir -p "$LOGS"
 STORE="$(mktemp -d)"
 BIND=127.0.0.1:8088

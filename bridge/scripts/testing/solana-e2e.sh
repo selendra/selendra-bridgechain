@@ -21,7 +21,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 echo "== [1/3] Foundry: EVM -> Solana send (32-byte receiver) =="
 ( cd contracts && forge test --match-contract "SolanaBridgeTest|SecurityTest|SendTest" )

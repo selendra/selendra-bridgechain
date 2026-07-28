@@ -13,7 +13,7 @@ set -euo pipefail
 SOLANA_BIN="$HOME/.local/share/solana/install/active_release/bin"
 PT_BIN="$HOME/.cache/solana/v1.41/platform-tools/rust/bin"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR/../crates/solana-gate"
+cd "$SCRIPT_DIR/../../crates/solana-gate"
 
 RUSTUP_CARGO() { PATH="$HOME/.cargo/bin:$PATH" cargo "$@"; }
 
