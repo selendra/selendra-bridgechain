@@ -12,7 +12,7 @@ The Solana counterpart of `contracts/src/Gate.sol`. Same protocol:
 ## Why it isn't in the host workspace
 
 Its `solana-program` / `spl-token` dependencies only compile for the Solana
-BPF/SBF target, so it is `exclude`d from `bridge/Cargo.toml`. **The logic here is
+BPF/SBF target, so it is `exclude`d from the workspace `Cargo.toml`. **The logic here is
 not hypothetical:** it is a syscall-based reimplementation of the
 [`bridge-solana`](../../crates/bridge-solana) crate, whose test suite proves the
 hash and signature verification byte-for-byte against `Gate.sol` and
@@ -26,15 +26,15 @@ needs (a current crates.io index otherwise pulls `edition2024` crates and a
 lockfile format the toolchain can't read):
 
 ```bash
-bash scripts/build-solana.sh          # -> target/deploy/solana_gate.so
+bash scripts/testing/build-solana.sh          # -> target/deploy/solana_gate.so
 
 # local cluster (Docker) + a real EVM->Solana claim, end to end:
 docker run -d --name solana-node -p 8899:8899 -p 8900:8900 \
   solanalabs/solana:v1.18.26 solana-test-validator --ledger /tmp/ledger --quiet
-bash scripts/solana-localnet-e2e.sh
+bash scripts/testing/solana-localnet-e2e.sh
 ```
 
-`solana-localnet-e2e.sh` deploys the `.so`, `Init`s the Config PDA with the
+`scripts/testing/solana-localnet-e2e.sh` deploys the `.so`, `Init`s the Config PDA with the
 validator set + threshold (the same EVM addresses the EVM gate trusts), pre-funds
 the vault, and submits a `Claim` with two real validator signatures — asserting
 on-chain release, replay rejection, and below-threshold refusal. **This has been

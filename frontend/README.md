@@ -8,7 +8,7 @@ Vite. No external asset/icon deps (all glyphs + icons are inline SVG).
 ## Run everything (backend + frontend)
 
 ```bash
-bash ../scripts/run-dev.sh
+bash ../scripts/testing/run-dev.sh
 ```
 
 That launches `graphql-api` on `127.0.0.1:8088` and the Vite dev server on
@@ -17,9 +17,9 @@ That launches `graphql-api` on `127.0.0.1:8088` and the Vite dev server on
 ### Frontend only
 
 ```bash
-npm install
-npm run dev        # http://localhost:5173, proxies /graphql -> :8088
-npm run build      # tsc -b + production bundle in dist/
+bun install
+bun run dev        # http://localhost:5173, proxies /graphql -> :8088
+bun run build      # tsc -b + production bundle in dist/
 ```
 
 The dev server proxies `/graphql` and `/health` to the backend (see

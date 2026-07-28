@@ -177,7 +177,7 @@ VITE_BRIDGE_CHAINS=[{"chainId":$SRC_CHAIN,"name":"Anvil A","rpcUrl":"$SRC_RPC","
 ENV
 
 echo "=== boot vite dev server ==="
-( cd "$WEB" && spawn "npx vite --host 127.0.0.1 --port 5173 --strictPort" web.log )
+( cd "$WEB" && spawn "bunx vite --host 127.0.0.1 --port 5173 --strictPort" web.log )
 for _ in $(seq 1 80); do curl -s "http://127.0.0.1:5173/" >/dev/null 2>&1 && break; sleep 0.3; done
 
 echo

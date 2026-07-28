@@ -1,12 +1,17 @@
 # On-Chain Swap for Bridge Tokens — Step-by-Step Plan
 
+> **Historical.** This is the plan the swap layer was built from, kept as a record
+> of intent. The line below saying no contract code is written yet was true when
+> this was drafted and is no longer: `SwapPool.sol` and `SwapRouter.sol` exist and
+> are tested. For the system as it stands, read [`../architecture.md`](../architecture.md).
+
 > A **same-chain** swap layer that lets a user exchange any bridge-registered
 > ERC-20 for any other on the same chain, priced against **one stablecoin as the
 > core unit of account**, with each token's throughput hard-capped by its locked
 > reserve. Built as a standalone `SwapPool` contract per chain, deliberately
 > structured so a **cross-chain router** can be layered on later without rework.
 >
-> Companion to [`BRIDGE_BUILD_PLAN.md`](./BRIDGE_BUILD_PLAN.md). Same rules:
+> Companion to [`bridge-build-plan.md`](./bridge-build-plan.md). Same rules:
 > every phase ends with a **✅ Verification Checkpoint** — a concrete test that
 > proves the step before you move on. Do not skip checkpoints. **This is a plan;
 > no contract code is written yet.**

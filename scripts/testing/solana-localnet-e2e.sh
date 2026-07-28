@@ -39,8 +39,8 @@ echo "programId $PROGRAM_ID"
 echo "== build ix helper =="
 ( cd "$ROOT" && cargo build -p bridge-solana --example gen_claim_ix --offline >/dev/null 2>&1 )
 
-echo "== npm deps =="
-[ -d "$ROOT/tools/localnet/node_modules" ] || ( cd "$ROOT/tools/localnet" && npm install --no-audit --no-fund >/dev/null 2>&1 )
+echo "== localnet deps =="
+[ -d "$ROOT/tools/localnet/node_modules" ] || ( cd "$ROOT/tools/localnet" && bun install >/dev/null 2>&1 )
 
 echo "== run claim =="
 node "$ROOT/tools/localnet/claim.mjs" "$PROGRAM_ID" "$ROOT/target/debug/examples/gen_claim_ix" "$KEY"

@@ -1,7 +1,12 @@
 # Building a Cross-Chain Bridge From the Ground Up — Step-by-Step Plan
 
-> A pragmatic, **incremental** plan to build an external-validator bridge based on
-> the architecture documented in [`BRIDGE_ARCHITECTURE.md`](./BRIDGE_ARCHITECTURE.md).
+> **Historical.** This is the plan the bridge was built from, kept as a record of
+> intent. It is not a description of the system as it stands - for that, read
+> [`../architecture.md`](../architecture.md), which is written from the sources.
+> Phases 0-8 are largely realised; where this document and the code disagree, the
+> code wins.
+
+> A pragmatic, **incremental** plan to build an external-validator bridge.
 > Every phase ends with a **✅ Verification Checkpoint** — a concrete test that
 > proves the step works before you move on. Do not skip checkpoints.
 

@@ -3,6 +3,8 @@ contracts/out
 contracts/cache
 contracts/broadcast
 contracts/lib
+frontend/node_modules
+frontend/dist
 .e2e-logs
 sig-store-data
 sig-store-data-p6
@@ -11,4 +13,9 @@ sig-store-data-p7
 *.json.tmp
 validator*.toml
 keeper*.toml
+# these carry inline private_key values; COPY . . would bake them into the
+# builder layer even though the runtime stage only copies the binaries.
+docker/configs/*.toml
+docs
+report.md
 .git

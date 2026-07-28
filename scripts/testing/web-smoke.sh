@@ -60,10 +60,10 @@ for i in $(seq 1 40); do curl -s "http://$API_BIND/health" >/dev/null 2>&1 && br
 curl -s "http://$API_BIND/health" | grep -q ok || fail "graphql-api did not come up"
 
 echo "=== install web deps (if needed) ==="
-[[ -d "$WEB/node_modules/vite" ]] || ( cd "$WEB" && npm install >/dev/null 2>&1 ) || fail "npm install failed"
+[[ -d "$WEB/node_modules/vite" ]] || ( cd "$WEB" && bun install >/dev/null 2>&1 ) || fail "bun install failed"
 
 echo "=== boot vite dev server (proxy -> $API_BIND) ==="
-( cd "$WEB" && GRAPHQL_API_URL="http://$API_BIND" npx vite --port "$WEB_PORT" --strictPort >"$BASE/web.log" 2>&1 ) & WEB_PID=$!
+( cd "$WEB" && GRAPHQL_API_URL="http://$API_BIND" bunx vite --port "$WEB_PORT" --strictPort >"$BASE/web.log" 2>&1 ) & WEB_PID=$!
 for i in $(seq 1 60); do curl -s "http://127.0.0.1:$WEB_PORT/" >/dev/null 2>&1 && break; sleep 0.3; done
 
 echo

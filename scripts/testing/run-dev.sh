@@ -58,8 +58,8 @@ disown || true
 
 # --- frontend: Vite dev server (proxies /graphql -> 127.0.0.1:8088) ---
 cd "$ROOT/frontend"
-[ -d node_modules ] || npm install --no-audit --no-fund
-setsid bash -c 'exec npx vite --host 0.0.0.0 --port 5173 --strictPort' \
+[ -d node_modules ] || bun install
+setsid bash -c 'exec bunx vite --host 0.0.0.0 --port 5173 --strictPort' \
   >"$LOG/web.log" 2>&1 < /dev/null &
 disown || true
 
