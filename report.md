@@ -1,155 +1,345 @@
-# SelendraBridge Status
+# SelendraBridge Remediation Brief
 
-Review date: 2026-07-28.
-Last updated: 2026-07-28, after the restructure.
-Source of truth is the code.
+Audit date: 2026-07-28
 
----
+Branch: `master` at `e8fb32a`
 
-## Where we are
+To: SelendraBridge development team
 
-The project now lives at the repo root.
-`bridge/` is gone except for an orphaned `target/` build cache that still needs deleting by hand.
+Assignment: implement and verify the remediation plan in this document.
 
-The cryptography is sound and locked by tests.
-Nothing in this report is a break in the hashing, the signature verification, or the trust boundary.
+Release decision: **do not deploy to production or public testnet with real
+funds until every P0 item is accepted.**
 
-Two high-severity defects are open, and both are wiring, not logic.
-A reverted `claim()` is recorded as successful (H1), and the shipped Docker stack cannot perform a refund because the indexer is not in it (H2).
+## What the development team must deliver
 
-Start at H1.
+Please implement the P0 work in the specified dependency order. Submit the work
+as reviewable PRs rather than one large patch. Each PR must include:
 
----
+- a regression test that fails before the fix and passes afterward;
+- the relevant unit, integration, and end-to-end verification output;
+- configuration and operations documentation updates;
+- migration or rollout instructions when persisted state, database schema, or
+  deployment topology changes;
+- a short statement identifying which acceptance criteria below are satisfied.
 
-## Done
+Do not close an item based only on compilation or existing green tests. The
+current suites do not exercise the critical Solana authorization boundary,
+chain reorgs, cursor fault recovery, concurrent first writes, or the actual
+compose refund topology.
 
-| Commit | What |
-| --- | --- |
-| `226a66f` | Fixed 22 test scripts whose `$ROOT` resolved one level short. Also `$ROOT/web` to `frontend/`, and the `allowlist.sh` cross-reference. |
-| `11bda89` | Moved the project out of `bridge/` to the repo root. 139 files, pure `git mv`. |
-| `ea8de0c` | Merged `.gitignore`, extended `.dockerignore`, corrected the README tree, merged the docs. |
-| `4231d0c` | Restored `_detect_ed2024.py`, `tools/localnet/`, and `chains.json`, deleted in `525b109` while still referenced. |
+## Executive status
 
-Findings closed by the above:
+The EVM hash/signature design has strong unit coverage, and the checked build
+baseline is green. The repository still has one critical authorization defect,
+five high-severity safety/liveness defects, and no CI gate.
 
-- **Section 3, doc fiction.** `docs/BRIDGE_ARCHITECTURE.md` deleted. `docs/architecture.md` written from the sources. `docs/operations.md` and `docs/README.md` are new. Build plans moved to `docs/history/`.
-- **L10, secrets in the build context.** `.dockerignore` now excludes `docker/configs/*.toml`, plus `frontend/node_modules`, `frontend/dist`, `docs`, `report.md`.
-- **Section 8.2, broken scripts.** All root resolution fixed.
-- **TODO 23, package manager.** `frontend/package-lock.json` replaced by `bun.lock`. Scripts use `bun`/`bunx`.
+The most important correction to the previous report is the Solana program.
+Its hashing and signature primitives are correct, but its `claim` instruction
+does not bind those checks to the canonical config or an asset-specific vault.
+That makes the deployable program unsafe even though the host-side Solana model
+passes.
 
-Correction to the original review:
+Do not deploy `solana-gate`. Keep the EVM bridge restricted to local development
+until the P0 list below is closed and the end-to-end suites have been rerun.
 
-- **M4 was half wrong.** `allow_zero_confirmation` is a real, enforced field on `[refund]`, and `Config::load` refuses to start at buffer 0 without it. Only the `[source]`-level key is silently discarded. Documented in `docs/operations.md` §3.1.
+## Scope and method
 
----
+Reviewed:
 
-## Open
+- Solidity bridge, refund, swap pool, router, deploy scripts, and Foundry tests
+- Rust validator, keeper, indexer, signature store, database, GraphQL API, and
+  host-side Solana model
+- deployable Solana program and local-validator driver
+- React wallet transaction construction, cross-chain flow state, API polling,
+  and production build
+- Docker image/compose wiring, shell scripts, configuration, documentation, and
+  repository test/CI surface
 
-### High
+This was a source audit plus local build/test verification. It was not a formal
+cryptographic audit, dependency-CVE audit, live-chain test, or penetration test.
 
-**H1. A reverted `claim()` is recorded as successful.**
-`crates/keeper/src/main.rs:393-405`.
-`try_claim` logs `receipt.status()` but never branches on it, then returns `Ok`, and the caller runs `mark_claimed`.
-`sweep_refund_eligible` (`bridge-db/src/lib.rs:774`) and `refund_candidates` (`:790`) both filter `status <> 'claimed'`, and nothing resets the column.
-A failed delivery is permanently excluded from refund.
-Fix: branch on `receipt.status()`, or delete the keeper's `mark_claimed` and let the indexer own that write from the observed `Claimed` event (`indexer/src/main.rs:221`).
+## Findings
 
-**H2. The shipped stack cannot refund.**
-`Dockerfile:7` builds `validator`, `keeper`, `sig-store` only.
-`indexer` is the sole writer of `refund_status` and is absent from the image and from compose, so no transfer ever becomes refund-eligible.
-`graphql-api` and the frontend are also absent, so the stack has no UI.
-Fix: add both to the Dockerfile and compose. Add a `USER` directive and `restart: unless-stopped` in the same pass.
+### CRITICAL C1 — Solana `claim` can use an attacker-controlled validator set
 
-### Medium
+**Evidence:** `crates/solana-gate/src/lib.rs:359-430`.
 
-| Id | Location | Defect |
+`process_claim` deserializes whichever `config_ai` the caller supplies. It never
+requires the canonical `["config"]` PDA or checks that the account is owned by
+the program. The same path has no `debridge_id -> mint/vault` registry and does
+not bind `vault` to the signed asset. It derives the global
+`["vault_authority"]` PDA but does not otherwise establish which SPL vault that
+authority may release.
+
+An attacker can supply config bytes containing their own validators and
+threshold, sign an invented claim, select an SPL token account controlled by the
+program's global vault-authority PDA, and direct its balance to the signed
+receiver. The SPL token program enforces mint equality and the PDA signature; it
+does not repair the missing bridge authorization or asset binding.
+
+The same canonical-config validation is absent from `send`, `set_validator`, and
+`set_threshold`. `emit_sent` also emits only the id and debridge id, not the
+fields a validator needs to reconstruct the event.
+
+**Required fix:** stop deployment; require the canonical program-owned config
+PDA on every instruction; add a program-owned asset/vault registry keyed by
+mint/debridge id; verify token program, vault, vault authority, receiver mint,
+and all writable owners. Make deployment and initialization atomic: today
+`process_init` has no intended-deployer authority, so the first caller to create
+the config PDA becomes owner. Replace the stale module documentation that says
+the authority is `["vault", mint]`; the code currently uses one global
+`["vault_authority"]`, which expands the blast radius to every vault.
+
+Add `solana-program-test` tests that first reproduce config takeover and the
+forged-config vault drain, then prove both fail. Repair the event/relayer
+incompatibility in H5 only after the `send` config boundary is secure.
+
+### HIGH H1 — source-chain finality defaults to zero and the apparent opt-in is discarded
+
+**Evidence:** `crates/validator/src/config.rs:93-115,177-260` and
+`docker/configs/val1.toml:8-9` (same shape in val2/val3).
+
+`SourceChain.block_confirmation` defaults to zero. Unlike the refund reader,
+startup does not reject zero confirmations. `SourceChain` has no
+`allow_zero_confirmation` field, while serde accepts unknown fields, so the
+shipped config's apparent explicit opt-in is silently ignored.
+
+On a reorg-capable source chain, validators can sign a `Sent` event at the tip,
+the keeper can release destination liquidity, and the source deposit can then
+disappear in a reorg.
+
+**Required fix:** add a real source-level opt-in intended only for local
+instant-finality chains, reject zero by default, and use
+`#[serde(deny_unknown_fields)]` on every operational config structure. Add
+config tests for omitted, misspelled, zero, and explicitly opted-in values.
+
+### HIGH H2 — a reverted EVM claim is persisted as claimed
+
+**Evidence:** `crates/keeper/src/main.rs:393-405`,
+`crates/keeper/src/main.rs:240-249`, and
+`crates/bridge-db/src/lib.rs:489-503,770-790`.
+
+`try_claim` logs the receipt status but returns success for status `0`. Its caller
+then calls the signature store's `mark_claimed` route. Refund eligibility and
+candidate queries exclude rows whose status is `claimed`, so a mined revert can
+permanently hide a stranded transfer from recovery. `mark_claimed` also changes
+an existing `refund_status = 'eligible'` back to `'none'`, actively undoing a
+recovery flag the indexer sweep may already have raised.
+
+`try_cancel` and `try_refund` also log success without checking receipt status.
+They do not directly advance the database lifecycle, but they produce false
+operator signals and retry only on a later poll.
+
+**Required fix:** treat a receipt with failed status as an error in all three
+paths. Prefer making the indexer the only writer of claimed/cancelled/refunded
+lifecycle state, based on observed on-chain events. Do not remove the keeper
+write until H4's indexer is actually built and running.
+
+### HIGH H3 — failed logs are skipped while cursors advance
+
+**Evidence:** `crates/indexer/src/main.rs:136-160,167-191` and
+`crates/validator/src/main.rs:224-244`.
+
+The indexer logs and suppresses both scan-level and per-log handler errors, then
+persists the end of the block range. The validator logs a `handle_log` error and
+also advances the range cursor. A transient database/store failure can therefore
+drop history or a validator signature permanently.
+
+This interacts badly with concurrent first writes to the signature database:
+`bridge-db` performs `SELECT` then plain `INSERT` for a new submission, so
+simultaneous validators can race on the primary key. A losing validator reports
+an error and the current scan loop never revisits that event.
+
+**Required fix:** a batch succeeds only when every relevant log is durably
+handled. Return errors instead of swallowing them, advance the cursor only after
+success, make first-write upserts race-safe, and add fault-injection/restart
+tests.
+
+### HIGH H4 — the shipped compose stack cannot run the advertised refund path
+
+**Evidence:** `Dockerfile:7,14-16` and `docker-compose.yml:14-99`.
+
+The image builds only validator, keeper, and signature store. Compose does not
+run the indexer, which is the only component that marks transfers refund
+eligible and records on-chain cancellation/refund state. The three validators
+therefore poll a candidate list that never becomes populated through the
+advertised stack.
+
+GraphQL and the frontend are also absent, so compose is not a complete runnable
+product surface. Containers run as root, have no restart policy, and expose
+Postgres and the signature store to the host with development credentials/token.
+
+**Required fix:** add indexer and GraphQL binaries/services, a frontend serving
+story, non-root runtime user, health-based dependencies, restart policies, and
+production-safe port/secret profiles. Prove claim and refund flows against the
+actual compose topology.
+
+### HIGH H5 — Solana `Sent` output and the relayer use incompatible protocols
+
+**Evidence:** `crates/solana-gate/src/lib.rs:482-492` and
+`crates/bridge-solana/src/relayer.rs:119-135`.
+
+The program emits binary program data with two fields:
+`sol_log_data([b"BRIDGE_SENT", id || debridge_id])`. The off-chain relayer does
+not decode that format. It looks for a text line shaped as
+`BRIDGE_SENT {json}` and expects the complete transfer record.
+
+Solana-to-EVM scanning is therefore non-functional today. The missing data is
+also why a validator could not independently reconstruct the submission id from
+the deployed program's event.
+
+**Required fix:** after C1's `send` config/account boundary is secured, define
+one versioned event wire format shared by the program and relayer, emit every
+hash-bound field plus the locked asset identity, and test the real transaction
+log decoder. Fixing the parser first would expose the insecure `send` path to
+live bridge signing.
+
+### MEDIUM findings
+
+| ID | Evidence | Risk and next change |
 | --- | --- | --- |
-| M1 | `validator/src/main.rs:399` | `u256_to_u64` saturates to `u64::MAX`. Two sends with `chainIdTo` above `2^64-1` collide in the nonce map and wedge the scanner. Costs an attacker two dust sends. Bound `chainIdTo` in `Gate.send` too. |
-| M2 | `indexer/src/main.rs:139-160` | Cursor advances past a failed scan. A transient RPC error drops an entire block range from the DB permanently. |
-| M2 | `validator/src/main.rs:225-244` | Same shape. A log that fails to sign is never revisited. |
-| M2 | `validator/src/state.rs:63,79,144` | `paused` is runtime-only. A validator that paused on an anomaly comes back unpaused after restart. |
-| M3 | `bridge-core/src/store.rs:233-253` | `verify_signature` does not check validator-set membership. Not fund-loss (the Gate counts `isValidator` on-chain), but the off-chain signature count is attacker-controlled. |
-| M4 | `validator/src/config.rs:93-115` | `SourceChain` has no `deny_unknown_fields` and no `allow_zero_confirmation`. `block_confirmation = 0` is accepted on any chain with no guard. |
-| M5 | `contracts/src/SwapPool.sol:222-237` | `setPrice` deviation cap is per call with no cooldown. N calls in one block walk the price N times. |
-| M6 | `frontend/src/components/BridgeView.tsx:286-301` | Cross-chain swap strands with no recovery. `pending` lives only in component memory, and `extractSent` matches the user-typed gate rather than `SwapRouter.gate()`. Data to rebuild it is already fetched in `api/client.ts:88-91` and discarded. |
-| M7 | `frontend/src/api/hooks.ts:33-57` | `usePoll`'s `run()` ignores the `alive` flag, so a superseded request can overwrite current data. |
-| M8 | `contracts/src/Gate.sol:40,227-246` | `setGuardian` is called nowhere in the repo, so `guardian` is `address(0)` in every deployment. Only `owner` can trip the breaker. |
+| M1 | `crates/validator/src/state.rs:16-23,61-80,117-125` | Pause state and reason are not serialized. Restarting after a nonce anomaly or hash mismatch silently unpauses the validator. Persist the safety stop and require an explicit operator resume. |
+| M2 | `crates/validator/src/main.rs:264-266,399-401`; `crates/indexer/src/main.rs:201-203` | `uint256` chain ids/nonces saturate to `u64::MAX`; database casts then use signed `BIGINT`. Reject out-of-range values on-chain and off-chain instead of aliasing them. |
+| M3 | `crates/bridge-core/src/store.rs:229-253`; `crates/keeper/src/main.rs:204,222` | The store authenticates signatures but does not know validator membership, while keeper prechecks count every distinct signer. Outsider signatures can trigger repeated reverting submissions. Pin validator sets per destination or verify membership before quorum counting. |
+| M4 | `contracts/src/SwapPool.sol:220-237` | The oracle's price-deviation cap is per call with no time/cumulative bound. A compromised oracle can walk the price arbitrarily in one block. Add a delay, epoch/cumulative bound, or independent oracle guard. |
+| M5 | `frontend/src/components/BridgeView.tsx:267-360` | Cross-chain finalize state exists only in React memory. A refresh/device change loses the recovery action. The event parser also searches the user-editable gate address even though the router's immutable gate is authoritative. Rebuild pending state from indexed history and use registry/on-chain addresses. |
+| M6 | `frontend/src/api/hooks.ts:26-59` | `usePoll.run` ignores effect generation and permits overlapping or superseded requests to overwrite current data. Add an abort/generation guard and avoid overlapping intervals. |
+| M7 | `contracts/src/Gate.sol:227-246`; `contracts/script/DeployXSwap.s.sol:52-54` | No repository deployment path appoints a guardian or enforces production validator/chain parameters. Demo scripts deploy threshold-one gates and unrestricted-mint assets without a chain-id guard. Create a production-only deployment script with post-deploy assertions. |
+| M8 | `contracts/src/Gate.sol:268-312,323-350` | Gate accounting assumes exact-transfer ERC-20s. Fee-on-transfer/rebasing assets can lock or release less than the signed amount and consume shared liquidity. Explicitly reject unsupported asset behavior or account by verified balance deltas and document the policy. |
 
-### Low
+### LOW findings and quality gaps
 
-| Id | Location | Defect |
-| --- | --- | --- |
-| L1 | `frontend/src/components/Dropdown.tsx:23` | Falls back to `options[0]` without telling the parent. Display and state can disagree. |
-| L2 | `frontend/src/components/BridgeView.tsx:125-150` | `decimals` not reset on token change. A fast submit mid-switch under-sends by `10^12`. |
-| L3 | `frontend/src/wallet/eth.ts:254-256` | `eth_sendTransaction` pins no `chainId`. A network switch mid-flow executes against the wrong chain's addresses. |
-| L4 | `frontend/src/wallet/eth.ts:372-386` | `extractSent` matches by address only, not `topics[0]`. Correct today; silent garbage the moment a second two-indexed event joins that path. |
-| L5 | `graphql-api/src/swap.rs:85-118` | `listed_tokens` does two `from_block(0)` `get_logs` per `pools()` query, on a 10s frontend poll. Most hosted RPCs will reject it. |
-| L6 | `graphql-api/src/swap.rs` | `max_swap_usd` returns `0` on overflow where the contract's `Math.mulDiv` returns a real number. UI shows "no capacity" for a funded pool. |
-| L7 | `crates/solana-gate` | No PDA/owner validation on `config_ai` outside `process_init`, no asset registry, no liquidity checks. `emit_sent` discards the data a validator needs. Excluded from the workspace and not on the live path, so it is a landmine, not a live hole. |
-| L8 | `bridge-solana/src/gate.rs:209-217` | Host model inserts into `executed` before the asset checks, so a failed claim burns the id. Real Solana would roll back. `tests/e2e.rs` asserts the wrong semantics. |
-| L9 | `contracts/src/Gate.sol:524-542` | `signatures.length` uncapped. Self-griefing only, since `claim` is permissionless and the attacker pays. |
-| L11 | `frontend/src/api/client.ts:98-127` | GraphQL args inlined as query-string literals. Not exploitable today (dropdown + hardcoded `100`), but `NaN` emits a broken query. |
-| L12 | `contracts/src/Gate.sol:308` | `forge coverage` fails with stack-too-deep, `--ir-minimum` too. Nobody can produce a coverage report. Scope the locals at the `emit Sent` site. |
-| L13 | `contracts/script/DeployXSwap.s.sol:52-54` | Deploys a threshold-1 gate and unrestricted-mint tokens with no `block.chainid` guard. `DeploySwap.s.sol` same. There is also no reviewed production Gate deploy path anywhere. |
+- `frontend/src/components/Dropdown.tsx:20-82` falls back visually to the first
+  option without updating parent state and implements only partial listbox
+  keyboard behavior.
+- `frontend/src/components/BridgeView.tsx:124-150` retains old decimals while a
+  new token read is pending; a fast submit can encode the wrong base amount.
+- `frontend/src/wallet/eth.ts:254-331` does not include/check a transaction chain
+  id immediately before wallet writes.
+- `frontend/src/wallet/eth.ts:363-386` does not match the `Sent` topic and trusts
+  fixed data offsets after matching only an address.
+- `crates/graphql-api/src/swap.rs:85-118` performs two genesis-to-tip log scans
+  whenever pool metadata is requested. Cache/index token-list state.
+- `crates/graphql-api/src/swap.rs` returns zero for `max_swap_usd` on intermediate
+  overflow where the contract's full-precision `mulDiv` can return a value.
+- `contracts/src/Gate.sol:524-542` does not cap signature-array length. This is
+  caller-paid grief rather than a vault compromise, but a sensible cap reduces
+  pathological RPC/estimation load.
+- `forge coverage` cannot compile `Gate.send` because of stack depth; the
+  `--ir-minimum` fallback fails with a Yul stack exception too.
+- There are no frontend tests, no database integration tests in the Rust test
+  suite, no deployable Solana program tests, no dependency vulnerability scan,
+  and no CI workflow.
 
-### Gaps, not defects
+## Required implementation plan
 
-- **No frontend tests at all.** `encodeSend`, `encodeFinalize`, `encodeAutoParamsTo`, `encodeSwapIntent`, `extractSent`, `parseUnits` are pure and trivial to test, and a wrong byte offset misdirects funds silently. Highest-value test work in the repo.
-- **No `eslint.config.mjs`.** Five `eslint-disable` comments currently suppress nothing.
-- **No error boundary.** A throw in any view blanks the page.
-- **Accessibility.** `Dropdown` is mouse-only, the detail drawer has no focus trap, Explorer rows are unreachable by keyboard.
-- **Contract coverage.** No test walks `setPrice` across repeated calls (M5), and none passes an out-of-range `chainIdTo` (M1).
-- **11 clippy warnings**, all cosmetic.
+### P0 — release blockers
 
----
+- [ ] **P0.1 — Solana authorization and initialization.** Reproduce C1 in
+  `solana-program-test`, make deploy+init atomic/authorized, and enforce canonical
+  config/asset/vault/token accounts. Acceptance: config front-running, forged
+  config, wrong config owner/PDA, wrong mint, wrong vault, wrong authority, wrong
+  token program, and replay all fail; a valid 2-of-3 claim passes.
+- [ ] **P0.2 — Source finality.** Fail closed on zero confirmations unless a real
+  source-level local-dev opt-in is present; reject unknown config keys.
+  Acceptance: config unit tests cover omissions and typos, and a reorg simulation
+  proves unconfirmed sends are never signed.
+- [ ] **P0.3 — Runnable topology.** Ship indexer, GraphQL, and frontend alongside
+  the existing services with non-root/restart/secret hardening. Acceptance: a
+  clean compose run proves one claim and one timed-out cancel-then-refund, with
+  history visible through GraphQL/UI.
+- [ ] **P0.4 — Receipt truth; start only after P0.3.** Reject failed receipts, then remove
+  keeper-authoritative claim lifecycle writes. Acceptance: a forced mined revert
+  remains retryable/refund-eligible; only an indexed `Claimed` event marks
+  success.
+- [ ] **P0.5 — Durable cursors.** Fail the whole batch on any handler/store/database
+  error and make concurrent database insertion idempotent.
+  Acceptance: injected failures followed by restart produce every expected row
+  and signature exactly once.
+- [ ] **P0.6 — Solana event protocol; start only after P0.1.** Implement one shared versioned
+  event encoder/decoder. Acceptance: a real program transaction is decoded into
+  every hash-bound field, independently recomputed, signed, and delivered to the
+  EVM test gate.
 
-## Next
+### P1 — safety and recovery
 
-1. H1. Branch on `receipt.status()`.
-2. H2. Add `indexer` and `graphql-api` to the Dockerfile and compose.
-3. M8 and L13. Set a guardian. Write a deploy script with post-deploy assertions (checklist in `docs/operations.md` §5).
-4. M2. Stop advancing cursors past failures, all three sites. Persist `paused`.
-5. M4. `deny_unknown_fields` on the validator config, and make `block_confirmation = 0` an explicit opt-in on sources as it already is on refunds.
-6. M1, M3, M7, M6, in that order.
-7. L12. Unblock `forge coverage`, then act on what it says.
-8. Frontend tests.
+- [ ] Persist validator pause state and add restart tests.
+- [ ] Reject chain ids/nonces outside the off-chain and database domains.
+- [ ] Count only configured validators toward off-chain quorum readiness.
+- [ ] Make cross-chain finalize recoverable after refresh and validate the actual
+  router/gate pair.
+- [ ] Add the production deployment script, guardian setup, multisig ownership,
+  chain-id guards, and post-deploy assertions.
+- [ ] Define and enforce the supported ERC-20 behavior policy.
 
----
+### P2 — engineering quality
 
-## Verification state
+- [ ] Add frontend unit tests for every calldata encoder/parser and integration
+  tests for wallet network changes, stale requests, refresh recovery, and failed
+  receipts.
+- [ ] Add database concurrency/lifecycle tests and sig-store API limits.
+- [ ] Unblock Solidity coverage and add tests for cumulative price movement and
+  out-of-range chain ids.
+- [ ] Add CI for formatting, clippy, Rust tests, Foundry tests/coverage, frontend
+  tests/build, compose validation, shell syntax, and the Solana program suite.
+- [ ] Add pinned dependency vulnerability scanning for Cargo and Bun.
+- [ ] Address accessibility, error-boundary, and GraphQL caching/pagination gaps.
 
-Run after the restructure, on this machine:
+## Required handoff evidence
+
+For each completed item, send the reviewer:
+
+1. the PR or commit range;
+2. the exact acceptance criteria addressed;
+3. the new regression-test name and the failure it reproduces;
+4. fresh test/build/end-to-end output;
+5. known limitations and any follow-up ticket;
+6. deployment, migration, and rollback instructions where applicable.
+
+The development team should not mark the bridge production-ready. Return the
+completed evidence for a second security review and release decision.
+
+## Verification baseline
+
+Run locally during this audit:
 
 | Check | Result |
 | --- | --- |
-| `cargo build --workspace` | clean |
-| `cargo test --workspace` | 40 passed, 0 failed. Same as the pre-move baseline. |
-| `cargo clippy --workspace --all-targets` | 11 warnings, all cosmetic, none new |
-| `bun install && bun run build` (frontend) | clean, 47 modules, 194 kB / 60.6 kB gzipped |
-| `docker compose config` | OK |
-| `git grep "bridge/"` | no hits outside `docs/history` |
+| `cargo test --workspace --all-targets` | 40 passed, 0 failed |
+| `forge test -vv` | 99 passed, 0 failed |
+| `bun run build` | passed; 47 modules, 194.00 kB JS / 60.61 kB gzip |
+| `cargo test --manifest-path crates/solana-gate/Cargo.toml --lib` | compiled; **0 tests**; 4 cfg warnings |
+| `cargo clippy --workspace --all-targets` | exit 0 with 11 non-blocking warnings |
+| `docker compose config --quiet` | passed |
+| `bash -n docker/deploy.sh scripts/testing/*.sh` | passed |
+| `forge coverage --report summary` | failed: stack too deep at `Gate.sol:308` |
+| `forge coverage --ir-minimum --report summary` | failed: Yul stack exception |
 
-Verified in the original review, not re-run since the move:
+Not run:
 
-| Check | Result |
-| --- | --- |
-| `forge test` | 99 tests, 8 suites, 0 failures. Foundry 1.7.1, forge-std v1.9.4, OZ v5.0.2. |
-| Solidity/Rust hash equivalence | Fixtures regenerated from Solidity byte-identical, Rust suites pass against them |
-| All 9 frontend selectors | Keccak-256 recomputed, 9/9 match |
-| Contract sizes | Largest is SwapRouter at 6,507 B, 18 KB under EIP-170 |
-| `forge build --force` | 2 warnings, both on test helpers, none in `src/` |
+- live Postgres/database integration scripts
+- Docker end-to-end flows
+- EVM multi-process end-to-end scripts
+- Solana SBF build and local-validator flow
+- dependency-CVE scans
 
-**Not verified, and this is the real gap.**
-Foundry is not installed on this machine, so no `scripts/testing/*.sh` has been run end to end since the restructure.
-`bash scripts/testing/e2e.sh` is the check that actually proves `226a66f`.
-Install Foundry and run it before trusting the scripts.
+Passing unit/build checks do not cover C1, reorg behavior, cursor fault recovery,
+database write races, or the shipped compose refund topology.
 
-Two scripts also need external toolchains nobody here has: `build-solana.sh` needs Solana 1.18 platform-tools, and `solana-localnet-e2e.sh` needs a `solana-test-validator` container plus a built `.so`.
-Their file dependencies are restored and their helper binary (`gen_claim_ix`) builds and emits the JSON shape `claim.mjs` expects, but neither script has been run.
+## Independent review
 
----
+Claude Code 2.1.220 independently read the report and referenced source. Its
+verdict:
 
-## Loose ends
+- confirmed C1 and H1-H4 with no severity downgrade;
+- identified H5 as a separate release blocker;
+- confirmed that C1 is a config/asset authorization failure, not receiver
+  redirection (the receiver itself is signature-bound);
+- required the H2 eligibility-reset detail, atomic Solana initialization, and
+  the P0.3-before-P0.4 dependency now recorded above;
+- judged the report safe to hand to the team after those corrections.
 
-- `bridge/target/` is an orphaned 4 GB build cache. Delete it once you trust the new root.
-- No production serving story for the frontend in compose. Dev relies on the Vite proxy; production needs same-origin serving or `VITE_API`.
+Claude could not rerun the build/test commands in its sandbox, so the verification
+table remains backed by the command output from this audit rather than by a
+second execution.
