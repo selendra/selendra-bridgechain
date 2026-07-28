@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Dropdown, type DropdownOption } from "./Dropdown";
 import { TxBanner, type TxState } from "./TxBanner";
 import { ArrowRight, Glyph, Help } from "./icons";
-import { chainViz, formatUnits, formatUnitsRaw, isAddress, parseUnits } from "../data/format";
+import { chainViz, formatUnits, formatUnitsRaw, isAddress, parseUnits, shortHex } from "../data/format";
 import { fetchSubmission, fetchSwapPool, fetchSwapQuote } from "../api/client";
 import { useDebounced, usePoll } from "../api/hooks";
 import {
@@ -99,9 +99,13 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
     [chains, finalizeChainId]
   );
 
-  // Prefill token/gate/router from the registry for the source chain, when it pins them.
+  // Prefill token/gate/router from the registry for the source chain. When the
+  // source chain changes, reset the token to that chain's primary (first listed)
+  // asset so the picker and the address field stay in sync; the user can still
+  // pick another from the dropdown or type a custom address.
   useEffect(() => {
-    if (fromReg?.token && !token) setToken(fromReg.token);
+    const primary = fromReg?.tokens?.[0]?.address ?? fromReg?.token ?? "";
+    if (primary) setToken(primary);
     if (fromReg?.gate && !gate) setGate(fromReg.gate);
     if (fromReg?.router && !router) setRouter(fromReg.router);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -468,6 +472,21 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
       <div className="fields">
         <label className="field">
           <span className="field__label">Token (ERC-20 on {fromName})</span>
+          {fromReg && fromReg.tokens.length > 0 && (
+            <div className="token-picker">
+              <Dropdown
+                variant="token"
+                value={fromReg.tokens.some((t) => eqAddr(t.address, token)) ? token.toLowerCase() : ""}
+                options={fromReg.tokens.map((t) => ({
+                  value: t.address.toLowerCase(),
+                  label: t.symbol,
+                  glyph: <span className="token-glyph">{t.symbol.slice(0, 3).toUpperCase()}</span>,
+                  sub: shortHex(t.address, 6, 4),
+                }))}
+                onChange={(v) => setToken(v)}
+              />
+            </div>
+          )}
           <input
             className={`field__input mono${token && !tokenOk ? " field__input--bad" : ""}`}
             placeholder="0x…"

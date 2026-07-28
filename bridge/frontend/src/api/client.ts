@@ -40,7 +40,9 @@ export async function health(): Promise<boolean> {
 // --- bridge / signature store -------------------------------------------
 
 export function fetchChains(): Promise<Chain[]> {
-  return gql<{ chains: Chain[] }>(`{ chains { chainId name rpcUrl gate token router } }`).then((d) => d.chains);
+  return gql<{ chains: Chain[] }>(
+    `{ chains { chainId name rpcUrl gate token tokens { symbol address } router } }`,
+  ).then((d) => d.chains);
 }
 
 export function fetchStats(): Promise<Stats> {

@@ -30,12 +30,26 @@ pub struct ChainInfo {
     pub rpc_url: Option<String>,
     #[serde(default)]
     pub gate: Option<String>,
+    /// Default ERC-20 to prefill when bridging from this chain (the primary
+    /// asset). Kept for back-compat; `tokens[0]` supersedes it when present.
     #[serde(default)]
     pub token: Option<String>,
+    /// All ERC-20s that can be bridged from this chain, so the UI can offer a
+    /// token picker instead of a single prefilled address. Empty when unset.
+    #[serde(default)]
+    pub tokens: Vec<TokenInfo>,
     /// Deployed `SwapRouter` on this chain, for cross-chain-swap (Phase F). Like
     /// `gate`/`token`, optional and re-deployed fresh by local scripts each run.
     #[serde(default)]
     pub router: Option<String>,
+}
+
+/// One bridgeable token on a chain (symbol + address), served to the UI.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TokenInfo {
+    pub symbol: String,
+    /// `0x`-prefixed ERC-20 address on this chain.
+    pub address: String,
 }
 
 /// Load the chain registry from a JSON file (an array of [`ChainInfo`]).

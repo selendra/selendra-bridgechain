@@ -36,3 +36,7 @@ contracts/broadcast
 
 # deps are vendored by forge install; keep lib out of git
 contracts/lib
+
+# scripts/run.sh — frontend env override (if written) and local config copies
+frontend/.env.local
+scripts/run.config.local

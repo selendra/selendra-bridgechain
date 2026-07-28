@@ -18,8 +18,16 @@ use serde::{Deserialize, Serialize};
 pub struct Persist {
     /// Last block whose logs were fully processed (resume from `last_block + 1`).
     pub last_block: u64,
-    /// Per-target-chain (`chainIdTo`) last accepted nonce.
-    pub nonces: BTreeMap<u64, u64>,
+    /// Last accepted nonce, keyed by **(source chain, target chain)**.
+    ///
+    /// The on-chain nonce is `nonceTo[chainIdTo]` on each SOURCE gate, so every
+    /// source produces its own 0,1,2,… sequence toward a given destination. In a
+    /// mesh where two sources bridge to the same destination, both legitimately
+    /// emit nonce 0 for that `chainIdTo` — keying by `chain_to` alone would flag
+    /// the second as a duplicate and wrongly pause. The sequence is unique per
+    /// `(chain_from, chain_to)` (both are bound into the submissionId), so that
+    /// is the key. Serialized as `{ "<from>": { "<to>": <nonce> } }`.
+    pub nonces: BTreeMap<u64, BTreeMap<u64, u64>>,
 }
 
 /// What the nonce checker decides for a freshly seen event.
@@ -36,8 +44,8 @@ pub enum NonceDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PauseReason {
     Operator,
-    MissedNonce { chain_to: u64, expected: u64, got: u64 },
-    DuplicatedNonce { chain_to: u64, last: u64, got: u64 },
+    MissedNonce { chain_from: u64, chain_to: u64, expected: u64, got: u64 },
+    DuplicatedNonce { chain_from: u64, chain_to: u64, last: u64, got: u64 },
     IdMismatch { submission_id: String },
 }
 
@@ -45,11 +53,11 @@ impl PauseReason {
     pub fn as_str(&self) -> String {
         match self {
             PauseReason::Operator => "operator".into(),
-            PauseReason::MissedNonce { chain_to, expected, got } => {
-                format!("MISSED_NONCE chain_to={chain_to} expected={expected} got={got}")
+            PauseReason::MissedNonce { chain_from, chain_to, expected, got } => {
+                format!("MISSED_NONCE chain_from={chain_from} chain_to={chain_to} expected={expected} got={got}")
             }
-            PauseReason::DuplicatedNonce { chain_to, last, got } => {
-                format!("DUPLICATED_NONCE chain_to={chain_to} last={last} got={got}")
+            PauseReason::DuplicatedNonce { chain_from, chain_to, last, got } => {
+                format!("DUPLICATED_NONCE chain_from={chain_from} chain_to={chain_to} last={last} got={got}")
             }
             PauseReason::IdMismatch { submission_id } => {
                 format!("ID_MISMATCH submission_id={submission_id}")
@@ -70,11 +78,19 @@ impl Runtime {
     /// (the first block we'd scan is `last_block + 1`, so seed `last_block`
     /// with `start_block.saturating_sub(1)`).
     pub fn load_or_init(path: &Path, start_block: u64) -> anyhow::Result<Self> {
+        let fresh = || Persist { last_block: start_block.saturating_sub(1), nonces: BTreeMap::new() };
         let persist = if path.exists() {
             let raw = std::fs::read_to_string(path)?;
-            serde_json::from_str(&raw)?
+            // Tolerate an unreadable/old-format state file: re-scanning from
+            // start_block is safe (signing is idempotent — the store dedups by
+            // signer), whereas hard-failing would brick the validator. This also
+            // covers the pre-mesh `nonces: {"<to>": n}` format transparently.
+            serde_json::from_str(&raw).unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "unreadable state file; starting fresh");
+                fresh()
+            })
         } else {
-            Persist { last_block: start_block.saturating_sub(1), nonces: BTreeMap::new() }
+            fresh()
         };
         Ok(Self { persist, paused: false, pause_reason: None, path: path.to_path_buf() })
     }
@@ -97,21 +113,27 @@ impl Runtime {
         Ok(())
     }
 
-    /// Decide whether `nonce` (for target chain `chain_to`) is the expected next
-    /// one. Pure — does not mutate; call [`Runtime::accept_nonce`] on Accept.
-    pub fn check_nonce(&self, chain_to: u64, nonce: u64) -> NonceDecision {
-        match self.persist.nonces.get(&chain_to) {
-            // First event ever seen for this target chain: accept (we may be
-            // resuming mid-stream; the gap-from-genesis is not meaningful here).
+    /// Last accepted nonce for a `(chain_from, chain_to)` pair, if any.
+    pub fn last_nonce(&self, chain_from: u64, chain_to: u64) -> Option<u64> {
+        self.persist.nonces.get(&chain_from).and_then(|m| m.get(&chain_to)).copied()
+    }
+
+    /// Decide whether `nonce` for the `(chain_from, chain_to)` corridor is the
+    /// expected next one. Pure — does not mutate; call [`Runtime::accept_nonce`]
+    /// on Accept.
+    pub fn check_nonce(&self, chain_from: u64, chain_to: u64, nonce: u64) -> NonceDecision {
+        match self.last_nonce(chain_from, chain_to) {
+            // First event ever seen for this corridor: accept (we may be resuming
+            // mid-stream; the gap-from-genesis is not meaningful here).
             None => NonceDecision::Accept,
-            Some(&last) if nonce == last + 1 => NonceDecision::Accept,
-            Some(&last) if nonce <= last => NonceDecision::Duplicated,
+            Some(last) if nonce == last + 1 => NonceDecision::Accept,
+            Some(last) if nonce <= last => NonceDecision::Duplicated,
             Some(_) => NonceDecision::Missed,
         }
     }
 
-    pub fn accept_nonce(&mut self, chain_to: u64, nonce: u64) {
-        self.persist.nonces.insert(chain_to, nonce);
+    pub fn accept_nonce(&mut self, chain_from: u64, chain_to: u64, nonce: u64) {
+        self.persist.nonces.entry(chain_from).or_default().insert(chain_to, nonce);
     }
 
     pub fn pause(&mut self, reason: PauseReason) {
@@ -147,53 +169,73 @@ mod tests {
         }
     }
 
+    // corridor 1337 -> 1338 in these tests unless noted
+    const FROM: u64 = 1337;
+    const TO: u64 = 1338;
+
     #[test]
     fn first_event_for_chain_is_accepted() {
         let r = rt();
-        assert_eq!(r.check_nonce(1338, 0), NonceDecision::Accept);
-        assert_eq!(r.check_nonce(1338, 7), NonceDecision::Accept);
+        assert_eq!(r.check_nonce(FROM, TO, 0), NonceDecision::Accept);
+        assert_eq!(r.check_nonce(FROM, TO, 7), NonceDecision::Accept);
     }
 
     #[test]
     fn sequential_nonces_accept_then_advance() {
         let mut r = rt();
-        assert_eq!(r.check_nonce(1338, 0), NonceDecision::Accept);
-        r.accept_nonce(1338, 0);
-        assert_eq!(r.check_nonce(1338, 1), NonceDecision::Accept);
-        r.accept_nonce(1338, 1);
-        assert_eq!(r.check_nonce(1338, 2), NonceDecision::Accept);
+        assert_eq!(r.check_nonce(FROM, TO, 0), NonceDecision::Accept);
+        r.accept_nonce(FROM, TO, 0);
+        assert_eq!(r.check_nonce(FROM, TO, 1), NonceDecision::Accept);
+        r.accept_nonce(FROM, TO, 1);
+        assert_eq!(r.check_nonce(FROM, TO, 2), NonceDecision::Accept);
     }
 
     #[test]
     fn gap_is_missed() {
         let mut r = rt();
-        r.accept_nonce(1338, 0);
-        assert_eq!(r.check_nonce(1338, 2), NonceDecision::Missed);
+        r.accept_nonce(FROM, TO, 0);
+        assert_eq!(r.check_nonce(FROM, TO, 2), NonceDecision::Missed);
     }
 
     #[test]
     fn replay_is_duplicated() {
         let mut r = rt();
-        r.accept_nonce(1338, 5);
-        assert_eq!(r.check_nonce(1338, 5), NonceDecision::Duplicated);
-        assert_eq!(r.check_nonce(1338, 3), NonceDecision::Duplicated);
+        r.accept_nonce(FROM, TO, 5);
+        assert_eq!(r.check_nonce(FROM, TO, 5), NonceDecision::Duplicated);
+        assert_eq!(r.check_nonce(FROM, TO, 3), NonceDecision::Duplicated);
     }
 
     #[test]
     fn nonces_are_independent_per_target_chain() {
         let mut r = rt();
-        r.accept_nonce(1338, 4);
+        r.accept_nonce(FROM, TO, 4);
         // a different target chain starts fresh
-        assert_eq!(r.check_nonce(9999, 0), NonceDecision::Accept);
+        assert_eq!(r.check_nonce(FROM, 9999, 0), NonceDecision::Accept);
         // and 1338 still enforces sequence
-        assert_eq!(r.check_nonce(1338, 6), NonceDecision::Missed);
+        assert_eq!(r.check_nonce(FROM, TO, 6), NonceDecision::Missed);
+    }
+
+    #[test]
+    fn nonces_are_independent_per_source_chain() {
+        // THE mesh case: two sources bridging to the SAME destination each run
+        // their own 0,1,2,… sequence and must not collide.
+        let mut r = rt();
+        r.accept_nonce(1337, TO, 0);
+        // a second source to the same destination legitimately starts at 0
+        assert_eq!(r.check_nonce(1339, TO, 0), NonceDecision::Accept);
+        r.accept_nonce(1339, TO, 0);
+        // each corridor keeps its own sequence
+        assert_eq!(r.check_nonce(1337, TO, 1), NonceDecision::Accept);
+        assert_eq!(r.check_nonce(1339, TO, 1), NonceDecision::Accept);
+        // and a genuine replay within a corridor is still caught
+        assert_eq!(r.check_nonce(1337, TO, 0), NonceDecision::Duplicated);
     }
 
     #[test]
     fn rescan_resets_cursor_and_nonces() {
         let mut r = rt();
         r.persist.last_block = 100;
-        r.accept_nonce(1338, 9);
+        r.accept_nonce(FROM, TO, 9);
         r.pause(PauseReason::Operator);
         r.rescan_from(50);
         assert_eq!(r.next_block(), 50);

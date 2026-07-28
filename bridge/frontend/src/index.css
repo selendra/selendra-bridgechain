@@ -533,6 +533,25 @@ body {
   font-size: 17px;
 }
 
+/* bridge token picker: dropdown sits above the address input */
+.token-picker {
+  margin-bottom: 8px;
+}
+.token-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: var(--surface);
+  color: var(--muted);
+  border: 1px solid var(--line-2);
+}
+
 .dd__chev {
   color: var(--muted-2);
 }

@@ -2,12 +2,20 @@
 
 export type SubmissionStatus = "PENDING" | "READY" | "EXECUTED" | "CANCELLED" | "UNKNOWN";
 
+export interface TokenRef {
+  symbol: string;
+  address: string;
+}
+
 export interface Chain {
   chainId: number;
   name: string;
   rpcUrl: string | null;
   gate: string | null;
+  /** Default/primary bridgeable token (back-compat; `tokens[0]` supersedes). */
   token: string | null;
+  /** All bridgeable tokens on this chain, for the token picker. May be empty. */
+  tokens: TokenRef[];
   /** Deployed SwapRouter on this chain, for cross-chain swap. Null if unset. */
   router: string | null;
 }

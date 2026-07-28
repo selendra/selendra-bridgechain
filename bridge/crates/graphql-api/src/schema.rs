@@ -51,8 +51,19 @@ pub struct Chain {
     pub gate: Option<String>,
     /// Default ERC-20 to prefill when bridging from this chain. Null if unset.
     pub token: Option<String>,
+    /// All ERC-20s that can be bridged from this chain (for the UI's token
+    /// picker). Empty when the registry doesn't list any.
+    pub tokens: Vec<Token>,
     /// Deployed `SwapRouter` on this chain, for cross-chain-swap. Null if unset.
     pub router: Option<String>,
+}
+
+/// One bridgeable token on a chain.
+#[derive(SimpleObject)]
+pub struct Token {
+    pub symbol: String,
+    /// `0x`-prefixed ERC-20 address on this chain.
+    pub address: String,
 }
 
 impl From<ChainInfo> for Chain {
@@ -63,6 +74,11 @@ impl From<ChainInfo> for Chain {
             rpc_url: c.rpc_url,
             gate: c.gate,
             token: c.token,
+            tokens: c
+                .tokens
+                .into_iter()
+                .map(|t| Token { symbol: t.symbol, address: t.address })
+                .collect(),
             router: c.router,
         }
     }

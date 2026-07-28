@@ -262,25 +262,29 @@ async fn handle_log(
     let ev = &decoded.data;
 
     let emitted_id: B256 = ev.submissionId;
+    let chain_from = u256_to_u64(ev.chainIdFrom);
     let chain_to = u256_to_u64(ev.chainIdTo);
     let nonce = u256_to_u64(ev.nonce);
 
-    // Sequential-nonce enforcement (mirrors NonceControllingService).
+    // Sequential-nonce enforcement (mirrors NonceControllingService). The nonce
+    // sequence is per (chain_from, chain_to): each source gate runs its own
+    // nonceTo[chainIdTo], so distinct sources reach the same destination with
+    // independent 0,1,2,… — a mesh corridor, not a duplicate.
     {
         let mut rt = runtime.lock().await;
-        match rt.check_nonce(chain_to, nonce) {
+        match rt.check_nonce(chain_from, chain_to, nonce) {
             NonceDecision::Accept => {}
             NonceDecision::Missed => {
-                let expected = rt.persist.nonces.get(&chain_to).map(|n| n + 1).unwrap_or(0);
-                warn!(chain_to, expected, got = nonce, "MISSED_NONCE — pausing scanner");
-                rt.pause(PauseReason::MissedNonce { chain_to, expected, got: nonce });
+                let expected = rt.last_nonce(chain_from, chain_to).map(|n| n + 1).unwrap_or(0);
+                warn!(chain_from, chain_to, expected, got = nonce, "MISSED_NONCE — pausing scanner");
+                rt.pause(PauseReason::MissedNonce { chain_from, chain_to, expected, got: nonce });
                 let _ = rt.save();
                 return Ok(false);
             }
             NonceDecision::Duplicated => {
-                let last = rt.persist.nonces.get(&chain_to).copied().unwrap_or(0);
-                warn!(chain_to, last, got = nonce, "DUPLICATED_NONCE — pausing scanner");
-                rt.pause(PauseReason::DuplicatedNonce { chain_to, last, got: nonce });
+                let last = rt.last_nonce(chain_from, chain_to).unwrap_or(0);
+                warn!(chain_from, chain_to, last, got = nonce, "DUPLICATED_NONCE — pausing scanner");
+                rt.pause(PauseReason::DuplicatedNonce { chain_from, chain_to, last, got: nonce });
                 let _ = rt.save();
                 return Ok(false);
             }
@@ -308,7 +312,6 @@ async fn handle_log(
     // reach threshold and be claimed.
     if let Some(allow) = allowlist {
         let debridge_hex = format!("{:#x}", ev.debridgeId);
-        let chain_from = u256_to_u64(ev.chainIdFrom);
         if !allow.token_allowed(&debridge_hex) || !allow.chain_allowed(chain_from, chain_to) {
             warn!(
                 submission_id = %emitted_id,
@@ -317,7 +320,7 @@ async fn handle_log(
                 chain_to,
                 "BLOCKED by allowlist — withholding signature (nonce advanced)"
             );
-            runtime.lock().await.accept_nonce(chain_to, nonce);
+            runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
             return Ok(true);
         }
     }
@@ -348,7 +351,7 @@ async fn handle_log(
         .await?;
 
     // Record the accepted nonce only after a successful sign+store.
-    runtime.lock().await.accept_nonce(chain_to, nonce);
+    runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
 
     info!(
         submission_id = %emitted_id,

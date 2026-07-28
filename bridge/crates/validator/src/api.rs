@@ -48,7 +48,8 @@ struct StatusResponse {
     pause_reason: Option<String>,
     last_block: u64,
     next_block: u64,
-    nonces: BTreeMap<u64, u64>,
+    /// Last accepted nonce per corridor: `{ "<chain_from>": { "<chain_to>": n } }`.
+    nonces: BTreeMap<u64, BTreeMap<u64, u64>>,
 }
 
 #[derive(Deserialize)]
