@@ -322,11 +322,19 @@ impl Db {
                 .await?;
             }
         } else {
+            // ON CONFLICT makes the first-insert concurrency-safe: when several
+            // validators POST the same brand-new submissionId at once they all
+            // SELECT no existing row and race here. Without this the loser hits a
+            // duplicate-key error (a 500 that drops its signature). The id⇄params
+            // binding guarantees any existing row has identical params, so the
+            // conflict path only ever backfills `token` (never other fields).
             sqlx::query(
                 "INSERT INTO submissions \
                  (submission_id, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
                   receiver, auto_params, native_sender, token) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+                 ON CONFLICT (submission_id) DO UPDATE \
+                   SET token = COALESCE(submissions.token, EXCLUDED.token)",
             )
             .bind(&id)
             .bind(record.debridge_id.to_ascii_lowercase())

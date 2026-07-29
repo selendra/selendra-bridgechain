@@ -7,6 +7,29 @@ On-chain gate in **Solidity**; off-chain validator + keeper + sig-store in **Rus
 Start with [`docs/architecture.md`](docs/architecture.md) — it describes the system
 as built, from the sources.
 
+## Quick start — run the whole stack
+
+One config file, one command. Brings up two chains, deploys + wires the gates
+(and a SwapPool), and starts Postgres + sig-store + validators + keeper +
+indexer + refund loop + the GraphQL backend + the React frontend:
+
+```bash
+bash scripts/run.sh          # edit scripts/run.config first to taste
+# open http://localhost:5173   (Bridge + Swap views, live)
+bash scripts/stop.sh         # tear it all down
+```
+
+Everything is driven by [`scripts/run.config`](scripts/run.config): chains and
+RPCs (local anvil or your own), validator keys + threshold, ports, and feature
+toggles (`ENABLE_SWAP` / `ENABLE_INDEXER` / `ENABLE_REFUND`). Point it at an
+existing deployment with `LOCAL_ANVIL=false` / `DEPLOY=false` and the `*_ADDR`
+fields. Generated per-service configs and logs land in `RUN_DIR` (default
+`/tmp/bridge-run`). Re-running is idempotent (it stops the previous run first).
+The MetaMask network + import details are printed at the end.
+
+> `scripts/testing/` holds the phase/e2e demos (`e2e.sh`, `phase7.sh`,
+> `refund-relayer-e2e.sh`, …); `scripts/run.sh` is the everyday launcher.
+
 ```
 .
 ├── contracts/                # Foundry: Gate, BridgeHash, SwapPool, SwapRouter + tests
