@@ -7,6 +7,9 @@ bundlr_wallet.json
 # rust — bare, so it also covers crates/solana-gate/target (built out of workspace)
 target
 
+# old pre-move project root; nothing should live here anymore (moved to repo root)
+/bridge/
+
 # node
 node_modules/
 dist/
