@@ -29,28 +29,39 @@ export function usePoll<T>(fn: () => Promise<T>, deps: unknown[], intervalMs = 4
   const [loading, setLoading] = useState(true);
   const fnRef = useRef(fn);
   fnRef.current = fn;
+  // Monotonic generation. Every run() bumps it and captures its own value; only
+  // the newest run may write state. Without this, a slow request (or one from a
+  // previous deps-arming) could resolve after a fresher one and clobber current
+  // data with stale results — a flicker or a wrong-filter view.
+  const genRef = useRef(0);
 
   const run = useCallback(async () => {
+    const myGen = ++genRef.current;
     try {
       const d = await fnRef.current();
+      if (genRef.current !== myGen) return; // superseded by a newer run
       setData(d);
       setError(null);
     } catch (e) {
+      if (genRef.current !== myGen) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      // Only the newest run clears loading (interval ticks don't re-raise it, so
+      // the spinner shows on the initial arming, not on every background poll).
+      if (genRef.current === myGen) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    let alive = true;
     setLoading(true);
-    run();
     const id = setInterval(() => {
-      if (alive && document.visibilityState !== "hidden") run();
+      if (document.visibilityState !== "hidden") run();
     }, intervalMs);
+    run();
     return () => {
-      alive = false;
+      // Re-arming (deps changed) or unmount supersedes any in-flight request:
+      // bumping the generation makes an older resolve a no-op.
+      genRef.current++;
       clearInterval(id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

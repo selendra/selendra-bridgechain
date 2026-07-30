@@ -361,19 +361,32 @@ export async function waitReceipt(req: Eip1193Request, hash: string, timeoutMs =
 }
 
 /**
+ * topic0 of the Gate's `Sent` event:
+ *   keccak256("Sent(bytes32,bytes32,uint256,uint256,uint256,bytes,uint256,bytes,bytes,address)")
+ * Hardcoded because the frontend carries no keccak implementation. If the `Sent`
+ * signature ever changes, recompute with:
+ *   cast keccak "Sent(bytes32,bytes32,uint256,uint256,uint256,bytes,uint256,bytes,bytes,address)"
+ */
+const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898a1f2bbb";
+
+/**
  * Pull `{submissionId, debridgeId, amount, nonce}` out of the `Sent` event the
- * Gate emits during `swapAndBridge` (or a plain `send`). We only need the log's
- * `address` to find it (the Gate emits exactly one `Sent` per call) — no event
- * topic0/signature hash needed. `submissionId`/`debridgeId` are indexed
- * (topics[1]/[2]); `amount`/`nonce` are static fields at fixed word offsets in
- * the non-indexed data (word0 and word4 — see `Sent`'s field order in Gate.sol),
- * so no dynamic-offset ABI decoding is needed for them either.
+ * Gate emits during `swapAndBridge` (or a plain `send`). Match BOTH the emitting
+ * address AND `topics[0]` — matching the address alone would trust the first log
+ * from that address and then read fixed word offsets, so any other event the Gate
+ * emits (now or later) could be mis-decoded as a `Sent`. `submissionId`/
+ * `debridgeId` are indexed (topics[1]/[2]); `amount`/`nonce` are static fields at
+ * fixed word offsets in the non-indexed data (word0 and word4 — see `Sent`'s
+ * field order in Gate.sol).
  */
 export function extractSent(
   logs: RawLog[],
   gate: string
 ): { submissionId: string; debridgeId: string; amount: bigint; nonce: bigint } | null {
-  const log = logs.find((l) => l.address?.toLowerCase() === gate.toLowerCase());
+  const g = gate.toLowerCase();
+  const log = logs.find(
+    (l) => l.address?.toLowerCase() === g && l.topics[0]?.toLowerCase() === SENT_TOPIC0
+  );
   if (!log || log.topics.length < 3) return null;
   const data = strip0x(log.data);
   const wordAt = (i: number) => data.slice(i * 64, i * 64 + 64);
