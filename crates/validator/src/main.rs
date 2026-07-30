@@ -167,8 +167,8 @@ async fn scan_source(
         // Respect the pause flag (operator-set, or tripped by a nonce anomaly).
         {
             let rt = runtime.lock().await;
-            if rt.paused {
-                let reason = rt.pause_reason.as_ref().map(|r| r.as_str()).unwrap_or_default();
+            if rt.paused() {
+                let reason = rt.pause_reason().map(|r| r.as_str()).unwrap_or_default();
                 drop(rt);
                 warn!(chain_id = source.chain_id, %reason, "scanner PAUSED — not processing (resume via operator API)");
                 tokio::time::sleep(Duration::from_millis(source.poll_interval_ms.max(1000))).await;

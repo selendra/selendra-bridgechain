@@ -129,8 +129,8 @@ async fn status_for(validator: &str, chain_id: u64, rt: &Arc<Mutex<Runtime>>) ->
     StatusResponse {
         validator: validator.to_string(),
         chain_id,
-        paused: rt.paused,
-        pause_reason: rt.pause_reason.as_ref().map(|r| r.as_str()),
+        paused: rt.paused(),
+        pause_reason: rt.pause_reason().map(|r| r.as_str()),
         last_block: rt.persist.last_block,
         next_block: rt.next_block(),
         nonces: rt.persist.nonces.clone(),

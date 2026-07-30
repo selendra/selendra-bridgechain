@@ -28,6 +28,16 @@ pub struct Persist {
     /// `(chain_from, chain_to)` (both are bound into the submissionId), so that
     /// is the key. Serialized as `{ "<from>": { "<to>": <nonce> } }`.
     pub nonces: BTreeMap<u64, BTreeMap<u64, u64>>,
+    /// A safety stop (nonce anomaly / submissionId mismatch / operator pause) is
+    /// **persisted**: it MUST survive a restart, or a crash-loop would silently
+    /// clear a pause the operator has not investigated and resume signing into the
+    /// very anomaly that tripped it. Cleared only by an explicit operator resume
+    /// or rescan. `#[serde(default)]` keeps old state files (without these keys)
+    /// loadable as not-paused.
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub pause_reason: Option<PauseReason>,
 }
 
 /// What the nonce checker decides for a freshly seen event.
@@ -41,7 +51,7 @@ pub enum NonceDecision {
     Missed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PauseReason {
     Operator,
     MissedNonce { chain_from: u64, chain_to: u64, expected: u64, got: u64 },
@@ -68,8 +78,6 @@ impl PauseReason {
 
 pub struct Runtime {
     pub persist: Persist,
-    pub paused: bool,
-    pub pause_reason: Option<PauseReason>,
     path: PathBuf,
 }
 
@@ -78,7 +86,10 @@ impl Runtime {
     /// (the first block we'd scan is `last_block + 1`, so seed `last_block`
     /// with `start_block.saturating_sub(1)`).
     pub fn load_or_init(path: &Path, start_block: u64) -> anyhow::Result<Self> {
-        let fresh = || Persist { last_block: start_block.saturating_sub(1), nonces: BTreeMap::new() };
+        let fresh = || Persist {
+            last_block: start_block.saturating_sub(1),
+            ..Default::default()
+        };
         let persist = if path.exists() {
             let raw = std::fs::read_to_string(path)?;
             // Tolerate an unreadable/old-format state file: re-scanning from
@@ -92,7 +103,23 @@ impl Runtime {
         } else {
             fresh()
         };
-        Ok(Self { persist, paused: false, pause_reason: None, path: path.to_path_buf() })
+        // A persisted safety stop must be honoured across the restart — surface it
+        // loudly so the operator knows the scanner came up paused and why.
+        if persist.paused {
+            let reason = persist.pause_reason.as_ref().map(|r| r.as_str()).unwrap_or_default();
+            tracing::warn!(path = %path.display(), reason = %reason, "resuming PAUSED from persisted state; operator resume required");
+        }
+        Ok(Self { persist, path: path.to_path_buf() })
+    }
+
+    /// Whether the scanner is under a safety stop.
+    pub fn paused(&self) -> bool {
+        self.persist.paused
+    }
+
+    /// The current pause reason, if paused.
+    pub fn pause_reason(&self) -> Option<&PauseReason> {
+        self.persist.pause_reason.as_ref()
     }
 
     pub fn next_block(&self) -> u64 {
@@ -137,14 +164,14 @@ impl Runtime {
     }
 
     pub fn pause(&mut self, reason: PauseReason) {
-        self.paused = true;
-        self.pause_reason = Some(reason);
+        self.persist.paused = true;
+        self.persist.pause_reason = Some(reason);
     }
 
     /// Clear the pause flag (operator resume).
     pub fn resume(&mut self) {
-        self.paused = false;
-        self.pause_reason = None;
+        self.persist.paused = false;
+        self.persist.pause_reason = None;
     }
 
     /// Reset the cursor to re-scan from `from_block` and clear nonce tracking so
@@ -163,8 +190,6 @@ mod tests {
     fn rt() -> Runtime {
         Runtime {
             persist: Persist::default(),
-            paused: false,
-            pause_reason: None,
             path: PathBuf::from("/dev/null"),
         }
     }
@@ -240,6 +265,36 @@ mod tests {
         r.rescan_from(50);
         assert_eq!(r.next_block(), 50);
         assert!(r.persist.nonces.is_empty());
-        assert!(!r.paused);
+        assert!(!r.paused());
+    }
+
+    #[test]
+    fn pause_state_survives_save_and_reload() {
+        // The safety stop MUST persist: a restart after a nonce anomaly must come
+        // back paused, not silently resume signing into the anomaly.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("val-state-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut r = Runtime::load_or_init(&path, 0).unwrap();
+        r.persist.last_block = 42;
+        r.pause(PauseReason::MissedNonce { chain_from: 1, chain_to: 2, expected: 5, got: 8 });
+        r.save().unwrap();
+
+        let r2 = Runtime::load_or_init(&path, 0).unwrap();
+        assert!(r2.paused(), "must reload paused");
+        assert_eq!(r2.persist.last_block, 42);
+        assert_eq!(
+            r2.pause_reason(),
+            Some(&PauseReason::MissedNonce { chain_from: 1, chain_to: 2, expected: 5, got: 8 })
+        );
+
+        // An operator resume clears it and persists the clear.
+        let mut r3 = Runtime::load_or_init(&path, 0).unwrap();
+        r3.resume();
+        r3.save().unwrap();
+        assert!(!Runtime::load_or_init(&path, 0).unwrap().paused());
+
+        let _ = std::fs::remove_file(&path);
     }
 }
