@@ -119,6 +119,31 @@ impl Config {
     }
 }
 
+/// Load the program's canonical `Config`, refusing any account that is not the
+/// program-owned `["config"]` PDA.
+///
+/// SECURITY (finding C1): every instruction that trusts the config — claim
+/// (validator set + threshold for signature verification), send (chain id +
+/// nonces), and the owner-gated setters — MUST route through here. Without the
+/// PDA + program-owner check, a caller could pass a config account they created
+/// and own, containing their own validator set and threshold, and satisfy
+/// `verify_threshold` with self-signed signatures — draining any vault the
+/// program's authority controls. The `["config"]` seed makes the account unique
+/// and unforgeable, and the owner check ensures only this program ever wrote it.
+fn load_config(program_id: &Pubkey, config_ai: &AccountInfo) -> Result<Config, ProgramError> {
+    let (expected, _bump) = Pubkey::find_program_address(&[b"config"], program_id);
+    if config_ai.key != &expected {
+        msg!("config account is not the canonical [\"config\"] PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if config_ai.owner != program_id {
+        msg!("config account is not program-owned");
+        return Err(ProgramError::IllegalOwner);
+    }
+    Config::deserialize(&mut &config_ai.data.borrow()[..])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
 #[derive(thiserror::Error, Debug, Copy, Clone)]
 pub enum GateError {
     #[error("amount must be non-zero")]
@@ -305,7 +330,7 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
 }
 
 /// Accounts: [config(w), payer(s), user_token(w), vault(w), spl_token_program]
-fn process_send(_program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -> ProgramResult {
+fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -> ProgramResult {
     if args.amount == 0 {
         return Err(GateError::ZeroAmount.into());
     }
@@ -319,7 +344,9 @@ fn process_send(_program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) 
     let vault = next_account_info(it)?;
     let token_program = next_account_info(it)?;
 
-    let mut cfg = Config::deserialize(&mut &config_ai.data.borrow()[..])?;
+    // C1: bind the chain id + nonce sequence to the canonical config, so a forged
+    // config can't rewrite them and desync the off-chain nonce/submissionId.
+    let mut cfg = load_config(program_id, config_ai)?;
     let nonce = cfg.nonce(args.chain_id_to);
 
     let native_sender = payer.key.to_bytes();
@@ -367,7 +394,8 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     let token_program = next_account_info(it)?;
     let system_program = next_account_info(it)?;
 
-    let cfg = Config::deserialize(&mut &config_ai.data.borrow()[..])?;
+    // C1: only the canonical program-owned config may drive signature checks.
+    let cfg = load_config(program_id, config_ai)?;
 
     // Bind the release destination to the signed `receiver`. `claim` is
     // deliberately permissionless (any keeper may submit a threshold-signed
@@ -413,8 +441,14 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
         &[&[b"executed", &id, &[bump]]],
     )?;
 
-    // Release: vault -> receiver, signed by the vault-authority PDA.
-    let (_auth, auth_bump) = Pubkey::find_program_address(&[b"vault_authority"], program_id);
+    // Release: vault -> receiver, signed by the vault-authority PDA. Assert the
+    // supplied vault_authority IS the canonical PDA (defense in depth: the SPL
+    // transfer would already fail if the vault's authority didn't match, but an
+    // explicit check fails fast with a clear error and documents the invariant).
+    let (auth, auth_bump) = Pubkey::find_program_address(&[b"vault_authority"], program_id);
+    if vault_authority.key != &auth {
+        return Err(ProgramError::InvalidSeeds);
+    }
     let transfer = spl_token::instruction::transfer(
         token_program.key,
         vault.key,
@@ -434,7 +468,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
 }
 
 fn process_set_validator(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     validator: [u8; 20],
     active: bool,
@@ -442,7 +476,8 @@ fn process_set_validator(
     let it = &mut accounts.iter();
     let config_ai = next_account_info(it)?;
     let owner = next_account_info(it)?;
-    let mut cfg = Config::deserialize(&mut &config_ai.data.borrow()[..])?;
+    // C1: mutate only the canonical program-owned config, and only for its owner.
+    let mut cfg = load_config(program_id, config_ai)?;
     if owner.key != &cfg.owner || !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -460,14 +495,15 @@ fn process_set_validator(
 }
 
 fn process_set_threshold(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     threshold: u32,
 ) -> ProgramResult {
     let it = &mut accounts.iter();
     let config_ai = next_account_info(it)?;
     let owner = next_account_info(it)?;
-    let mut cfg = Config::deserialize(&mut &config_ai.data.borrow()[..])?;
+    // C1: mutate only the canonical program-owned config, and only for its owner.
+    let mut cfg = load_config(program_id, config_ai)?;
     if owner.key != &cfg.owner || !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
