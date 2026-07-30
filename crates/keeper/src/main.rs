@@ -174,6 +174,10 @@ async fn run_target(
         "target loop started"
     );
 
+    // Validator-membership memo for this gate, kept across ticks (a set change is
+    // picked up on keeper restart). See `quorum_count`.
+    let mut member_cache: std::collections::HashMap<Address, bool> = std::collections::HashMap::new();
+
     loop {
         // Allowlist for this tick. Fail-closed: if the sig-store is unreachable,
         // skip the tick rather than claim on a stale view. None => file mode
@@ -201,7 +205,7 @@ async fn run_target(
             // refunding most: a transfer the allowlist rejects never collects
             // transfer signatures at all, so it would fail the threshold check,
             // never reach this branch, and its funds would stay locked forever.
-            if (rec.cancel_signatures.len() as u64) >= threshold {
+            if quorum_count(&gate, &rec.cancel_signatures, &mut member_cache).await >= threshold {
                 match try_cancel(&gate, &rec).await {
                     // The DB `refund_status` is advanced by the indexer when it
                     // observes the resulting `Cancelled` event on-chain, not
@@ -219,7 +223,7 @@ async fn run_target(
                 continue;
             }
 
-            if (rec.signatures.len() as u64) < threshold {
+            if quorum_count(&gate, &rec.signatures, &mut member_cache).await < threshold {
                 continue;
             }
             // Second enforcement gate (validators are the first): never submit a
@@ -314,13 +318,15 @@ async fn run_source_refunds(
         "source refund loop started"
     );
 
+    let mut member_cache: std::collections::HashMap<Address, bool> = std::collections::HashMap::new();
+
     loop {
         let records = store.load_all().await.unwrap_or_default();
         for rec in records {
             if rec.chain_id_from != src.chain_id {
                 continue;
             }
-            if (rec.refund_signatures.len() as u64) < threshold {
+            if quorum_count(&gate, &rec.refund_signatures, &mut member_cache).await < threshold {
                 continue;
             }
             match try_refund(&gate, &rec).await {
@@ -538,6 +544,48 @@ async fn try_refund<P: Provider>(
     }
     info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "REFUNDED");
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
+}
+
+/// Count how many of `sigs` were signed by a member of `gate`'s on-chain
+/// validator set.
+///
+/// The sig-store verifies only that a signature recovers to its claimed signer,
+/// not that the signer is a validator — so an outsider can deposit a
+/// structurally valid signature over a submissionId. Counting it toward the
+/// off-chain quorum would make the keeper submit a claim/cancel/refund the Gate
+/// is guaranteed to reject (it re-checks every signer against `isValidator`),
+/// burning gas on a revert every tick. Counting only members closes that.
+///
+/// `cache` memoizes membership per signer across ticks; a validator-set change is
+/// picked up on keeper restart. Fail-closed: an `isValidator` read error leaves
+/// the signer uncounted for this tick (we wait rather than submit a doomed tx)
+/// and is not cached.
+async fn quorum_count<P: Provider>(
+    gate: &Gate::GateInstance<P>,
+    sigs: &[SignerSig],
+    cache: &mut std::collections::HashMap<Address, bool>,
+) -> u64 {
+    let mut count = 0u64;
+    for s in sigs {
+        let Ok(addr) = Address::from_str(&s.signer) else { continue };
+        let member = match cache.get(&addr) {
+            Some(&m) => m,
+            None => match gate.isValidator(addr).call().await {
+                Ok(m) => {
+                    cache.insert(addr, m);
+                    m
+                }
+                Err(e) => {
+                    warn!(signer = %s.signer, error = %e, "isValidator read failed; not counting this signer toward quorum this tick");
+                    continue;
+                }
+            },
+        };
+        if member {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Signatures ordered by recovered signer ascending, as every Gate entry point

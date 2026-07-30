@@ -106,6 +106,11 @@ sol! {
         function sentBy(bytes32 submissionId) external view returns (address);
         function refunded(bytes32 submissionId) external view returns (bool);
         function threshold() external view returns (uint256);
+        /// Membership of the on-chain validator set. The keeper uses this to count
+        /// only real validators toward the off-chain quorum, so an outsider's
+        /// (structurally valid) signature cannot inflate the count and provoke a
+        /// guaranteed-reverting on-chain submission.
+        function isValidator(address who) external view returns (bool);
         function nonceTo(uint256 chainIdTo) external view returns (uint256);
         function setLocalToken(bytes32 debridgeId, address localToken) external;
         function setValidator(address v, bool active) external;
