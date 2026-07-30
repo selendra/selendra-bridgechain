@@ -395,10 +395,21 @@ async fn try_claim<P: Provider>(
         .get_receipt()
         .await
         .context("await receipt")?;
+    // A mined-but-reverted claim (status 0) must NOT be reported as success: the
+    // caller records success via the store's `mark_claimed`, which also clears the
+    // `eligible` refund flag — so a false success would permanently hide a
+    // stranded transfer from recovery. Surface it as an error so the tick logs a
+    // failure and retries, leaving the transfer refund-eligible.
+    if !receipt.status() {
+        anyhow::bail!(
+            "claim tx {:#x} reverted (status 0) for submission {}; not recording as claimed",
+            receipt.transaction_hash,
+            rec.submission_id
+        );
+    }
     info!(
         submission_id = %rec.submission_id,
         tx = %receipt.transaction_hash,
-        status = receipt.status(),
         "CLAIMED"
     );
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
@@ -444,6 +455,16 @@ async fn try_cancel<P: Provider>(
         .get_receipt()
         .await
         .context("await receipt")?;
+    // A reverted cancel is not a burn — reporting success would emit a false
+    // operator signal (and, once the indexer keys off it, mis-sequence the
+    // two-phase refund). Fail so the tick retries.
+    if !receipt.status() {
+        anyhow::bail!(
+            "cancel tx {:#x} reverted (status 0) for submission {}",
+            receipt.transaction_hash,
+            rec.submission_id
+        );
+    }
     info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "CANCELLED");
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
 }
@@ -507,6 +528,14 @@ async fn try_refund<P: Provider>(
         .get_receipt()
         .await
         .context("await receipt")?;
+    // A reverted refund did not return funds; don't claim it did.
+    if !receipt.status() {
+        anyhow::bail!(
+            "refund tx {:#x} reverted (status 0) for submission {}",
+            receipt.transaction_hash,
+            rec.submission_id
+        );
+    }
     info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "REFUNDED");
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
 }
