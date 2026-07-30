@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
@@ -274,9 +274,26 @@ async fn handle_log(
     let ev = &decoded.data;
 
     let emitted_id: B256 = ev.submissionId;
-    let chain_from = u256_to_u64(ev.chainIdFrom);
-    let chain_to = u256_to_u64(ev.chainIdTo);
-    let nonce = u256_to_u64(ev.nonce);
+    // Chain ids and the nonce MUST fit u64: they are re-encoded as U256 by the
+    // keeper's claim(), so a value that only fits by saturating to u64::MAX would
+    // reconstruct a different submissionId (and alias two distinct chains/nonces
+    // into one corridor). A real gate never emits these; treat it as a malformed
+    // or hostile source and refuse to sign — but skip, don't error, so a single
+    // bad log can't wedge the batch (H3 retries errors forever).
+    let (chain_from, chain_to, nonce) =
+        match (u64::try_from(ev.chainIdFrom), u64::try_from(ev.chainIdTo), u64::try_from(ev.nonce)) {
+            (Ok(f), Ok(t), Ok(n)) => (f, t, n),
+            _ => {
+                warn!(
+                    submission_id = %emitted_id,
+                    chain_from = %ev.chainIdFrom,
+                    chain_to = %ev.chainIdTo,
+                    nonce = %ev.nonce,
+                    "Sent event has a chainId/nonce that exceeds u64 — refusing to sign (aliased value would mis-key the nonce and break claim reconstruction)"
+                );
+                return Ok(true); // skip this event; never sign an aliased transfer
+            }
+        };
 
     // Sequential-nonce enforcement (mirrors NonceControllingService). The nonce
     // sequence is per (chain_from, chain_to): each source gate runs its own
@@ -345,7 +362,7 @@ async fn handle_log(
         submission_id: format!("{emitted_id:#x}"),
         debridge_id: format!("{:#x}", ev.debridgeId),
         amount: ev.amount.to_string(),
-        chain_id_from: u256_to_u64(ev.chainIdFrom),
+        chain_id_from: chain_from,
         chain_id_to: chain_to,
         nonce,
         receiver: format!("0x{}", hex::encode(&ev.receiver)),
@@ -409,8 +426,4 @@ fn encode_signature(sig: &alloy::primitives::Signature) -> String {
     out.extend_from_slice(&sig.s().to_be_bytes::<32>());
     out.push(27 + sig.v() as u8);
     format!("0x{}", hex::encode(out))
-}
-
-fn u256_to_u64(v: U256) -> u64 {
-    v.try_into().unwrap_or(u64::MAX)
 }

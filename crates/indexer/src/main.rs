@@ -210,13 +210,28 @@ where
 async fn handle_gate_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()> {
     if let Ok(decoded) = Gate::Sent::decode_log(&log.inner) {
         let ev = &decoded.data;
+        // Reject (skip) an event whose chainId/nonce overflows u64 rather than
+        // aliasing it to u64::MAX and mis-keying the history row. Skip, not error:
+        // the scan cursor must still advance past a permanently-malformed log.
+        let (chain_id_from, chain_id_to, nonce) =
+            match (u64::try_from(ev.chainIdFrom), u64::try_from(ev.chainIdTo), u64::try_from(ev.nonce)) {
+                (Ok(f), Ok(t), Ok(n)) => (f, t, n),
+                _ => {
+                    warn!(
+                        chain_id,
+                        submission_id = %format!("{:#x}", ev.submissionId),
+                        "skipping Sent with chainId/nonce exceeding u64 (malformed/hostile source)"
+                    );
+                    return Ok(());
+                }
+            };
         let record = SubmissionRecord {
             submission_id: format!("{:#x}", ev.submissionId),
             debridge_id: format!("{:#x}", ev.debridgeId),
             amount: ev.amount.to_string(),
-            chain_id_from: u256_to_u64(ev.chainIdFrom),
-            chain_id_to: u256_to_u64(ev.chainIdTo),
-            nonce: u256_to_u64(ev.nonce),
+            chain_id_from,
+            chain_id_to,
+            nonce,
             receiver: format!("0x{}", hex::encode(&ev.receiver)),
             auto_params: format!("0x{}", hex::encode(&ev.autoParams)),
             native_sender: format!("0x{}", hex::encode(&ev.nativeSender)),
@@ -314,8 +329,4 @@ async fn handle_router_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()
         info!(chain_id, submission_id = %id, "observed FinalizeFallback");
     }
     Ok(())
-}
-
-fn u256_to_u64(v: alloy::primitives::U256) -> u64 {
-    v.try_into().unwrap_or(u64::MAX)
 }
