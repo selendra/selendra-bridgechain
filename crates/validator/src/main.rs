@@ -222,6 +222,7 @@ async fn scan_source(
             };
 
             let mut paused = false;
+            let mut batch_failed = false;
             for log in &logs {
                 match handle_log(&signer, signer_addr, &sink, &runtime, log, allowlist.as_ref()).await {
                     Ok(true) => {} // processed
@@ -230,12 +231,23 @@ async fn scan_source(
                         paused = true;
                         break;
                     }
-                    Err(e) => warn!(chain_id = source.chain_id, error = %e, "failed handling log"),
+                    Err(e) => {
+                        // A sign/store failure must NOT lose the signature: stop the
+                        // batch and leave the cursor put, so the range is rescanned
+                        // next tick. `accept_nonce` runs only after a durable store
+                        // (see handle_log), so the failed event's nonce was never
+                        // consumed — re-signing the range is idempotent (the store
+                        // upserts) and the nonce sequence stays intact.
+                        warn!(chain_id = source.chain_id, error = %e, "failed handling log; will retry same range");
+                        batch_failed = true;
+                        break;
+                    }
                 }
             }
 
-            if !paused {
-                // Advance and persist the cursor only after the whole batch is done.
+            if !paused && !batch_failed {
+                // Advance and persist the cursor only after the whole batch is
+                // durably handled.
                 let mut rt = runtime.lock().await;
                 rt.persist.last_block = to_block;
                 if let Err(e) = rt.save() {

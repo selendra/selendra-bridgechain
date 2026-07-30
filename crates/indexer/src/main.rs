@@ -136,27 +136,37 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
         if confirmed >= from_block {
             let to_block = confirmed.min(from_block + chain.max_block_range - 1);
 
+            // Advance the cursor only if EVERY relevant scan durably handled all
+            // its logs. If any scan fails, leave the cursor put and reprocess the
+            // same range next tick — advancing past a failed range would drop
+            // whatever events it held (history, a Claimed/Cancelled transition).
+            let mut all_ok = true;
             if let Some(addr) = gate {
                 if let Err(e) = scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handle_gate_log).await {
-                    warn!(chain_id = chain.chain_id, error = %e, "gate scan failed; will retry next tick");
+                    warn!(chain_id = chain.chain_id, error = %e, "gate scan failed; will retry same range next tick");
+                    all_ok = false;
                 }
             }
             if let Some(addr) = router {
                 if let Err(e) = scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handle_router_log).await
                 {
-                    warn!(chain_id = chain.chain_id, error = %e, "router scan failed; will retry next tick");
+                    warn!(chain_id = chain.chain_id, error = %e, "router scan failed; will retry same range next tick");
+                    all_ok = false;
                 }
             }
             if let Some(addr) = pool {
                 if let Err(e) = scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handle_pool_log).await {
-                    warn!(chain_id = chain.chain_id, error = %e, "pool scan failed; will retry next tick");
+                    warn!(chain_id = chain.chain_id, error = %e, "pool scan failed; will retry same range next tick");
+                    all_ok = false;
                 }
             }
 
-            if let Err(e) = db.set_cursor(chain.chain_id, to_block).await {
-                warn!(chain_id = chain.chain_id, error = %e, "failed to persist cursor");
-            } else {
-                from_block = to_block + 1;
+            if all_ok {
+                if let Err(e) = db.set_cursor(chain.chain_id, to_block).await {
+                    warn!(chain_id = chain.chain_id, error = %e, "failed to persist cursor");
+                } else {
+                    from_block = to_block + 1;
+                }
             }
         }
 
@@ -184,9 +194,15 @@ where
     let mut logs = provider.get_logs(&filter).await.context("get_logs")?;
     logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
     for log in logs {
-        if let Err(e) = handler(db.clone(), chain_id, log).await {
-            warn!(chain_id, error = %e, "failed handling log (skipped)");
-        }
+        // Propagate handler failures instead of swallowing them. A transient
+        // DB/store error must fail the whole batch so the caller leaves the
+        // cursor where it is and reprocesses the range next tick — otherwise the
+        // event (a Sent/Claimed/Cancelled row) would be dropped permanently. All
+        // handler writes are idempotent upserts (ON CONFLICT / UPDATE), so
+        // reprocessing already-handled logs in the range is safe.
+        handler(db.clone(), chain_id, log)
+            .await
+            .with_context(|| format!("handling log in blocks [{from_block},{to_block}]"))?;
     }
     Ok(())
 }
