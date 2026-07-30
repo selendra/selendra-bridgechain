@@ -230,6 +230,39 @@ contract SwapTest is Test {
         pool.setPrice(address(usd), 2e18);
     }
 
+    function test_SetPrice_CooldownBoundsRateOfChange() public {
+        // The first repricing after listing is free.
+        vm.prank(oracle);
+        pool.setPrice(address(weth), 3300e18); // +~3.8%, within the 10% cap
+
+        // A second repricing before the cooldown elapses is rejected — so a
+        // compromised oracle cannot chain several capped steps in one block and
+        // walk the price arbitrarily.
+        uint256 nextAllowed = block.timestamp + pool.minPriceUpdateInterval();
+        vm.prank(oracle);
+        vm.expectRevert(
+            abi.encodeWithSelector(SwapPool.PriceUpdateTooSoon.selector, address(weth), nextAllowed)
+        );
+        pool.setPrice(address(weth), 3400e18);
+
+        // Price is unchanged from the single allowed step.
+        (, , uint256 price, ) = _info(address(weth));
+        assertEq(price, 3300e18);
+
+        // After the cooldown, one more capped step is allowed.
+        vm.warp(nextAllowed);
+        vm.prank(oracle);
+        pool.setPrice(address(weth), 3400e18);
+        (, , price, ) = _info(address(weth));
+        assertEq(price, 3400e18);
+    }
+
+    function test_SetMinPriceUpdateInterval_OnlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(SwapPool.NotOwner.selector);
+        pool.setMinPriceUpdateInterval(0);
+    }
+
     // ----------------------------------------------------------------- fees
 
     function test_Fee_ReducesOutput() public {

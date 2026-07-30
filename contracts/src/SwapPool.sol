@@ -62,6 +62,15 @@ contract SwapPool is ReentrancyGuard {
     /// @dev max allowed price move per setPrice() call, in bps (anti-fat-finger /
     ///      anti-compromise). Applies only to UPDATES (not the first price).
     uint16 public maxPriceDeviationBps;
+    /// @dev minimum wall-clock gap between two reprices of the SAME token. The
+    ///      per-call deviation cap alone only bounds one step; without a time gate
+    ///      a compromised oracle could call setPrice() many times in a single
+    ///      block, each within the cap, and walk the price arbitrarily. Together
+    ///      the two bound the price to at most `maxPriceDeviationBps` per interval.
+    uint256 public minPriceUpdateInterval;
+    /// @dev last repricing time per token (0 => never repriced since listing; the
+    ///      first update is always allowed).
+    mapping(address => uint256) public lastPriceUpdate;
 
     // --- events ---
     event TokenListed(address indexed token, uint256 price, uint8 decimals);
@@ -79,6 +88,7 @@ contract SwapPool is ReentrancyGuard {
     );
     event FeeSet(uint16 feeBps);
     event MaxPriceDeviationSet(uint16 bps);
+    event MinPriceUpdateIntervalSet(uint256 interval);
     event OracleSet(address indexed oracle);
     // governance / pause (same shape as Gate.sol)
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
@@ -102,6 +112,8 @@ contract SwapPool is ReentrancyGuard {
     error Slippage(uint256 got, uint256 min);
     error StableRepriceForbidden();
     error PriceDeviationTooHigh(uint256 oldPrice, uint256 newPrice, uint16 maxBps);
+    /// @dev setPrice() called again before the per-token cooldown elapsed.
+    error PriceUpdateTooSoon(address token, uint256 nextAllowed);
     error ReserveNonZero();
     error FeeTooHigh();
     error DeviationTooHigh();
@@ -136,6 +148,12 @@ contract SwapPool is ReentrancyGuard {
 
         maxPriceDeviationBps = maxPriceDeviationBps_;
         emit MaxPriceDeviationSet(maxPriceDeviationBps_);
+
+        // Default cooldown: at most one deviation-capped step per hour, so a
+        // compromised oracle cannot walk the price within a block/many blocks.
+        // Owner-tunable via setMinPriceUpdateInterval.
+        minPriceUpdateInterval = 1 hours;
+        emit MinPriceUpdateIntervalSet(1 hours);
 
         stable = stable_;
         uint8 dec = IERC20Metadata(stable_).decimals();
@@ -185,6 +203,15 @@ contract SwapPool is ReentrancyGuard {
         emit MaxPriceDeviationSet(bps);
     }
 
+    /// @notice Set the minimum gap between two reprices of the same token. Set to
+    ///         0 only for instant-finality dev chains where oracle abuse is not a
+    ///         concern; a real deployment should keep a nonzero cooldown so the
+    ///         price can move at most `maxPriceDeviationBps` per interval.
+    function setMinPriceUpdateInterval(uint256 interval) external onlyOwner {
+        minPriceUpdateInterval = interval;
+        emit MinPriceUpdateIntervalSet(interval);
+    }
+
     function pause() external {
         if (msg.sender != owner && msg.sender != guardian) revert NotAuthorizedToPause();
         if (!paused) {
@@ -225,6 +252,15 @@ contract SwapPool is ReentrancyGuard {
         if (token == stable) revert StableRepriceForbidden();
         if (newPrice == 0) revert ZeroPrice();
 
+        // Time gate: the first repricing after listing is free, but every
+        // subsequent one must wait out the cooldown. This bounds the RATE of
+        // change — with the per-call cap it caps movement to maxPriceDeviationBps
+        // per interval — so a compromised oracle cannot walk the price in a block.
+        uint256 last = lastPriceUpdate[token];
+        if (last != 0 && block.timestamp < last + minPriceUpdateInterval) {
+            revert PriceUpdateTooSoon(token, last + minPriceUpdateInterval);
+        }
+
         uint256 oldPrice = t.price;
         // |new - old| / old <= maxDeviation
         uint256 diff = newPrice > oldPrice ? newPrice - oldPrice : oldPrice - newPrice;
@@ -233,6 +269,7 @@ contract SwapPool is ReentrancyGuard {
         }
 
         t.price = newPrice;
+        lastPriceUpdate[token] = block.timestamp;
         emit PriceSet(token, oldPrice, newPrice);
     }
 
