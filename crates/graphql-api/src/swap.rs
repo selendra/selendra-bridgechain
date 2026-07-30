@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, U512};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
@@ -151,13 +151,20 @@ impl Swaps {
             let decimals = info.decimals;
             let price = info.price;
             let reserve = info.reserve;
-            // reserve * price / 10^decimals (PRICE_ONE-scaled USD). Fits in U256
-            // for any realistic reserve/price; saturating guards the pathological.
+            // reserve * price / 10^decimals (PRICE_ONE-scaled USD). Compute the
+            // product at full 512-bit width — matching the contract's mulDiv — so a
+            // large reserve*price that overflows U256 before the divide still
+            // yields the correct value instead of collapsing to 0 (which would
+            // under-report the swap ceiling for a deep pool). Saturate only if the
+            // final quotient itself exceeds U256 (not physically reachable).
             let scale = U256::from(10u64).pow(U256::from(decimals));
-            let max_swap_usd = reserve
-                .checked_mul(price)
-                .map(|v| v / scale)
-                .unwrap_or(U256::ZERO);
+            let wide = U512::from(reserve) * U512::from(price) / U512::from(scale);
+            let max_swap_usd = if wide > U512::from(U256::MAX) {
+                U256::MAX
+            } else {
+                // low 256 bits are the entire value once we know it fits
+                U256::from_le_slice(&wide.to_le_bytes::<64>()[..32])
+            };
 
             let symbol = IERC20Mintable::new(token, provider)
                 .symbol()

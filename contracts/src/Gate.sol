@@ -135,6 +135,8 @@ contract Gate {
     ///      (the signed `amount` would exceed what was actually locked, letting a
     ///      claim on the destination release more than was received).
     error UnsupportedTokenBehavior(uint256 expected, uint256 received);
+    /// @dev more signatures supplied than there are validators — junk padding.
+    error TooManySignatures(uint256 supplied, uint256 validatorCount);
     error ZeroValidator();
     error ZeroAddress();
     /// @dev threshold must always satisfy 0 < threshold <= validatorCount
@@ -541,6 +543,14 @@ contract Gate {
         view
     {
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(message);
+
+        // A useful quorum needs at most `validatorCount` distinct signers (the
+        // ascending-order rule already forbids duplicates, and non-validators are
+        // ignored below). Cap the array there so a caller can't pad it with junk
+        // to inflate ECDSA-recovery gas / RPC estimation load.
+        if (signatures.length > validatorCount) {
+            revert TooManySignatures(signatures.length, validatorCount);
+        }
 
         address last = address(0);
         uint256 count = 0;

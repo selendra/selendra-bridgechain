@@ -89,6 +89,19 @@ contract ClaimTest is Test {
 
     // --- tests ---
 
+    function test_Claim_RevertsTooManySignatures() public {
+        // validatorCount is 3; a 4-signature array is junk padding and must revert
+        // (the cap is checked before any ECDSA recovery, so contents don't matter).
+        bytes32 id = _id();
+        bytes[] memory sigs = new bytes[](4);
+        sigs[0] = _sign(v1pk, id);
+        sigs[1] = _sign(v2pk, id);
+        sigs[2] = _sign(v3pk, id);
+        sigs[3] = _sign(v1pk, id);
+        vm.expectRevert(abi.encodeWithSelector(Gate.TooManySignatures.selector, 4, 3));
+        _claim(sigs);
+    }
+
     function test_Claim_HappyPath_OneSig() public {
         bytes[] memory sigs = new bytes[](1);
         sigs[0] = _sign(v1pk, _id());
