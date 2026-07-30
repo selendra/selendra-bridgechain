@@ -5,6 +5,32 @@ import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
 import {TestToken} from "../src/TestToken.sol";
 import {BridgeHash} from "../src/BridgeHash.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+/// Minimal fee-on-transfer token: burns `feeBps` of every transfer so the
+/// recipient receives less than `amount`. Used to prove the gate rejects it.
+contract FeeToken is ERC20 {
+    uint256 public immutable feeBps;
+
+    constructor(uint256 feeBps_) ERC20("Fee", "FEE") {
+        feeBps = feeBps_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0) && to != address(0) && feeBps > 0) {
+            uint256 fee = (value * feeBps) / 10_000;
+            super._update(from, to, value - fee);
+            super._update(from, address(0xdead), fee); // burn-ish sink
+        } else {
+            super._update(from, to, value);
+        }
+    }
+}
 
 contract SendTest is Test {
     Gate gate;
@@ -110,5 +136,35 @@ contract SendTest is Test {
         vm.prank(user);
         vm.expectRevert(Gate.ZeroAmount.selector);
         gate.send(address(token), 0, CHAIN_TO, abi.encodePacked(address(0xCAFE)), "");
+    }
+
+    function test_Send_RejectsFeeOnTransferToken() public {
+        // A 1% fee-on-transfer token: the gate would receive 99 for a signed 100,
+        // so a destination claim would release 100 from shared liquidity — a
+        // shortfall drain. The exact-transfer check must reject it.
+        FeeToken fee = new FeeToken(100); // 1%
+        fee.mint(user, 1_000 ether);
+        vm.prank(user);
+        fee.approve(address(gate), type(uint256).max);
+
+        uint256 amount = 100 ether;
+        uint256 received = amount - (amount * 100) / 10_000; // 99 ether
+        vm.prank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(Gate.UnsupportedTokenBehavior.selector, amount, received)
+        );
+        gate.send(address(fee), amount, CHAIN_TO, abi.encodePacked(address(0xCAFE)), "");
+
+        // and nothing was locked / no nonce consumed (the whole tx reverted)
+        assertEq(fee.balanceOf(address(gate)), 0, "no funds should be locked");
+        assertEq(gate.nonceTo(CHAIN_TO), 0, "nonce must not advance on a rejected send");
+    }
+
+    function test_Send_AcceptsExactTransferToken() public {
+        // Sanity: a normal (exact-transfer) token still works after the check.
+        uint256 amount = 100 ether;
+        vm.prank(user);
+        gate.send(address(token), amount, CHAIN_TO, abi.encodePacked(address(0xCAFE)), "");
+        assertEq(token.balanceOf(address(gate)), amount);
     }
 }

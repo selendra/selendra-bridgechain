@@ -113,22 +113,33 @@ contract SecurityTest is Test {
         new Gate(_validators(1), 0);
     }
 
-    // ---- C2: send() reentrancy keeps nonces sequential ----
-
-    function test_Send_ReentrancyKeepsNoncesSequential() public {
+    // ---- C2 / M8: a token that reenters send() is rejected ----
+    //
+    // Originally this proved CEI nonce ordering left a clean nonce=2 when a token
+    // reentered send(). The M8 exact-transfer check (report.md) now REJECTS such a
+    // token outright: the inner reentrant send deposits extra, so the outer send's
+    // balance delta no longer equals its signed `amount` and it reverts. That is a
+    // strictly stronger guarantee (a reentering / non-exact-transfer token can
+    // never lock funds here). CEI ordering remains in the code as defense in depth;
+    // plain sequential nonces are covered by test_Send_NonceIncrementsPerTarget.
+    function test_Send_ReentrantTokenIsRejected() public {
         ReentrantToken rt = new ReentrantToken();
         rt.mint(attacker, 10 ether);
         rt.arm(gate, CHAIN_TO);
 
         vm.startPrank(attacker);
         rt.approve(address(gate), type(uint256).max);
+        // outer signed 1 ether; the reentrant inner send deposits 1 extra wei, so
+        // the outer balance delta is 1 ether + 1 and the exact-transfer check trips.
+        vm.expectRevert(
+            abi.encodeWithSelector(Gate.UnsupportedTokenBehavior.selector, 1 ether, 1 ether + 1)
+        );
         gate.send(address(rt), 1 ether, CHAIN_TO, abi.encodePacked(address(0xCAFE)), "");
         vm.stopPrank();
 
-        // outer reserved nonce 0; the reentrant inner send reserved nonce 1.
-        // With the pre-fix (transfer before increment) both would read 0 and the
-        // final nonce would be 1. CEI ordering makes it a clean 2.
-        assertEq(gate.nonceTo(CHAIN_TO), 2, "nonces must stay sequential under reentrancy");
+        // The whole tx rolled back: no funds locked, no nonce consumed.
+        assertEq(rt.balanceOf(address(gate)), 0, "no funds should be locked");
+        assertEq(gate.nonceTo(CHAIN_TO), 0, "nonce must not advance on a rejected send");
     }
 
     // ---- C3: receiver width must be 20 (EVM) or 32 (Solana/non-EVM) ----

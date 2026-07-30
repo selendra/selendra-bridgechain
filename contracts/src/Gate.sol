@@ -130,6 +130,11 @@ contract Gate {
     error InvalidSignerOrder();
     error UnknownAsset(bytes32 debridgeId);
     error BadReceiver();
+    /// @dev the gate received a different amount than `amount` on transferIn — a
+    ///      fee-on-transfer / rebasing token, which this gate does not support
+    ///      (the signed `amount` would exceed what was actually locked, letting a
+    ///      claim on the destination release more than was received).
+    error UnsupportedTokenBehavior(uint256 expected, uint256 received);
     error ZeroValidator();
     error ZeroAddress();
     /// @dev threshold must always satisfy 0 < threshold <= validatorCount
@@ -308,7 +313,17 @@ contract Gate {
             token
         );
 
+        // Exact-transfer policy: credit only tokens whose balance delta equals the
+        // signed `amount`. A fee-on-transfer / rebasing token would deliver less
+        // than `amount` while the emitted event (and thus the destination claim)
+        // promises the full `amount` — draining shared liquidity by the shortfall.
+        // Reject rather than silently over-credit. (A reentrant transfer hook can
+        // only make `received` differ, which also reverts, rolling back the nonce
+        // and the emitted Sent.)
+        uint256 balBefore = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = IERC20(token).balanceOf(address(this)) - balBefore;
+        if (received != amount) revert UnsupportedTokenBehavior(amount, received);
     }
 
     // ---------------------------------------------------------------------
