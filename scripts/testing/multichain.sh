@@ -130,6 +130,7 @@ rpc = "$SRC_RPC"
 gate = "$GATE_SRC"
 start_block = 0
 block_confirmation = 0
+allow_zero_confirmation = true   # anvil is instant-final; a real chain MUST set block_confirmation
 poll_interval_ms = 500
 max_block_range = 1000
 state_file = "$LOGS/validator-state.json"

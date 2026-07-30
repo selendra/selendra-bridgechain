@@ -322,7 +322,8 @@ for key in "${VALIDATOR_KEYS[@]}"; do
       echo "rpcs = [\"${CRPC[$i]}\"]"
       echo "gate = \"${CGATE[$i]}\""
       echo "start_block = 0"
-      echo "block_confirmation = 0"
+      echo "block_confirmation = $SOURCE_BLOCK_CONFIRMATION"
+      echo "allow_zero_confirmation = $SOURCE_ALLOW_ZERO_CONFIRMATION"
       echo "poll_interval_ms = 300"
       echo "max_block_range = 1000"
       echo "state_file = \"$RUN_DIR/validator-$vi-${CID[$i]}.json\""
@@ -389,7 +390,7 @@ if [[ "$ENABLE_INDEXER" == "true" ]]; then
       echo "gate = \"${CGATE[$i]}\""
       [[ "$ENABLE_SWAP" == "true" && $i == "$swap_idx" && -n "${SWAP_POOL:-}" ]] && echo "pool = \"$SWAP_POOL\""
       echo "start_block = 0"
-      echo "block_confirmation = 0"
+      echo "block_confirmation = $SOURCE_BLOCK_CONFIRMATION"
       echo "poll_interval_ms = 500"
       echo "max_block_range = 1000"
     done

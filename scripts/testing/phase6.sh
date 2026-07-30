@@ -95,6 +95,7 @@ rpcs = ["$DEAD_RPC", "$SRC_RPC"]
 gate = "$GATE"
 start_block = 0
 block_confirmation = 0
+allow_zero_confirmation = true   # anvil is instant-final; a real chain MUST set block_confirmation
 poll_interval_ms = 300
 max_block_range = 1000
 state_file = "$STATE"

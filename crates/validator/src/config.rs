@@ -2,6 +2,7 @@ use bridge_core::signer::SignerConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Legacy single-source form: `[source]`. Folded into `sources` on load.
     #[serde(default)]
@@ -27,6 +28,7 @@ pub struct Config {
 
 /// Drives the two-phase refund attestation loop.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefundConfig {
     /// Advisory only, surfaced in the startup log. The unclaimed-timeout that
     /// actually gates cancel attestations is enforced upstream by the indexer's
@@ -64,6 +66,7 @@ pub struct RefundConfig {
 
 /// One chain the refund loop can read gate state from.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefundChain {
     pub chain_id: u64,
     #[serde(default)]
@@ -91,6 +94,7 @@ impl RefundChain {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceChain {
     pub chain_id: u64,
     /// Single RPC (back-compat). Prefer `rpcs` for failover.
@@ -102,9 +106,19 @@ pub struct SourceChain {
     pub gate: String,
     #[serde(default)]
     pub start_block: u64,
-    /// finality buffer: only process up to `latest - block_confirmation`
+    /// **Finality buffer — SECURITY CRITICAL.** Only process up to
+    /// `latest - block_confirmation`. Signing a `Sent` event at the chain tip lets
+    /// a source reorg erase the deposit *after* validators have signed and the
+    /// keeper has released destination liquidity — a double-spend of bridge funds.
+    /// This MUST exceed the source chain's maximum reorg depth. `Config::load`
+    /// refuses to start with a 0 buffer unless `allow_zero_confirmation` is set.
     #[serde(default)]
     pub block_confirmation: u64,
+    /// Opt out of the non-zero `block_confirmation` requirement. ONLY for
+    /// instant-finality local chains (anvil) that never reorg. Never set this
+    /// against a real network. Mirrors `RefundConfig.allow_zero_confirmation`.
+    #[serde(default)]
+    pub allow_zero_confirmation: bool,
     #[serde(default = "default_interval")]
     pub poll_interval_ms: u64,
     #[serde(default = "default_range")]
@@ -178,7 +192,13 @@ impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {path}: {e}"))?;
-        let mut cfg: Config = toml::from_str(&raw)?;
+        Self::from_toml(&raw)
+    }
+
+    /// Parse + validate a config from a TOML string. Split out from [`load`] so the
+    /// fail-closed checks below can be unit-tested without touching the filesystem.
+    pub fn from_toml(raw: &str) -> anyhow::Result<Self> {
+        let mut cfg: Config = toml::from_str(raw)?;
 
         // Backward compatibility: a single `[source]` is a one-element list.
         if let Some(s) = cfg.source.take() {
@@ -203,6 +223,25 @@ impl Config {
                         cfg.sources[i].state_file
                     );
                 }
+            }
+        }
+
+        // SECURITY: signing a `Sent` event at the source chain tip lets a reorg
+        // erase the deposit *after* the keeper has already released destination
+        // liquidity — a double-spend of bridge funds. Refuse a 0 finality buffer
+        // unless the operator explicitly opts out for an instant-finality dev
+        // chain. (Mirrors the refund reader's guard below; before this check the
+        // shipped `allow_zero_confirmation` on `[source]` was silently ignored.)
+        for s in &cfg.sources {
+            if s.block_confirmation == 0 && !s.allow_zero_confirmation {
+                anyhow::bail!(
+                    "source chain_id {} has block_confirmation = 0 — the validator would sign \
+                     Sent events at the chain tip, so a source reorg could erase a deposit after \
+                     the destination was paid (double-spend). Set block_confirmation to exceed \
+                     the source chain's finality depth, or set allow_zero_confirmation = true \
+                     ONLY for an instant-finality dev chain (e.g. anvil).",
+                    s.chain_id
+                );
             }
         }
 
@@ -258,5 +297,70 @@ impl Config {
         }
 
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A minimal single-source config with an explicit finality buffer; each test
+    // tweaks the `[source]` block to exercise the fail-closed rule.
+    fn cfg(source_body: &str) -> String {
+        format!(
+            "[source]\n\
+             chain_id = 1337\n\
+             rpcs = [\"http://localhost:8545\"]\n\
+             gate = \"0x0000000000000000000000000000000000000001\"\n\
+             {source_body}\n\
+             [signer]\n\
+             private_key = \"0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d\"\n\
+             [store]\n\
+             dir = \"./sigs\"\n"
+        )
+    }
+
+    #[test]
+    fn source_zero_confirmation_is_rejected_by_default() {
+        // Omitted block_confirmation defaults to 0 -> must fail closed.
+        let err = Config::from_toml(&cfg("")).unwrap_err().to_string();
+        assert!(err.contains("block_confirmation = 0"), "got: {err}");
+
+        // Explicit 0 without the opt-in -> must fail closed.
+        let err = Config::from_toml(&cfg("block_confirmation = 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("block_confirmation = 0"), "got: {err}");
+    }
+
+    #[test]
+    fn source_zero_confirmation_opt_in_is_honored() {
+        // The opt-in must actually be read (the H1 bug: it was silently dropped).
+        let c = Config::from_toml(&cfg("block_confirmation = 0\nallow_zero_confirmation = true"))
+            .expect("opt-in should load");
+        assert!(c.sources[0].allow_zero_confirmation);
+        assert_eq!(c.sources[0].block_confirmation, 0);
+    }
+
+    #[test]
+    fn source_nonzero_confirmation_is_accepted() {
+        let c = Config::from_toml(&cfg("block_confirmation = 12")).expect("nonzero should load");
+        assert_eq!(c.sources[0].block_confirmation, 12);
+        assert!(!c.sources[0].allow_zero_confirmation);
+    }
+
+    #[test]
+    fn misspelled_field_is_rejected_not_ignored() {
+        // deny_unknown_fields: a typo like `allow_zero_confirmations` (trailing s)
+        // must be an error, not a silently-ignored no-op that leaves buffer 0.
+        let err = Config::from_toml(&cfg(
+            "block_confirmation = 0\nallow_zero_confirmations = true",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("allow_zero_confirmations") || err.contains("unknown field"),
+            "got: {err}"
+        );
     }
 }

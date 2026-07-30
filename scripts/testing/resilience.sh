@@ -79,6 +79,8 @@ cat > "$ROOT/validator.toml" <<EOF
 chain_id = $B_CHAIN
 rpc = "$B_RPC"
 gate = "$GATE_B"
+block_confirmation = 0
+allow_zero_confirmation = true   # anvil is instant-final; a real chain MUST set block_confirmation
 poll_interval_ms = 500
 state_file = "$LOGS/res-B-state.json"
 
@@ -86,6 +88,8 @@ state_file = "$LOGS/res-B-state.json"
 chain_id = $C_CHAIN
 rpc = "$C_RPC"
 gate = "$GATE_C"
+block_confirmation = 0
+allow_zero_confirmation = true   # anvil is instant-final; a real chain MUST set block_confirmation
 poll_interval_ms = 500
 state_file = "$LOGS/res-C-state.json"
 
