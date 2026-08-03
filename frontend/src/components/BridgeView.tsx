@@ -14,6 +14,7 @@ import {
   readBalance,
   readDecimals,
   readRemoteRouter,
+  readRouterGate,
   sendApprove,
   sendBridge,
   sendFinalize,
@@ -51,6 +52,52 @@ interface PendingSwap {
 
 type Stage = "idle" | "awaiting-execution" | "ready-to-finalize" | "finalized";
 
+// M5: the swap-and-bridge recovery action (the pending transfer + its stage) is
+// persisted so a page refresh or a wallet-chain switch doesn't strand an in-flight
+// transfer with no way to finalize it. On mount we restore it and then re-derive
+// the live stage from the backend (indexed history / sig-store), so the resumed
+// state reflects reality, not stale memory. Keyed by corridor so distinct
+// in-flight transfers don't clobber each other.
+const PENDING_STORE_KEY = "bridge.pendingSwap.v1";
+
+interface PersistedFlow {
+  pending: PendingSwap;
+  stage: Stage;
+}
+
+// PendingSwap carries bigint fields (amount/nonce/finalMinOut) that JSON can't
+// represent — tag+stringify on write, revive on read.
+function savePendingFlow(flow: PersistedFlow | null) {
+  try {
+    if (!flow || flow.stage === "idle") {
+      localStorage.removeItem(PENDING_STORE_KEY);
+      return;
+    }
+    localStorage.setItem(
+      PENDING_STORE_KEY,
+      JSON.stringify(flow, (_k, v) => (typeof v === "bigint" ? { __bigint: v.toString() } : v))
+    );
+  } catch {
+    /* storage disabled/full — non-fatal, we just lose refresh-resume */
+  }
+}
+
+function loadPendingFlow(): PersistedFlow | null {
+  try {
+    const raw = localStorage.getItem(PENDING_STORE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw, (_k, v) =>
+      v && typeof v === "object" && typeof (v as { __bigint?: string }).__bigint === "string"
+        ? BigInt((v as { __bigint: string }).__bigint)
+        : v
+    ) as PersistedFlow;
+    if (!parsed?.pending?.submissionId || parsed.stage === "idle") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export function BridgeView({ chains, wallet, onReview }: Props) {
   const fromChainId = wallet.chainId; // sends execute on the connected chain
   const fromReg = useMemo(
@@ -77,6 +124,25 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   const [slippageBps, setSlippageBps] = useState(50);
   const [stage, setStage] = useState<Stage>("idle");
   const [pending, setPending] = useState<PendingSwap | null>(null);
+
+  // M5: on mount, resume a persisted in-flight swap-and-bridge so a refresh /
+  // device switch doesn't lose the finalize recovery action. The awaiting →
+  // ready transition is then re-driven from the backend (see the poll effect),
+  // so the restored stage is reconciled with the indexed on-chain reality.
+  useEffect(() => {
+    const restored = loadPendingFlow();
+    if (restored) {
+      setPending(restored.pending);
+      setStage(restored.stage);
+      setCrossSwap(true); // a persisted flow is always a cross-chain swap
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist (or clear) the recovery action whenever it changes.
+  useEffect(() => {
+    savePendingFlow(pending && stage !== "idle" ? { pending, stage } : null);
+  }, [pending, stage]);
 
   // Default destination = first chain that isn't the source. Skipped once a
   // transfer is in flight: the user may switch their wallet to the destination
@@ -287,7 +353,12 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
       setTx({ kind: "pending", label: "Confirming…", hash });
       const r = await waitReceiptFull(wallet.request, hash);
       if (!r.success) throw new Error("swapAndBridge reverted on-chain");
-      const sent = extractSent(r.logs, gate);
+      // M5: match the Sent event against the router's IMMUTABLE on-chain gate, not
+      // the user-editable Gate field — the router emits through its own gate, so a
+      // mistyped/mismatched field must not make us miss (or mis-decode) the event.
+      // Fall back to the typed gate only if the read fails.
+      const emittingGate = await readRouterGate(wallet.request, router).catch(() => gate);
+      const sent = extractSent(r.logs, emittingGate);
       if (!sent) throw new Error("Sent event not found in receipt — can't finalize automatically");
       setPending({
         submissionId: sent.submissionId,

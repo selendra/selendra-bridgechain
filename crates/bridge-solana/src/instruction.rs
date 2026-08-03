@@ -59,6 +59,10 @@ pub enum GateInstruction {
     Claim(ClaimArgs),
     SetValidator { validator: [u8; 20], active: bool },
     SetThreshold { threshold: u32 },
+    /// C1: bind a `debridge_id` to the SPL mint + vault that may back it
+    /// (owner-gated on-chain). Appended last so discriminants 0..=4 stay stable
+    /// and byte-compatible with the deployable program's enum.
+    RegisterAsset { debridge_id: [u8; 32] },
 }
 
 impl GateInstruction {

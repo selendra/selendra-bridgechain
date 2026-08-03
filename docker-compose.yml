@@ -1,37 +1,66 @@
-# Phase 7 — the off-chain bridge stack, dockerized.
+# The off-chain bridge stack, dockerized — COMPLETE product surface (finding H4).
 #
-#   sig-store + 3 independent validators + 1 keeper, plus two anvil chains for
-#   local bring-up. The gate addresses in docker/configs/*.toml are anvil's
-#   DETERMINISTIC deploy addresses (account #0 deploys TestToken then Gate, so
-#   token=0x5FbD..., gate=0xe7f1...). Deploy + wire with docker/deploy.sh.
+# Previously this shipped only sig-store + validators + keeper, so the advertised
+# refund path could never run (no indexer to mark transfers refund-eligible) and
+# there was no product surface (no GraphQL, no UI). It now runs the full topology:
+#
+#   postgres ─ sig-store ─ 3 validators ─ keeper ─ indexer ─ graphql-api ─ frontend
+#
+# with health-gated startup ordering, restart policies, and non-root services.
+# The gate addresses in docker/configs/* are anvil's DETERMINISTIC deploy
+# addresses (account #0 deploys TestToken then Gate). Deploy + wire with
+# docker/deploy.sh.
 #
 # Bring-up:
-#   docker compose up -d anvil-src anvil-dst sig-store
-#   bash docker/deploy.sh                       # deploys + wires on both chains
-#   docker compose up -d validator1 validator2 validator3 keeper
-#   # then `cast send ... send(...)` on localhost:8545 and watch the keeper claim.
+#   docker compose up -d anvil-src anvil-dst
+#   bash docker/deploy.sh                 # deploys + wires on both chains
+#   docker compose up -d                  # brings up the rest, health-ordered
+#   # open http://localhost:8080 (UI) and http://localhost:8088 (GraphiQL)
+#   # send a transfer on localhost:8545 and watch it flow through to EXECUTED.
+#
+# PRODUCTION NOTES:
+#   * Postgres and the sig-store are NOT published to the host here (internal
+#     network only). The anvils/UI/GraphQL are, for local use.
+#   * Set a real secret:  SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
+#   * Replace the anvil services + baked keys/addresses with your real chains.
+
+x-restart: &restart
+  restart: unless-stopped
 
 services:
   anvil-src:
     image: ghcr.io/foundry-rs/foundry:latest
+    <<: *restart
     # foundry image entrypoint wraps the command in a shell, hence one string.
     command: ["anvil --host 0.0.0.0 --chain-id 1337"]
     ports: ["8545:8545"]
+    healthcheck:
+      test: ["CMD", "cast", "chain-id", "--rpc-url", "http://localhost:8545"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   anvil-dst:
     image: ghcr.io/foundry-rs/foundry:latest
+    <<: *restart
     command: ["anvil --host 0.0.0.0 --chain-id 1338"]
     ports: ["8546:8545"]
+    healthcheck:
+      test: ["CMD", "cast", "chain-id", "--rpc-url", "http://localhost:8545"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   postgres:
     image: postgres:16-alpine
+    <<: *restart
     environment:
       POSTGRES_USER: bridge
-      POSTGRES_PASSWORD: bridge
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-bridge}"
       POSTGRES_DB: bridge
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports: ["5432:5432"]
+    # Not published to the host — internal network only (production-safe).
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bridge -d bridge"]
       interval: 3s
@@ -39,61 +68,167 @@ services:
       retries: 20
 
   # Shared secret that authenticates the off-chain stack to the sig-store. The
-  # server requires it on every route but /health; validators/keeper send it via
-  # SIG_STORE_TOKEN (RemoteStore reads that env). Override in real deployments:
+  # server requires it on every route but /health; each service sends it via
+  # SIG_STORE_TOKEN. OVERRIDE in real deployments:
   #   SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
   sig-store:
     build: .
+    <<: *restart
     command: ["sig-store"]
     environment:
       SIG_STORE_BIND: "0.0.0.0:8080"
-      DATABASE_URL: "postgres://bridge:bridge@postgres:5432/bridge"
+      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
       SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
       RUST_LOG: "sig_store=info,bridge_db=info"
     depends_on:
       postgres:
         condition: service_healthy
-    ports: ["8080:8080"]
+    # Not published to the host — internal network only (production-safe).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   validator1:
     build: .
+    <<: *restart
     command: ["validator", "/configs/val1.toml"]
     environment:
       SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
-      - val-state:/data
-    depends_on: [sig-store, anvil-src]
+      - val1-state:/data
+    depends_on:
+      sig-store:
+        condition: service_healthy
+      anvil-src:
+        condition: service_healthy
 
   validator2:
     build: .
+    <<: *restart
     command: ["validator", "/configs/val2.toml"]
     environment:
       SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
-      - val-state:/data
-    depends_on: [sig-store, anvil-src]
+      - val2-state:/data
+    depends_on:
+      sig-store:
+        condition: service_healthy
+      anvil-src:
+        condition: service_healthy
 
   validator3:
     build: .
+    <<: *restart
     command: ["validator", "/configs/val3.toml"]
     environment:
       SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
-      - val-state:/data
-    depends_on: [sig-store, anvil-src]
+      - val3-state:/data
+    depends_on:
+      sig-store:
+        condition: service_healthy
+      anvil-src:
+        condition: service_healthy
 
   keeper:
     build: .
+    <<: *restart
     command: ["keeper", "/configs/keeper.toml"]
     environment:
       SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
     volumes:
       - ./docker/configs:/configs:ro
-    depends_on: [sig-store, anvil-dst]
+    depends_on:
+      sig-store:
+        condition: service_healthy
+      anvil-dst:
+        condition: service_healthy
+
+  # Indexer — the previously-missing piece: it marks stranded transfers
+  # refund-eligible (populating the validators' candidate list) and records
+  # on-chain cancel/refund state. Writes to the shared Postgres.
+  indexer:
+    build: .
+    <<: *restart
+    command: ["indexer", "/configs/indexer.toml"]
+    environment:
+      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
+      RUST_LOG: "indexer=info,bridge_db=info"
+    volumes:
+      - ./docker/configs:/configs:ro
+    depends_on:
+      # Also wait for sig-store: it runs the (idempotent) schema migration first,
+      # so the indexer's migrate() finds the tables already present. Postgres's
+      # `CREATE TABLE IF NOT EXISTS` still races two SIMULTANEOUS first-creates on
+      # pg_type, so we serialize the first migration behind sig-store rather than
+      # run both at once.
+      sig-store:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      anvil-src:
+        condition: service_healthy
+      anvil-dst:
+        condition: service_healthy
+
+  # GraphQL API — the product surface the frontend queries. Reads the sig-store,
+  # the indexer's Postgres (history/refund), and each chain's gate for on-chain
+  # status. Mutations stay OFF (read-only) unless you flip GRAPHQL_ALLOW_MUTATIONS.
+  graphql-api:
+    build: .
+    <<: *restart
+    command:
+      - "graphql-api"
+      - "--bind"
+      - "0.0.0.0:8088"
+      - "--store-url"
+      - "http://sig-store:8080"
+      - "--threshold"
+      - "2"
+      - "--chains-file"
+      - "/configs/chains.json"
+    environment:
+      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
+      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
+      RUST_LOG: "graphql_api=info,bridge_db=info"
+    volumes:
+      - ./docker/configs:/configs:ro
+    ports: ["8088:8088"]
+    depends_on:
+      sig-store:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Frontend — non-root nginx serving the built SPA, proxying /graphql + /health
+  # to graphql-api (same-origin, no CORS).
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    <<: *restart
+    ports: ["8080:8080"]
+    depends_on:
+      graphql-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/ >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata:
-  val-state:
+  val1-state:
+  val2-state:
+  val3-state:

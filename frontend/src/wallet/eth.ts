@@ -17,6 +17,7 @@ const SEL = {
   swapAndBridge: "07c1462d", // swapAndBridge(address,uint256,uint256,uint256,address,address,uint256)
   finalize: "c2c1fffb", // finalize(bytes32,uint256,uint256,uint256,bytes,bytes,bytes)
   remoteRouter: "a6b18e64", // remoteRouter(uint256)
+  gate: "7a0ebc88", // gate() — SwapRouter's immutable Gate
 } as const;
 
 function strip0x(h: string): string {
@@ -247,6 +248,21 @@ function decodeBytesReturn(hex: string): string {
 /** The peer router registered for `chainIdTo` (empty "0x" if the corridor isn't wired). */
 export async function readRemoteRouter(req: Eip1193Request, router: string, chainIdTo: bigint): Promise<string> {
   return decodeBytesReturn(await ethCall(req, router, "0x" + SEL.remoteRouter + encUint(chainIdTo)));
+}
+
+/**
+ * The SwapRouter's immutable `gate()` — the authoritative Gate the router locks
+ * into (M5). The `swapAndBridge` Sent event is emitted by THIS gate, so the log
+ * parser must match against it, not the user-editable Gate address field (which
+ * a user could mistype or point elsewhere, making the parser miss the event or
+ * mis-decode a lookalike). Returns a 20-byte `0x…` address.
+ */
+export async function readRouterGate(req: Eip1193Request, router: string): Promise<string> {
+  const raw = await ethCall(req, router, "0x" + SEL.gate);
+  const h = strip0x(raw);
+  if (h.length < 64) throw new Error("router gate() returned no address");
+  // Address is the low 20 bytes of the returned word.
+  return "0x" + h.slice(24, 64);
 }
 
 // --- writes (eth_sendTransaction) ---------------------------------------

@@ -17,7 +17,9 @@ mod common;
 use alloy_primitives::{Address, U256};
 use bridge_solana::gate::{GateError, Sent, SolanaGate};
 use bridge_solana::instruction::GateInstruction;
-use bridge_solana::relayer::{build_claim_instruction, parse_sent_log_line, sent_to_log_line};
+use bridge_solana::relayer::{
+    build_claim_instruction, parse_sent_log_line, sent_event_to_program_data_line, SentEvent,
+};
 use bridge_solana::verify::{eth_signed_digest, recover_evm_address, verify_threshold, VerifyError};
 use bridge_solana::SOLANA_CHAIN_ID;
 use common::Validator;
@@ -185,9 +187,13 @@ async fn solana_to_evm_send_scan_and_evm_verification() {
     assert_eq!(gate.vault_balance(&debridge_id), amount, "SPL should be locked in the vault");
 
     // --- Validator's Solana source: find & parse the Sent among program logs ---
+    // The program emits its Sent through `sol_log_data`, which the runtime prints
+    // as a `Program data: <b64> <b64>` line. `[0x55; 32]` is the locked mint the
+    // gate registered above — carried in the event as the asset identity (H5).
+    let mint = [0x55u8; 32];
     let logs = [
         "Program log: instruction: Send".to_string(),
-        sent_to_log_line(&sent),
+        sent_event_to_program_data_line(&SentEvent::from_sent(&sent, mint)),
         "Program consumed 4242 compute units".to_string(),
     ];
     let parsed = logs

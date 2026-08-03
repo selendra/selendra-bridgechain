@@ -1600,6 +1600,7 @@ dependencies = [
  "alloy",
  "alloy-primitives",
  "anyhow",
+ "base64",
  "borsh",
  "bridge-core",
  "hex",

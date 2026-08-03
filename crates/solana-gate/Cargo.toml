@@ -19,6 +19,8 @@ crate-type = ["cdylib", "lib"]
 solana-program = "=1.18.26"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
 borsh = { version = "1", features = ["derive"] }
+# Decode the BPF-loader `ProgramData` account (init upgrade-authority check).
+bincode = "1"
 thiserror = "1"
 
 [features]

@@ -24,6 +24,8 @@ sha3 = "0.10"
 k256 = { version = "0.13", features = ["ecdsa"] }
 # Borsh wire format — how a Solana program (de)serializes instruction data.
 borsh = { version = "1", features = ["derive"] }
+# base64 — decode the `Program data:` lines Solana's `sol_log_data` emits.
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
