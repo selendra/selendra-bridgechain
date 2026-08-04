@@ -1,4 +1,4 @@
-# EVM ↔ EVM + EVM ↔ Solana Bridge (Phases 0–8)
+# EVM ↔ EVM + EVM ↔ Solana Bridge
 
 An external-validator bridge built per [`docs/history/bridge-build-plan.md`](docs/history/bridge-build-plan.md),
 modeled on [deBridge's `DeBridgeGate`](https://github.com/debridge-finance/debridge-contracts-v1/tree/main/contracts/transfers).
