@@ -2,6 +2,7 @@ use bridge_core::signer::SignerConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Legacy single-target form: `[target]`. Folded into `targets` on load.
     #[serde(default)]
@@ -24,6 +25,7 @@ pub struct Config {
 
 /// A source chain the keeper can submit `refund()` transactions to.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceChain {
     pub chain_id: u64,
     pub rpc: String,
@@ -33,6 +35,7 @@ pub struct SourceChain {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TargetChain {
     pub chain_id: u64,
     pub rpc: String,
@@ -44,6 +47,7 @@ pub struct TargetChain {
 /// Where the keeper reads signatures: a local directory (`dir`) or the HTTP
 /// sig-store (`url`). `url` wins when both are set.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Store {
     #[serde(default)]
     pub dir: Option<String>,
@@ -59,7 +63,13 @@ impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {path}: {e}"))?;
-        let mut cfg: Config = toml::from_str(&raw)?;
+        Self::from_toml(&raw)
+    }
+
+    /// Parse + validate from a TOML string. Split out from [`load`] so the checks
+    /// below are unit-testable without touching the filesystem.
+    pub fn from_toml(raw: &str) -> anyhow::Result<Self> {
+        let mut cfg: Config = toml::from_str(raw)?;
 
         // Backward compatibility: a single `[target]` is just a one-element list.
         if let Some(t) = cfg.target.take() {
@@ -93,5 +103,77 @@ impl Config {
         }
 
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(body: &str) -> String {
+        format!(
+            "{body}\n\
+             [keeper]\n\
+             private_key = \"0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a\"\n\
+             [store]\n\
+             url = \"http://127.0.0.1:8080\"\n"
+        )
+    }
+
+    const TARGET: &str = "[target]\n\
+                          chain_id = 1338\n\
+                          rpc = \"http://127.0.0.1:8546\"\n\
+                          gate = \"0x0000000000000000000000000000000000000001\"\n";
+
+    #[test]
+    fn legacy_target_block_loads() {
+        let c = Config::from_toml(&cfg(TARGET)).expect("should load");
+        assert_eq!(c.targets.len(), 1);
+        assert_eq!(c.targets[0].chain_id, 1338);
+    }
+
+    // M-4: a misspelled key must be an ERROR, not a silently-ignored no-op. The
+    // validator got `deny_unknown_fields` in the H1 work; the keeper did not, so a
+    // typo here used to fall back to a default (or drop a whole refund source)
+    // with no signal at all.
+    #[test]
+    fn misspelled_field_is_rejected_not_ignored() {
+        let err = Config::from_toml(&cfg(&format!("{TARGET}poll_interval_msec = 500\n")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("poll_interval_msec") || err.contains("unknown field"),
+            "got: {err}"
+        );
+    }
+
+    // The costliest typo: `[[source]]` instead of `[[sources]]` silently produced
+    // a keeper that never submits a single refund.
+    #[test]
+    fn misspelled_sources_table_is_rejected() {
+        let body = format!(
+            "{TARGET}\n[[source]]\n\
+             chain_id = 1337\n\
+             rpc = \"http://127.0.0.1:8545\"\n\
+             gate = \"0x0000000000000000000000000000000000000002\"\n"
+        );
+        let err = Config::from_toml(&cfg(&body)).unwrap_err().to_string();
+        assert!(err.contains("source") || err.contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_target_chain_is_rejected() {
+        let body = format!("{TARGET}\n[[targets]]\n\
+             chain_id = 1338\n\
+             rpc = \"http://127.0.0.1:8546\"\n\
+             gate = \"0x0000000000000000000000000000000000000003\"\n");
+        let err = Config::from_toml(&cfg(&body)).unwrap_err().to_string();
+        assert!(err.contains("duplicate target chain_id"), "got: {err}");
+    }
+
+    #[test]
+    fn no_target_at_all_is_rejected() {
+        let err = Config::from_toml(&cfg("")).unwrap_err().to_string();
+        assert!(err.contains("at least one"), "got: {err}");
     }
 }

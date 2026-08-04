@@ -46,7 +46,7 @@ use bridge_core::allow::{
     AddTokenRequest, AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest,
     SubmissionHistory,
 };
-use bridge_core::auth::require_auth;
+use bridge_core::auth::{require_scope, Auth, Scope};
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
 use bridge_db::{Db, DbError};
 use clap::Parser;
@@ -61,12 +61,54 @@ struct Args {
     /// Postgres connection string, e.g. postgres://bridge:bridge@localhost:5432/bridge
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
-    /// Shared secret required as `Authorization: Bearer <token>` on every route
-    /// except `/health`. When unset the API is UNAUTHENTICATED (dev only) — the
-    /// allowlist (a security control) and history become world-writable, so set
-    /// this in any networked deployment.
+    /// LEGACY all-scopes secret. Still honoured so existing deployments keep
+    /// working, but it grants read + sign + relay + admin to whoever holds it —
+    /// the blast radius finding L-5 is about. Prefer the per-service tokens below.
     #[arg(long, env = "SIG_STORE_TOKEN")]
     auth_token: Option<String>,
+    /// Validators: read + deposit signatures/attestations. Cannot mark claimed or
+    /// edit the allowlist.
+    #[arg(long, env = "SIG_STORE_VALIDATOR_TOKEN")]
+    validator_token: Option<String>,
+    /// Keeper: read + record a claim tx. Cannot deposit signatures.
+    #[arg(long, env = "SIG_STORE_KEEPER_TOKEN")]
+    keeper_token: Option<String>,
+    /// Read-only consumers (the GraphQL API). Grants nothing that writes — this is
+    /// the whole point of the split, since it is the most exposed component.
+    #[arg(long, env = "SIG_STORE_READER_TOKEN")]
+    reader_token: Option<String>,
+    /// Operators: allowlist mutations, itself a security control.
+    #[arg(long, env = "SIG_STORE_ADMIN_TOKEN")]
+    admin_token: Option<String>,
+}
+
+impl Args {
+    /// Assemble the scoped token set. Absent/empty tokens are dropped by
+    /// [`Auth::new`], so an unset variable can never authenticate a request.
+    fn auth(&self) -> Auth {
+        let mut entries: Vec<(String, std::collections::HashSet<Scope>)> = Vec::new();
+        if let Some(t) = self.auth_token.clone().filter(|t| !t.is_empty()) {
+            warn!(
+                "SIG_STORE_TOKEN grants ALL scopes to every holder (read+sign+relay+admin). \
+                 Prefer SIG_STORE_{{VALIDATOR,KEEPER,READER,ADMIN}}_TOKEN so a leak from one \
+                 component cannot write on behalf of the others."
+            );
+            entries.push((t, Scope::all()));
+        }
+        if let Some(t) = self.validator_token.clone() {
+            entries.push((t, [Scope::Read, Scope::Sign].into_iter().collect()));
+        }
+        if let Some(t) = self.keeper_token.clone() {
+            entries.push((t, [Scope::Read, Scope::Relay].into_iter().collect()));
+        }
+        if let Some(t) = self.reader_token.clone() {
+            entries.push((t, [Scope::Read].into_iter().collect()));
+        }
+        if let Some(t) = self.admin_token.clone() {
+            entries.push((t, [Scope::Read, Scope::Admin].into_iter().collect()));
+        }
+        Auth::new(entries)
+    }
 }
 
 #[derive(Clone)]
@@ -84,48 +126,66 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let auth = args.auth();
     let db = Db::connect(&args.database_url).await?;
     info!("connected to Postgres and applied schema");
 
     let state = AppState { db };
 
-    // Everything but /health sits behind the bearer-token gate (when configured).
-    let mut protected = Router::new()
-        .route("/submissions", post(post_submission).get(list_submissions))
+    // L-5: each route group demands the NARROWEST scope that lets it work, so a
+    // credential leaked from one component cannot act as another.
+    //
+    // NOTE: there is deliberately no write route for the `cancelled`/`refunded`
+    // lifecycle at ANY scope. Those states gate the refund-candidate list, so a
+    // forged "refunded" would permanently hide a genuinely stuck transfer from the
+    // relayers. They are written ONLY by the indexer, from observed on-chain
+    // `Cancelled`/`Refunded` events — never on a caller's word.
+    let read = Router::new()
+        .route("/submissions", get(list_submissions))
         .route("/submissions/:id", get(get_submission))
-        .route("/submissions/:id/claimed", post(post_claimed))
-        .route("/submissions/:id/attestations", post(post_attestation))
-        // NOTE: there is deliberately no write route for the `cancelled`/`refunded`
-        // lifecycle. Those states gate the refund-candidate list, so allowing a
-        // caller to set them (a bearer-token holder, or anyone in unauthenticated
-        // dev mode) would let a forged "refunded" permanently hide a genuinely
-        // stuck transfer from the relayers. They are written ONLY by the indexer,
-        // from observed on-chain `Cancelled`/`Refunded` events — never on a
-        // caller's word.
         .route("/refund-candidates", get(get_refund_candidates))
         .route("/history", get(get_history))
-        .route("/allowed/tokens", get(list_tokens).post(add_token))
-        .route("/allowed/tokens/:chain/:token", delete(remove_token))
-        .route("/allowed/chains", get(list_chains).post(add_chain))
-        .route("/allowed/chains/:from/:to", delete(remove_chain));
+        .route("/allowed/tokens", get(list_tokens))
+        .route("/allowed/chains", get(list_chains))
+        .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Read), require_scope));
 
-    match args.auth_token.filter(|t| !t.is_empty()) {
-        Some(token) => {
-            info!("auth enabled: bearer token required on all routes except /health");
-            protected = protected.route_layer(middleware::from_fn_with_state(
-                Arc::new(token),
-                require_auth,
-            ));
-        }
-        None => warn!(
-            "SIG_STORE_TOKEN is unset — API is UNAUTHENTICATED (the allowlist and \
-             history are world-writable). Set a token for any networked deployment."
-        ),
+    // Validators deposit signatures and cancel/refund attestations.
+    let sign = Router::new()
+        .route("/submissions", post(post_submission))
+        .route("/submissions/:id/attestations", post(post_attestation))
+        .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Sign), require_scope));
+
+    // The keeper records a claim tx. Note this is NOT authoritative for the
+    // lifecycle the indexer owns — it only annotates the row.
+    let relay = Router::new()
+        .route("/submissions/:id/claimed", post(post_claimed))
+        .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Relay), require_scope));
+
+    // The allowlists are a security control, so they get their own scope.
+    let admin = Router::new()
+        .route("/allowed/tokens", post(add_token))
+        .route("/allowed/tokens/:chain/:token", delete(remove_token))
+        .route("/allowed/chains", post(add_chain))
+        .route("/allowed/chains/:from/:to", delete(remove_chain))
+        .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Admin), require_scope));
+
+    if auth.is_enforced() {
+        info!(tokens = auth.token_count(), "auth enabled: scoped bearer tokens required");
+    } else {
+        warn!(
+            "no tokens configured — the API is UNAUTHENTICATED (signatures, claim \
+             status and the allowlist are all world-writable). Set at least \
+             SIG_STORE_VALIDATOR_TOKEN / _KEEPER_TOKEN / _READER_TOKEN / _ADMIN_TOKEN \
+             for any networked deployment."
+        );
     }
 
     let app = Router::new()
         .route("/health", get(health))
-        .merge(protected)
+        .merge(read)
+        .merge(sign)
+        .merge(relay)
+        .merge(admin)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
@@ -311,59 +371,130 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{header, Request};
+    use axum::routing::post;
     use tower::ServiceExt; // for `oneshot`
 
-    // The same wiring main() uses: /health open, everything else behind the gate.
-    fn app(token: &str) -> Router {
-        let protected = Router::new()
+    const VAL: &str = "val-token";
+    const KEEP: &str = "keeper-token";
+    const READ: &str = "reader-token";
+    const ADMIN: &str = "admin-token";
+
+    fn test_auth() -> Auth {
+        Auth::new([
+            (VAL.to_string(), [Scope::Read, Scope::Sign].into_iter().collect()),
+            (KEEP.to_string(), [Scope::Read, Scope::Relay].into_iter().collect()),
+            (READ.to_string(), [Scope::Read].into_iter().collect()),
+            (ADMIN.to_string(), [Scope::Read, Scope::Admin].into_iter().collect()),
+        ])
+    }
+
+    /// The same scope layering main() uses, with stub handlers so the test
+    /// exercises the AUTH wiring rather than the database.
+    fn app() -> Router {
+        let auth = test_auth();
+        let read = Router::new()
+            .route("/submissions", get(|| async { "list" }))
             .route("/allowed/tokens", get(|| async { "tokens" }))
             .route_layer(middleware::from_fn_with_state(
-                Arc::new(token.to_string()),
-                require_auth,
+                (auth.clone(), Scope::Read),
+                require_scope,
             ));
-        Router::new().route("/health", get(health)).merge(protected)
+        let sign = Router::new()
+            .route("/submissions", post(|| async { "signed" }))
+            .route_layer(middleware::from_fn_with_state(
+                (auth.clone(), Scope::Sign),
+                require_scope,
+            ));
+        let relay = Router::new()
+            .route("/submissions/:id/claimed", post(|| async { "claimed" }))
+            .route_layer(middleware::from_fn_with_state(
+                (auth.clone(), Scope::Relay),
+                require_scope,
+            ));
+        let admin = Router::new()
+            .route("/allowed/tokens", post(|| async { "added" }))
+            .route_layer(middleware::from_fn_with_state(
+                (auth.clone(), Scope::Admin),
+                require_scope,
+            ));
+        Router::new()
+            .route("/health", get(health))
+            .merge(read)
+            .merge(sign)
+            .merge(relay)
+            .merge(admin)
     }
 
-    async fn status_of(req: Request<Body>) -> StatusCode {
-        app("s3cret").oneshot(req).await.unwrap().status()
-    }
-
-    fn req(uri: &str) -> Request<Body> {
-        Request::builder().uri(uri).body(Body::empty()).unwrap()
-    }
-    fn req_auth(uri: &str, bearer: &str) -> Request<Body> {
-        Request::builder()
-            .uri(uri)
-            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-            .body(Body::empty())
-            .unwrap()
+    async fn status(method: &str, uri: &str, bearer: Option<&str>) -> StatusCode {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        app().oneshot(b.body(Body::empty()).unwrap()).await.unwrap().status()
     }
 
     #[tokio::test]
     async fn health_needs_no_token() {
-        assert_eq!(status_of(req("/health")).await, StatusCode::OK);
+        assert_eq!(status("GET", "/health", None).await, StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn protected_route_rejects_missing_token() {
-        assert_eq!(status_of(req("/allowed/tokens")).await, StatusCode::UNAUTHORIZED);
+    async fn missing_or_wrong_token_is_rejected() {
+        assert_eq!(status("GET", "/submissions", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status("GET", "/submissions", Some("nope")).await, StatusCode::UNAUTHORIZED);
     }
 
+    /// THE L-5 property, end to end through the router: the read-only credential
+    /// the GraphQL API carries — the most exposed component — must be unable to
+    /// write anything. Under the old single shared token it could do everything.
     #[tokio::test]
-    async fn protected_route_rejects_wrong_token() {
+    async fn the_read_only_token_cannot_write_anything() {
+        assert_eq!(status("GET", "/submissions", Some(READ)).await, StatusCode::OK);
+
         assert_eq!(
-            status_of(req_auth("/allowed/tokens", "nope")).await,
+            status("POST", "/submissions", Some(READ)).await,
+            StatusCode::UNAUTHORIZED,
+            "a reader must not deposit signatures"
+        );
+        assert_eq!(
+            status("POST", "/submissions/0xabc/claimed", Some(READ)).await,
+            StatusCode::UNAUTHORIZED,
+            "a reader must not mark transfers claimed"
+        );
+        assert_eq!(
+            status("POST", "/allowed/tokens", Some(READ)).await,
+            StatusCode::UNAUTHORIZED,
+            "a reader must not edit the allowlist"
+        );
+    }
+
+    /// Components cannot act as one another.
+    #[tokio::test]
+    async fn scopes_are_not_interchangeable_over_http() {
+        // A validator signs, but does not relay or administer.
+        assert_eq!(status("POST", "/submissions", Some(VAL)).await, StatusCode::OK);
+        assert_eq!(
+            status("POST", "/submissions/0xabc/claimed", Some(VAL)).await,
             StatusCode::UNAUTHORIZED
         );
+        assert_eq!(status("POST", "/allowed/tokens", Some(VAL)).await, StatusCode::UNAUTHORIZED);
+
+        // The keeper relays, but cannot deposit signatures.
+        assert_eq!(status("POST", "/submissions/0xabc/claimed", Some(KEEP)).await, StatusCode::OK);
+        assert_eq!(status("POST", "/submissions", Some(KEEP)).await, StatusCode::UNAUTHORIZED);
+
+        // The operator administers, but does not sign.
+        assert_eq!(status("POST", "/allowed/tokens", Some(ADMIN)).await, StatusCode::OK);
+        assert_eq!(status("POST", "/submissions", Some(ADMIN)).await, StatusCode::UNAUTHORIZED);
     }
 
+    /// Every component still reads — the shared capability.
     #[tokio::test]
-    async fn protected_route_accepts_correct_token() {
-        assert_eq!(
-            status_of(req_auth("/allowed/tokens", "s3cret")).await,
-            StatusCode::OK
-        );
+    async fn every_service_token_can_read() {
+        for t in [VAL, KEEP, READ, ADMIN] {
+            assert_eq!(status("GET", "/submissions", Some(t)).await, StatusCode::OK, "{t}");
+        }
     }
 
-    // `ct_eq` itself is covered by bridge_core::auth's own tests.
+    // `ct_eq` and the scope table itself are covered by bridge_core::auth's tests.
 }

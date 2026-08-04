@@ -301,12 +301,41 @@ contract RefundTest is Test {
         _refund(sigs);
     }
 
-    function test_Refund_WhenPaused_Reverts() public {
+    /// A paused gate must STILL refund (finding L-2). The breaker exists to stop
+    /// new exposure — `send` locking more, `claim` releasing more — but a refund
+    /// only returns already-locked funds to the address that locked them, and only
+    /// after validators attested a destination burn. Halting it would trap exactly
+    /// the users the incident stranded, for as long as the incident lasted.
+    function test_Refund_WhenPaused_StillPaysOut() public {
         _cancel(_one(v1pk, _cancelId()));
         srcGate.pause();
 
-        vm.expectRevert(Gate.EnforcedPause.selector);
+        uint256 before = token.balanceOf(user);
         _refund(_one(v1pk, _refundId()));
+
+        assertEq(token.balanceOf(user), before + AMOUNT, "paused gate must still refund");
+        assertTrue(srcGate.refunded(submissionId), "refund must be recorded");
+        assertTrue(srcGate.paused(), "the breaker itself stays tripped");
+    }
+
+    /// ...but the exposure-creating paths stay halted, so the exemption above is
+    /// narrow and deliberate rather than a hole in the breaker.
+    function test_Pause_StillHaltsSendAndCancel() public {
+        vm.chainId(CHAIN_SRC);
+        srcGate.pause();
+
+        vm.startPrank(user);
+        token.approve(address(srcGate), AMOUNT);
+        vm.expectRevert(Gate.EnforcedPause.selector);
+        srcGate.send(address(token), AMOUNT, CHAIN_DST, receiver, EMPTY_AUTO);
+        vm.stopPrank();
+
+        // And a cancel on the destination is frozen too — it is irreversible and
+        // forecloses the payout, so it is not exempt the way `refund` is.
+        vm.chainId(CHAIN_DST);
+        dstGate.pause();
+        vm.expectRevert(Gate.EnforcedPause.selector);
+        _cancel(_one(v1pk, _cancelId()));
     }
 
     // -----------------------------------------------------------------

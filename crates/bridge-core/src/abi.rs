@@ -106,10 +106,14 @@ sol! {
         function sentBy(bytes32 submissionId) external view returns (address);
         function refunded(bytes32 submissionId) external view returns (bool);
         function threshold() external view returns (uint256);
-        /// Membership of the on-chain validator set. The keeper uses this to count
-        /// only real validators toward the off-chain quorum, so an outsider's
-        /// (structurally valid) signature cannot inflate the count and provoke a
-        /// guaranteed-reverting on-chain submission.
+        /// Size of the active validator set — also the hard cap `_verifySignatures`
+        /// puts on a submitted signature array. The keeper reads it so it can never
+        /// build an array the gate is guaranteed to reject with `TooManySignatures`.
+        function validatorCount() external view returns (uint256);
+        /// Membership of the on-chain validator set. The keeper uses this to FILTER
+        /// the signatures it submits, so an outsider's (structurally valid)
+        /// signature can neither inflate the off-chain quorum nor pad the on-chain
+        /// array past `validatorCount`.
         function isValidator(address who) external view returns (bool);
         function nonceTo(uint256 chainIdTo) external view returns (uint256);
         function setLocalToken(bytes32 debridgeId, address localToken) external;

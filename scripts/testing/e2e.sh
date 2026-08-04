@@ -147,11 +147,12 @@ private_key = "$KEEPER_KEY"
 dir = "$STORE"
 EOF
 
-echo "=== starting validator + keeper ==="
+# The validator starts FIRST and alone. The keeper is held back until after the
+# junk-signature injection below, so the reproduction is deterministic rather
+# than a race against the keeper's 500ms poll.
+echo "=== starting validator ==="
 "$ROOT/target/debug/validator" "$ROOT/validator.toml" >"$LOGS/validator.log" 2>&1 &
 VALIDATOR_PID=$!
-"$ROOT/target/debug/keeper" "$ROOT/keeper.toml" >"$LOGS/keeper.log" 2>&1 &
-KEEPER_PID=$!
 sleep 1
 
 echo "=== send() 100 TST: $SRC_CHAIN -> $DST_CHAIN ==="
@@ -159,6 +160,65 @@ cast send "$GATE_SRC" "send(address,uint256,uint256,bytes,bytes)" \
   "$TOKEN_SRC" $AMOUNT $DST_CHAIN "$RECEIVER" "0x" \
   --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 echo "  sent. gate(src) now holds: $(cast call $TOKEN_SRC 'balanceOf(address)(uint256)' $GATE_SRC --rpc-url $SRC_RPC)"
+
+# ---------------------------------------------------------------------------
+# Finding H-1 regression — junk signatures must not deny the claim path.
+#
+# The signature store authenticates only that a signature recovers to its CLAIMED
+# signer; it does not check validator membership. So anyone who can write to it
+# can deposit structurally valid signatures from throwaway keys.
+#
+# The keeper used to count only validators toward quorum but then forward the
+# record's ENTIRE signature list as calldata. `Gate._verifySignatures` rejects any
+# array longer than `validatorCount`, so a couple of junk signatures made every
+# submission revert TooManySignatures — forever, because the off-chain quorum
+# still read as satisfied and the tick just retried. The transfer became
+# permanently unclaimable.
+#
+# This gate has ONE validator, so two injected signatures are more than enough.
+# ---------------------------------------------------------------------------
+echo "=== injecting junk signatures (H-1 regression) ==="
+REC=""
+for i in $(seq 1 60); do
+  REC=$(ls "$STORE"/*.json 2>/dev/null | head -1 || true)
+  [[ -n "$REC" ]] && break
+  sleep 0.5
+done
+[[ -n "$REC" ]] || { echo "FAIL: validator never wrote a record to $STORE"; exit 1; }
+
+SUBMISSION_ID="0x$(basename "$REC" .json)"
+echo "  record: $SUBMISSION_ID"
+
+# Two throwaway keys sign the same submissionId. These are real EIP-191
+# signatures over the raw 32-byte id — exactly the shape the store accepts —
+# they simply are not from validators.
+for JUNK_KEY in \
+  0x1111111111111111111111111111111111111111111111111111111111111111 \
+  0x2222222222222222222222222222222222222222222222222222222222222222
+do
+  JUNK_ADDR=$(cast wallet address --private-key "$JUNK_KEY")
+  JUNK_SIG=$(cast wallet sign --private-key "$JUNK_KEY" "$SUBMISSION_ID")
+  python3 - "$REC" "$JUNK_ADDR" "$JUNK_SIG" <<'PY'
+import json, sys
+path, signer, signature = sys.argv[1], sys.argv[2], sys.argv[3]
+rec = json.load(open(path))
+rec.setdefault("signatures", []).append({"signer": signer, "signature": signature})
+json.dump(rec, open(path, "w"), indent=2)
+PY
+  echo "  injected non-validator signature from $JUNK_ADDR"
+done
+
+SIG_COUNT=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))['signatures']))" "$REC")
+VCOUNT=$(cast call "$GATE_DST" "validatorCount()(uint256)" --rpc-url $DST_RPC | awk '{print $1}')
+echo "  store now holds $SIG_COUNT signatures against a gate with validatorCount=$VCOUNT"
+if (( SIG_COUNT <= VCOUNT )); then
+  echo "FAIL: premise broken — need more stored signatures than validatorCount to reproduce H-1"
+  exit 1
+fi
+
+echo "=== starting keeper (must claim despite the junk) ==="
+"$ROOT/target/debug/keeper" "$ROOT/keeper.toml" >"$LOGS/keeper.log" 2>&1 &
+KEEPER_PID=$!
 
 echo "=== waiting for receiver to be paid on target ==="
 PAID=0

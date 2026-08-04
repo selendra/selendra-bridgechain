@@ -14,15 +14,18 @@
 #   scripts/testing/allowlist.sh seed                                # local-dev defaults
 #
 # Env: SIG_STORE=http://127.0.0.1:8080 (override to point elsewhere).
-#      SIG_STORE_TOKEN=...  bearer token, sent if the server requires auth.
+#      SIG_STORE_ADMIN_TOKEN=...  bearer token with the `admin` scope (L-5).
+#      SIG_STORE_TOKEN=...        legacy all-scopes fallback.
 set -euo pipefail
 SIG_STORE="${SIG_STORE:-http://127.0.0.1:8080}"
 
 # Forward the bearer token on every call when one is configured (the sig-store
 # requires it unless it's running in open dev mode).
 AUTH=()
-if [ -n "${SIG_STORE_TOKEN:-}" ]; then
-  AUTH=(-H "authorization: Bearer ${SIG_STORE_TOKEN}")
+# Allowlist mutations need the `admin` scope; fall back to the legacy secret.
+TOKEN="${SIG_STORE_ADMIN_TOKEN:-${SIG_STORE_TOKEN:-}}"
+if [ -n "$TOKEN" ]; then
+  AUTH=(-H "authorization: Bearer ${TOKEN}")
 fi
 
 # Deterministic local anvil deploy (account #0 deploys TestToken then Gate).

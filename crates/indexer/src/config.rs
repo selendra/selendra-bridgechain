@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Postgres connection string. Falls back to the `DATABASE_URL` env var.
     #[serde(default)]
@@ -20,6 +21,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChainCfg {
     pub chain_id: u64,
     pub rpc: String,
@@ -36,8 +38,22 @@ pub struct ChainCfg {
     #[serde(default)]
     pub start_block: u64,
     /// Finality buffer: only process up to `latest - block_confirmation`.
+    ///
+    /// The indexer signs nothing, so a reorg here cannot directly move funds —
+    /// validators independently re-read both gates at their own confirmed block
+    /// before attesting. It still matters: this process is the ONLY writer of
+    /// `refund_status`, and `mark_claimed` clears an `eligible` flag. Reading at
+    /// the tip means a reorged-away `Claimed` can un-flag a genuinely stranded
+    /// transfer, and a reorged-away `Cancelled` can leave the candidate list
+    /// asserting a burn that no longer exists. `Config::load` refuses a 0 buffer
+    /// unless `allow_zero_confirmation` is set.
     #[serde(default)]
     pub block_confirmation: u64,
+    /// Opt out of the non-zero `block_confirmation` requirement. ONLY for
+    /// instant-finality local chains (anvil). Mirrors the validator's field of the
+    /// same name so the two configs read identically.
+    #[serde(default)]
+    pub allow_zero_confirmation: bool,
     #[serde(default = "default_interval")]
     pub poll_interval_ms: u64,
     #[serde(default = "default_range")]
@@ -61,13 +77,36 @@ impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {path}: {e}"))?;
-        let cfg: Config = toml::from_str(&raw)?;
+        Self::from_toml(&raw)
+    }
+
+    /// Parse + validate from a TOML string. Split out from [`load`] so the
+    /// fail-closed checks below are unit-testable without the filesystem.
+    pub fn from_toml(raw: &str) -> anyhow::Result<Self> {
+        let cfg: Config = toml::from_str(raw)?;
         anyhow::ensure!(!cfg.chains.is_empty(), "config needs at least one [[chains]] block");
         for i in 0..cfg.chains.len() {
             for j in (i + 1)..cfg.chains.len() {
                 if cfg.chains[i].chain_id == cfg.chains[j].chain_id {
                     anyhow::bail!("duplicate chain_id {} in config", cfg.chains[i].chain_id);
                 }
+            }
+        }
+        // M-7: the indexer owns `refund_status`, so a tip read can un-flag a
+        // stranded transfer (reorged-away `Claimed`) or assert a burn that no
+        // longer exists (reorged-away `Cancelled`). Fail closed, exactly as the
+        // validator does, unless the operator opts in for an instant-final chain.
+        for c in &cfg.chains {
+            if c.block_confirmation == 0 && !c.allow_zero_confirmation {
+                anyhow::bail!(
+                    "chain_id {} has block_confirmation = 0 — the indexer would record \
+                     Claimed/Cancelled/Refunded from the chain tip, so a reorg could clear a \
+                     refund-eligible flag or assert a burn that was rolled back. Set \
+                     block_confirmation to exceed the chain's finality depth, or set \
+                     allow_zero_confirmation = true ONLY for an instant-finality dev chain \
+                     (e.g. anvil).",
+                    c.chain_id
+                );
             }
         }
         Ok(cfg)
@@ -78,5 +117,57 @@ impl Config {
             .clone()
             .or_else(|| std::env::var("DATABASE_URL").ok())
             .ok_or_else(|| anyhow::anyhow!("no database_url configured and DATABASE_URL env unset"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(chain_body: &str) -> String {
+        format!(
+            "database_url = \"postgres://x@localhost/x\"\n\
+             [[chains]]\n\
+             chain_id = 1337\n\
+             rpc = \"http://127.0.0.1:8545\"\n\
+             gate = \"0x0000000000000000000000000000000000000001\"\n\
+             {chain_body}\n"
+        )
+    }
+
+    // M-7: omitted (defaults to 0) must fail closed.
+    #[test]
+    fn zero_confirmation_is_rejected_by_default() {
+        let err = Config::from_toml(&cfg("")).unwrap_err().to_string();
+        assert!(err.contains("block_confirmation = 0"), "got: {err}");
+
+        let err = Config::from_toml(&cfg("block_confirmation = 0")).unwrap_err().to_string();
+        assert!(err.contains("block_confirmation = 0"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_confirmation_opt_in_is_honored() {
+        let c = Config::from_toml(&cfg("block_confirmation = 0\nallow_zero_confirmation = true"))
+            .expect("opt-in should load");
+        assert!(c.chains[0].allow_zero_confirmation);
+        assert_eq!(c.chains[0].block_confirmation, 0);
+    }
+
+    #[test]
+    fn nonzero_confirmation_is_accepted() {
+        let c = Config::from_toml(&cfg("block_confirmation = 12")).expect("should load");
+        assert_eq!(c.chains[0].block_confirmation, 12);
+    }
+
+    // M-4: a typo must be an error, not a silent default.
+    #[test]
+    fn misspelled_field_is_rejected_not_ignored() {
+        let err = Config::from_toml(&cfg("block_confirmation = 0\nallow_zero_confirmations = true"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("allow_zero_confirmations") || err.contains("unknown field"),
+            "got: {err}"
+        );
     }
 }

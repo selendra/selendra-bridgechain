@@ -19,7 +19,8 @@ pub enum Sink {
 impl Sink {
     pub fn from_config(cfg: &Store) -> anyhow::Result<Self> {
         if let Some(url) = &cfg.url {
-            Ok(Sink::Remote(RemoteStore::new(url.clone())))
+            // L-5: read + sign. Cannot mark claimed or edit the allowlist.
+            Ok(Sink::Remote(RemoteStore::for_role(url.clone(), "SIG_STORE_VALIDATOR_TOKEN")))
         } else if let Some(dir) = &cfg.dir {
             let dir = PathBuf::from(dir);
             store::ensure_dir(&dir)?;

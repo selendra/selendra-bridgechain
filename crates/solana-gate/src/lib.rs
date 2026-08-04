@@ -65,6 +65,19 @@ pub struct InitArgs {
     pub validators: Vec<[u8; 20]>,
     pub threshold: u32,
     pub chain_id: u64,
+    /// Hard capacity for the validator set. The config account is sized from this
+    /// at init, so it must be chosen up front (findings H-3 / L-3): the account
+    /// cannot grow later, and a `Config` that no longer fits its buffer makes
+    /// EVERY instruction that reserializes it — `send`, `set_validator`,
+    /// `set_threshold` — fail permanently.
+    pub max_validators: u32,
+    /// Hard capacity for registered corridors (destination chains). See
+    /// [`process_register_corridor`] for why corridors are governance-registered
+    /// rather than created on demand by `send`.
+    pub max_corridors: u32,
+    /// May trip the circuit breaker but not release it (mirrors `Gate.guardian`).
+    /// Pass `Pubkey::default()` for none.
+    pub guardian: Pubkey,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
@@ -99,6 +112,16 @@ pub enum GateInstruction {
     /// Owner-gated. New variant appended last so existing discriminants (0..=4)
     /// stay byte-compatible with `bridge_solana::instruction::GateInstruction`.
     RegisterAsset { debridge_id: [u8; 32] },
+    /// H-3: owner-gated registration of a destination chain. `send` refuses any
+    /// `chain_id_to` that has not been registered here.
+    RegisterCorridor { chain_id_to: u64 },
+    /// M-1: trip the circuit breaker (owner or guardian).
+    Pause,
+    /// M-1: release the circuit breaker (owner only — a guardian may stop but not
+    /// start, exactly as in `Gate.sol`).
+    Unpause,
+    /// M-1: appoint or clear the pause guardian (owner only).
+    SetGuardian { guardian: Pubkey },
 }
 
 // ---------------------------------------------------------------------------
@@ -108,26 +131,77 @@ pub enum GateInstruction {
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default)]
 pub struct Config {
     pub owner: Pubkey,
+    /// May pause but not unpause. `Pubkey::default()` == none appointed.
+    pub guardian: Pubkey,
     pub validators: Vec<[u8; 20]>,
     pub threshold: u32,
     pub chain_id: u64,
     pub paused: bool,
-    /// (chainIdTo, nextNonce)
+    /// Capacities the account was SIZED for at init. Both vectors are refused
+    /// growth past these, so `Config` can never outgrow its buffer (H-3 / L-3).
+    pub max_validators: u32,
+    pub max_corridors: u32,
+    /// (chainIdTo, nextNonce). One entry per GOVERNANCE-REGISTERED corridor —
+    /// `send` never creates one. See [`process_register_corridor`].
     pub nonce_to: Vec<(u64, u64)>,
+}
+
+/// Borsh-serialized size of a [`Config`] holding `validators` validators and
+/// `corridors` corridors.
+///
+/// Pure and host-testable because getting it wrong is what H-3 was: the account
+/// was a flat 512 bytes and `send` appended a 16-byte corridor entry for any
+/// `chain_id_to` a caller named. Around 25 dust sends to invented chain ids
+/// overflowed the buffer, after which every instruction that reserializes the
+/// config — `send`, `set_validator`, `set_threshold` — failed forever, with no
+/// realloc path. The account is now sized from declared capacities and both
+/// vectors are capped.
+fn config_space(validators: u32, corridors: u32) -> usize {
+    32                              // owner
+    + 32                            // guardian
+    + 4 + 20 * validators as usize  // validators: Vec<[u8; 20]>
+    + 4                             // threshold
+    + 8                             // chain_id
+    + 1                             // paused
+    + 4 + 4                         // max_validators, max_corridors
+    + 4 + 16 * corridors as usize   // nonce_to: Vec<(u64, u64)>
 }
 
 impl Config {
     fn is_validator(&self, a: &[u8; 20]) -> bool {
         self.validators.iter().any(|v| v == a)
     }
+    fn corridor_registered(&self, chain_id_to: u64) -> bool {
+        self.nonce_to.iter().any(|(c, _)| *c == chain_id_to)
+    }
     fn nonce(&self, chain_id_to: u64) -> u64 {
         self.nonce_to.iter().find(|(c, _)| *c == chain_id_to).map(|(_, n)| *n).unwrap_or(0)
     }
-    fn bump_nonce(&mut self, chain_id_to: u64) {
+    /// Advance a REGISTERED corridor's nonce. Returns an error rather than
+    /// creating an entry — corridor creation is governance-only (H-3).
+    fn bump_nonce(&mut self, chain_id_to: u64) -> Result<(), ProgramError> {
         match self.nonce_to.iter_mut().find(|(c, _)| *c == chain_id_to) {
-            Some(e) => e.1 += 1,
-            None => self.nonce_to.push((chain_id_to, 1)),
+            Some(e) => {
+                e.1 = e.1.checked_add(1).ok_or(ProgramError::ArithmeticOverflow)?;
+                Ok(())
+            }
+            None => Err(GateError::CorridorNotRegistered.into()),
         }
+    }
+    /// Serialize back into a fixed-size account, refusing to write a `Config` that
+    /// no longer fits. Borsh's own failure would abort the transaction anyway;
+    /// this reports the real reason instead of an opaque serialization error.
+    fn store(&self, config_ai: &AccountInfo) -> ProgramResult {
+        let needed = config_space(
+            self.validators.len().max(self.max_validators as usize) as u32,
+            self.nonce_to.len().max(self.max_corridors as usize) as u32,
+        );
+        if needed > config_ai.data_len() {
+            msg!("config no longer fits its account; capacities were fixed at init");
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        self.serialize(&mut &mut config_ai.data.borrow_mut()[..])?;
+        Ok(())
     }
 }
 
@@ -254,6 +328,68 @@ fn verify_upgrade_authority(
     }
 }
 
+/// Bytes in a replay marker PDA. One byte is enough to make `data_is_empty()`
+/// false; it also leaves room to record WHICH terminal state was reached once
+/// `cancel` exists (claimed vs burned), which a zero-length account cannot.
+const MARKER_LEN: usize = 1;
+
+/// Pure replay predicate (host-testable) — finding H-2.
+///
+/// The old guard was `lamports() > 0 || !data_is_empty()`, which anyone could
+/// satisfy: a submissionId is public (it is in the source chain's `Sent` event
+/// and in the signature store), so an attacker could simply transfer the
+/// rent-exempt minimum to the derived PDA and every later claim would report
+/// `AlreadyExecuted` forever. Lamports are not evidence of anything — ANY account
+/// can be funded by anyone. Only the program itself can make an account
+/// program-owned with data, so that is what "executed" now means.
+fn is_already_executed(owner: &Pubkey, data_len: usize, program_id: &Pubkey) -> bool {
+    owner == program_id && data_len > 0
+}
+
+/// Create a program-owned marker PDA at `seeds`, tolerating an account a griefer
+/// has pre-funded.
+///
+/// `system_instruction::create_account` fails outright when the target already
+/// holds lamports, which is the other half of H-2. `transfer` + `allocate` +
+/// `assign` is the standard workaround: it tops the balance up to rent exemption
+/// (rather than requiring it to start at zero), then takes ownership.
+fn create_marker<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    marker: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    seeds: &[&[u8]],
+    bump: u8,
+) -> ProgramResult {
+    let rent = Rent::get()?.minimum_balance(MARKER_LEN);
+    let have = marker.lamports();
+    if have < rent {
+        invoke(
+            &system_instruction::transfer(payer.key, marker.key, rent - have),
+            &[payer.clone(), marker.clone(), system_program.clone()],
+        )?;
+    }
+    // Seeds + bump, as `invoke_signed` wants them.
+    let bump_slice = [bump];
+    let mut signer_seeds: Vec<&[u8]> = seeds.to_vec();
+    signer_seeds.push(&bump_slice);
+
+    invoke_signed(
+        &system_instruction::allocate(marker.key, MARKER_LEN as u64),
+        &[marker.clone(), system_program.clone()],
+        &[&signer_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(marker.key, program_id),
+        &[marker.clone(), system_program.clone()],
+        &[&signer_seeds],
+    )?;
+    // Non-zero so `data_is_empty()` reads false even if a future reader forgets
+    // the owner half of the predicate.
+    marker.data.borrow_mut()[0] = 1;
+    Ok(())
+}
+
 /// Read the SPL mint + owner of a token account, asserting it is a real SPL
 /// token account owned by the given `token_program`. Used to verify the vault
 /// and receiver token accounts against the registry (C1: "verify token program,
@@ -269,6 +405,23 @@ fn spl_mint_and_owner(
     let acct = spl_token::state::Account::unpack(&token_ai.data.borrow())
         .map_err(|_| ProgramError::InvalidAccountData)?;
     Ok((acct.mint, acct.owner))
+}
+
+/// Pure vault-safety predicate (host-testable) — finding M-6.
+///
+/// `register_asset` checked the vault's mint and owner, which proves the program
+/// CAN move its funds. It did not prove that nobody else can. An SPL token
+/// account may carry:
+///   * a `delegate`, which can transfer up to `delegated_amount` with no
+///     involvement from the owner PDA at all, and
+///   * a `close_authority`, which can close the account and sweep its lamports.
+/// Either would let whoever holds it drain bridge liquidity entirely outside the
+/// program, past every check this gate makes. A vault must have neither.
+fn vault_is_exclusively_controlled(
+    delegate: Option<Pubkey>,
+    close_authority: Option<Pubkey>,
+) -> bool {
+    delegate.is_none() && close_authority.is_none()
 }
 
 /// Assert `who` is the program's on-chain upgrade authority. Reads the
@@ -327,6 +480,16 @@ pub enum GateError {
     NotEnoughSignatures,
     #[error("bad signature encoding")]
     BadSignature,
+    /// H-3: `send` to a destination chain governance never registered.
+    #[error("corridor (chain_id_to) is not registered")]
+    CorridorNotRegistered,
+    /// M-1: the circuit breaker is tripped.
+    #[error("gate is paused")]
+    Paused,
+    /// H-3 / L-3: the validator set or corridor list is at the capacity the
+    /// config account was sized for at init.
+    #[error("at capacity — the config account was sized for fewer entries")]
+    AtCapacity,
 }
 
 impl From<GateError> for ProgramError {
@@ -458,6 +621,14 @@ pub fn process_instruction(
         GateInstruction::RegisterAsset { debridge_id } => {
             process_register_asset(program_id, accounts, debridge_id)
         }
+        GateInstruction::RegisterCorridor { chain_id_to } => {
+            process_register_corridor(program_id, accounts, chain_id_to)
+        }
+        GateInstruction::Pause => process_set_paused(program_id, accounts, true),
+        GateInstruction::Unpause => process_set_paused(program_id, accounts, false),
+        GateInstruction::SetGuardian { guardian } => {
+            process_set_guardian(program_id, accounts, guardian)
+        }
     }
 }
 
@@ -487,14 +658,21 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
     if args.threshold == 0 || args.threshold > args.validators.len() as u32 {
         return Err(ProgramError::InvalidArgument);
     }
+    // Capacities must cover the initial set and be non-zero, or the gate is born
+    // unable to register the corridor it needs to send anything.
+    if args.max_validators < args.validators.len() as u32 || args.max_corridors == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     // The initializer must be the program's upgrade authority (the deployer).
     require_upgrade_authority(program_id, program_ai, program_data_ai, payer.key)?;
 
-    // Room for the validator set + a handful of per-chain nonces to grow into.
-    let space: usize = 512;
+    // Size the account from the DECLARED capacities rather than a flat 512 bytes
+    // (H-3 / L-3). Both vectors are capped at these, so the config can never grow
+    // past the buffer and wedge every instruction that reserializes it.
+    let space = config_space(args.max_validators, args.max_corridors);
     let rent = Rent::get()?.minimum_balance(space);
     invoke_signed(
         &system_instruction::create_account(payer.key, config_ai.key, rent, space as u64, program_id),
@@ -504,14 +682,126 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
 
     let cfg = Config {
         owner: *payer.key,
+        guardian: args.guardian,
         validators: args.validators,
         threshold: args.threshold,
         chain_id: args.chain_id,
         paused: false,
+        max_validators: args.max_validators,
+        max_corridors: args.max_corridors,
         nonce_to: Vec::new(),
     };
-    cfg.serialize(&mut &mut config_ai.data.borrow_mut()[..])?;
-    msg!("gate initialized: {} validators, threshold {}", cfg.validators.len(), cfg.threshold);
+    cfg.store(config_ai)?;
+    msg!(
+        "gate initialized: {} validators (cap {}), threshold {}, corridor cap {}",
+        cfg.validators.len(),
+        cfg.max_validators,
+        cfg.threshold,
+        cfg.max_corridors
+    );
+    Ok(())
+}
+
+/// Accounts: [config(w), owner(s)]
+///
+/// H-3: register a destination chain `send` may target.
+///
+/// `send` used to accept ANY `chain_id_to` and append a 16-byte `(chain, nonce)`
+/// entry for each new one. The config was a fixed 512-byte account with no
+/// realloc path, so roughly 25 dust sends to invented chain ids overflowed it and
+/// permanently bricked `send`, `set_validator` and `set_threshold` alike. Corridor
+/// creation is therefore governance-only and capacity-bounded; `send` may only
+/// advance a nonce that already exists.
+///
+/// This also mirrors the EVM side's `allowed_chains` allowlist, so a corridor is
+/// an explicit protocol decision on both VMs rather than a side effect of a
+/// caller's arbitrary input.
+fn process_register_corridor(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    chain_id_to: u64,
+) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let owner = next_account_info(it)?;
+
+    let mut cfg = load_config(program_id, config_ai)?;
+    if owner.key != &cfg.owner || !owner.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if chain_id_to == cfg.chain_id {
+        // A corridor to ourselves is meaningless and would collide with local ids.
+        return Err(ProgramError::InvalidArgument);
+    }
+    if cfg.corridor_registered(chain_id_to) {
+        return Ok(()); // idempotent; never resets a live nonce
+    }
+    if cfg.nonce_to.len() as u32 >= cfg.max_corridors {
+        return Err(GateError::AtCapacity.into());
+    }
+    cfg.nonce_to.push((chain_id_to, 0));
+    cfg.store(config_ai)?;
+    msg!("corridor registered: {}", chain_id_to);
+    Ok(())
+}
+
+/// Accounts: [config(w), signer(s)]
+///
+/// M-1: the circuit breaker. `Config.paused` existed but was dead — written
+/// `false` at init, never read, with no instruction able to set it, so the Solana
+/// leg had no incident response at all while `Gate.sol` gated both `send` and
+/// `claim` on one. Guardian may pause; only the owner may unpause.
+fn process_set_paused(program_id: &Pubkey, accounts: &[AccountInfo], paused: bool) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let who = next_account_info(it)?;
+
+    let mut cfg = load_config(program_id, config_ai)?;
+    if !who.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let is_owner = who.key == &cfg.owner;
+    let is_guardian = cfg.guardian != Pubkey::default() && who.key == &cfg.guardian;
+    if !authorized_to_set_paused(is_owner, is_guardian, paused) {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if cfg.paused == paused {
+        return Ok(());
+    }
+    cfg.paused = paused;
+    cfg.store(config_ai)?;
+    msg!("gate {}", if paused { "PAUSED" } else { "resumed" });
+    Ok(())
+}
+
+/// Pure breaker-authority rule (host-testable): a guardian is a low-trust STOP
+/// button — it may halt the gate but never restart it, so a compromised guardian
+/// can only cause a recoverable liveness halt, never resume a gate the owner
+/// deliberately stopped. Mirrors `Gate.pause` / `Gate.unpause`.
+fn authorized_to_set_paused(is_owner: bool, is_guardian: bool, paused: bool) -> bool {
+    if paused {
+        is_owner || is_guardian
+    } else {
+        is_owner
+    }
+}
+
+/// Accounts: [config(w), owner(s)] — appoint or clear the pause guardian.
+fn process_set_guardian(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    guardian: Pubkey,
+) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let owner = next_account_info(it)?;
+
+    let mut cfg = load_config(program_id, config_ai)?;
+    if owner.key != &cfg.owner || !owner.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    cfg.guardian = guardian;
+    cfg.store(config_ai)?;
     Ok(())
 }
 
@@ -534,6 +824,15 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     // C1: bind the chain id + nonce sequence to the canonical config, so a forged
     // config can't rewrite them and desync the off-chain nonce/submissionId.
     let mut cfg = load_config(program_id, config_ai)?;
+    // M-1: the circuit breaker halts new exposure.
+    if cfg.paused {
+        return Err(GateError::Paused.into());
+    }
+    // H-3: only a governance-registered destination. Checked before any account
+    // work so a spam send costs the attacker a failed tx and nothing else.
+    if !cfg.corridor_registered(args.chain_id_to) {
+        return Err(GateError::CorridorNotRegistered.into());
+    }
 
     // C1: bind the locked asset to the canonical registry for this debridge_id.
     // Without this a caller could lock a worthless token against a debridge_id
@@ -559,8 +858,8 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     );
 
     // effects before interaction
-    cfg.bump_nonce(args.chain_id_to);
-    cfg.serialize(&mut &mut config_ai.data.borrow_mut()[..])?;
+    cfg.bump_nonce(args.chain_id_to)?;
+    cfg.store(config_ai)?;
 
     // Emit the Sent event as structured program data for the validator's source,
     // carrying the registered mint as the locked asset identity (H5).
@@ -595,6 +894,10 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
 
     // C1: only the canonical program-owned config may drive signature checks.
     let cfg = load_config(program_id, config_ai)?;
+    // M-1: a paused gate releases nothing.
+    if cfg.paused {
+        return Err(GateError::Paused.into());
+    }
 
     // C1: the vault a claim releases from must be the one the program registered
     // for the SIGNED debridge_id — not an arbitrary vault under the global
@@ -641,19 +944,14 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     if executed_ai.key != &expected_executed {
         return Err(ProgramError::InvalidSeeds);
     }
-    if executed_ai.lamports() > 0 || !executed_ai.data_is_empty() {
+    if is_already_executed(executed_ai.owner, executed_ai.data_len(), program_id) {
         return Err(GateError::AlreadyExecuted.into());
     }
 
     verify_threshold(&cfg, &id, &args.signatures)?;
 
     // Create the executed marker (effects before interaction).
-    let rent = Rent::get()?.minimum_balance(0);
-    invoke_signed(
-        &system_instruction::create_account(payer.key, executed_ai.key, rent, 0, program_id),
-        &[payer.clone(), executed_ai.clone(), system_program.clone()],
-        &[&[b"executed", &id, &[bump]]],
-    )?;
+    create_marker(program_id, payer, executed_ai, system_program, &[b"executed", &id], bump)?;
 
     // Release: vault -> receiver, signed by the vault-authority PDA. Assert the
     // supplied vault_authority IS the canonical PDA (defense in depth: the SPL
@@ -697,6 +995,10 @@ fn process_set_validator(
     }
     let present = cfg.is_validator(&validator);
     if active && !present {
+        // L-3: the account was sized for `max_validators` at init and cannot grow.
+        if cfg.validators.len() as u32 >= cfg.max_validators {
+            return Err(GateError::AtCapacity.into());
+        }
         cfg.validators.push(validator);
     } else if !active && present {
         cfg.validators.retain(|v| v != &validator);
@@ -704,7 +1006,7 @@ fn process_set_validator(
             return Err(ProgramError::InvalidArgument);
         }
     }
-    cfg.serialize(&mut &mut config_ai.data.borrow_mut()[..])?;
+    cfg.store(config_ai)?;
     Ok(())
 }
 
@@ -725,7 +1027,7 @@ fn process_set_threshold(
         return Err(ProgramError::InvalidArgument);
     }
     cfg.threshold = threshold;
-    cfg.serialize(&mut &mut config_ai.data.borrow_mut()[..])?;
+    cfg.store(config_ai)?;
     Ok(())
 }
 
@@ -776,6 +1078,18 @@ fn process_register_asset(
     let (auth, _auth_bump) = Pubkey::find_program_address(&[b"vault_authority"], program_id);
     if vault_owner != auth {
         msg!("register: vault is not owned by the canonical vault_authority PDA");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // M-6: owning the vault is not enough — nobody ELSE may be able to move it.
+    // A pre-set delegate or close authority drains liquidity outside the program
+    // entirely, past every check above.
+    let vault_state = spl_token::state::Account::unpack(&vault.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if !vault_is_exclusively_controlled(
+        vault_state.delegate.into(),
+        vault_state.close_authority.into(),
+    ) {
+        msg!("register: vault has a delegate or close authority set");
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -979,6 +1293,132 @@ mod c1_tests {
             verify_asset_binding(&asset, &fake_prog, &vault, &mint, &mint),
             Err(ProgramError::IncorrectProgramId)
         );
+    }
+
+    // ---------------------------------------------------------------
+    // H-2 — the executed marker
+    // ---------------------------------------------------------------
+
+    // Lamports prove nothing: ANY account can be funded by anyone, and the
+    // submissionId is public (source-chain `Sent` event, signature store). The old
+    // guard `lamports() > 0 || !data_is_empty()` let a griefer transfer the
+    // rent-exempt minimum to the derived PDA and block that claim forever — with
+    // no cancel/refund path on this program to recover from it.
+    #[test]
+    fn a_pre_funded_marker_is_not_executed() {
+        let program_id = pid();
+        let system = Pubkey::default();
+
+        // The griefing state: funded, system-owned, zero data. NOT executed.
+        assert!(
+            !is_already_executed(&system, 0, &program_id),
+            "a pre-funded PDA must not read as already executed"
+        );
+        // Fresh, untouched.
+        assert!(!is_already_executed(&system, 0, &program_id));
+        // Genuinely executed: program-owned WITH data — only this program can
+        // produce that combination.
+        assert!(is_already_executed(&program_id, MARKER_LEN, &program_id));
+        // Program-owned but empty cannot occur via `create_marker`, and is not
+        // treated as executed either.
+        assert!(!is_already_executed(&program_id, 0, &program_id));
+    }
+
+    // ---------------------------------------------------------------
+    // H-3 / L-3 — bounded config
+    // ---------------------------------------------------------------
+
+    /// Borsh size of the PRE-FIX `Config` (no guardian, no capacity fields), for
+    /// the historical-arithmetic test below.
+    fn old_config_space(validators: u32, corridors: u32) -> usize {
+        32 + (4 + 20 * validators as usize) + 4 + 8 + 1 + (4 + 16 * corridors as usize)
+    }
+
+    // The exact arithmetic that made H-3 exploitable: at 3 validators the old flat
+    // 512-byte account held 24 corridors, so the 25th `send` to an invented chain
+    // id overflowed it and bricked send + governance permanently.
+    #[test]
+    fn the_old_flat_512_byte_config_really_did_overflow() {
+        assert!(old_config_space(3, 24) <= 512, "24 corridors fit the old buffer");
+        assert!(old_config_space(3, 25) > 512, "the 25th overflowed it — this was the brick");
+    }
+
+    // The fix, measured against real Borsh output rather than against itself: a
+    // config filled to its declared capacity must fit the account `process_init`
+    // sizes from those same capacities.
+    #[test]
+    fn a_config_at_full_capacity_fits_its_account() {
+        for (v, c) in [(3u32, 8u32), (7, 32), (22, 4), (1, 1)] {
+            let cfg = Config {
+                owner: Pubkey::new_unique(),
+                guardian: Pubkey::new_unique(),
+                validators: (0..v).map(|i| [i as u8; 20]).collect(),
+                threshold: 1,
+                chain_id: SOLANA_CHAIN_ID,
+                paused: false,
+                max_validators: v,
+                max_corridors: c,
+                nonce_to: (0..c as u64).map(|i| (1000 + i, i)).collect(),
+            };
+            let actual = borsh::to_vec(&cfg).expect("serialize").len();
+            assert_eq!(
+                actual,
+                config_space(v, c),
+                "config_space must match real Borsh output at capacity {v}/{c}"
+            );
+        }
+    }
+
+    // `send` can no longer create a corridor — that is governance-only now, which
+    // is what bounds the vector an attacker used to grow.
+    #[test]
+    fn send_cannot_create_a_corridor() {
+        let mut cfg = Config { max_corridors: 4, ..Default::default() };
+        assert!(
+            cfg.bump_nonce(4242).is_err(),
+            "an unregistered destination must be refused, not appended"
+        );
+
+        cfg.nonce_to.push((4242, 0));
+        assert!(cfg.bump_nonce(4242).is_ok(), "a registered corridor advances normally");
+        assert_eq!(cfg.nonce(4242), 1);
+        assert_eq!(cfg.nonce_to.len(), 1, "no entry may ever be appended by a send");
+    }
+
+    // ---------------------------------------------------------------
+    // M-1 — the circuit breaker
+    // ---------------------------------------------------------------
+
+    // A guardian is a low-trust STOP button: it may halt the gate but never
+    // restart it, so a compromised guardian causes a recoverable liveness halt
+    // rather than resuming a gate the owner deliberately stopped.
+    #[test]
+    fn guardian_may_pause_but_only_the_owner_may_resume() {
+        // pause
+        assert!(authorized_to_set_paused(true, false, true), "owner may pause");
+        assert!(authorized_to_set_paused(false, true, true), "guardian may pause");
+        assert!(!authorized_to_set_paused(false, false, true), "a stranger may not");
+        // unpause
+        assert!(authorized_to_set_paused(true, false, false), "owner may resume");
+        assert!(!authorized_to_set_paused(false, true, false), "guardian may NOT resume");
+        assert!(!authorized_to_set_paused(false, false, false), "a stranger may not");
+    }
+
+    // ---------------------------------------------------------------
+    // M-6 — vault exclusivity
+    // ---------------------------------------------------------------
+
+    // Owning the vault proves the program CAN move it; it does not prove nobody
+    // else can. A delegate transfers up to `delegated_amount` with no involvement
+    // from the owner PDA, and a close authority sweeps the account — both entirely
+    // outside this program.
+    #[test]
+    fn vault_with_a_delegate_or_close_authority_is_rejected() {
+        let someone = Pubkey::new_unique();
+        assert!(vault_is_exclusively_controlled(None, None), "a clean vault is fine");
+        assert!(!vault_is_exclusively_controlled(Some(someone), None), "delegate drains it");
+        assert!(!vault_is_exclusively_controlled(None, Some(someone)), "close authority sweeps it");
+        assert!(!vault_is_exclusively_controlled(Some(someone), Some(someone)));
     }
 
     // Atomic/authorized init: only the program's upgrade authority (deployer) may

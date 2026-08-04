@@ -43,6 +43,12 @@ contract DeployProd is Script {
     error WeakThreshold(uint256 threshold, uint256 validatorCount);
     error ZeroConfigAddress();
     error GuardianEqualsOwner();
+    /// @dev the same validator address appears twice in VALIDATORS. The Gate
+    ///      constructor silently dedupes, so a duplicate would quietly shrink the
+    ///      real validator set below the intended size while every check here
+    ///      still passed against the (longer) supplied array.
+    error DuplicateValidator(address validator);
+    error ZeroValidatorAddress();
 
     function run() external {
         Params memory p = Params({
@@ -73,6 +79,17 @@ contract DeployProd is Script {
         if (p.validators.length < 3) revert TooFewValidators(p.validators.length);
         if (p.guardian == address(0) || p.owner == address(0)) revert ZeroConfigAddress();
         if (p.guardian == p.owner) revert GuardianEqualsOwner();
+        // The majority rule below counts the SUPPLIED array, but Gate's constructor
+        // dedupes as it registers. Without this check `[A, B, B]` with threshold 2
+        // passes every rule here and every post-deploy assertion, yet ships a 2-of-2
+        // gate instead of the intended 2-of-3 — a quorum one key short of what the
+        // operator signed off on. Reject duplicates so length == validatorCount.
+        for (uint256 i = 0; i < p.validators.length; i++) {
+            if (p.validators[i] == address(0)) revert ZeroValidatorAddress();
+            for (uint256 j = i + 1; j < p.validators.length; j++) {
+                if (p.validators[i] == p.validators[j]) revert DuplicateValidator(p.validators[j]);
+            }
+        }
         // Strict majority: threshold > validators/2 AND at least 2. This forbids
         // the demo threshold-1 and any sub-majority quorum. (Gate's own constructor
         // only rejects 0 and > count.)
@@ -89,6 +106,11 @@ contract DeployProd is Script {
         require(gate.guardian() == p.guardian, "post: guardian mismatch");
         require(gate.pendingOwner() == p.owner, "post: pendingOwner mismatch");
         require(gate.validatorCount() >= p.threshold, "post: validatorCount < threshold");
+        // The deduplication check above makes these equal; assert it rather than
+        // assume it, so a future change to Gate's constructor cannot silently
+        // reintroduce a smaller-than-intended validator set.
+        require(gate.validatorCount() == p.validators.length, "post: validatorCount != supplied");
+        require(gate.threshold() * 2 > gate.validatorCount(), "post: threshold not a strict majority");
         for (uint256 i = 0; i < p.validators.length; i++) {
             require(gate.isValidator(p.validators[i]), "post: validator not registered");
         }

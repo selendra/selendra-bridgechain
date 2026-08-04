@@ -266,4 +266,40 @@ contract SecurityTest is Test {
         vm.expectRevert(Gate.NotOwner.selector);
         gate.setGuardian(attacker);
     }
+
+    // -----------------------------------------------------------------
+    // M-5: the asset registry is write-once
+    // -----------------------------------------------------------------
+
+    /// A claim commits to a `debridgeId` — a one-way hash of the SOURCE asset —
+    /// never to the local token. So the mapping read at claim time is what decides
+    /// the payout. If it could be repointed, validators could sign a transfer of
+    /// asset X and the very same signatures would release asset Y, with nothing
+    /// they attested having changed.
+    function test_SetLocalToken_IsWriteOnce() public {
+        bytes32 did = keccak256("some-corridor");
+        gate.setLocalToken(did, address(token));
+        assertEq(gate.tokenOf(did), address(token));
+
+        TestToken other = new TestToken("Other", "OTH");
+        vm.expectRevert(
+            abi.encodeWithSelector(Gate.LocalTokenAlreadySet.selector, did, address(token))
+        );
+        gate.setLocalToken(did, address(other));
+
+        assertEq(gate.tokenOf(did), address(token), "registered asset must be immutable");
+    }
+
+    /// Zero is the "unregistered" sentinel `claim` tests against, so it must never
+    /// be storable — otherwise it would read as a corridor that was never set up.
+    function test_SetLocalToken_RejectsZero() public {
+        vm.expectRevert(Gate.ZeroAddress.selector);
+        gate.setLocalToken(keccak256("z"), address(0));
+    }
+
+    function test_SetLocalToken_OnlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.setLocalToken(keccak256("x"), address(token));
+    }
 }

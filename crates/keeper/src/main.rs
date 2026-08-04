@@ -19,9 +19,10 @@
 mod config;
 mod source;
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, B256, U256};
@@ -40,6 +41,16 @@ use tracing::{info, warn};
 /// retried next tick, and each `try_*` re-checks on-chain state first so a retry
 /// after a tx actually landed is a no-op.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often [`GateView`] re-reads `threshold`, `validatorCount` and validator
+/// membership from the gate.
+///
+/// These used to be a startup snapshot (`threshold`) or a memo that never expired
+/// (membership), so an on-chain validator-set change needed a keeper restart to
+/// take effect. That is not merely stale reporting: a cached `true` for a
+/// validator that has since been removed lets the built signature array exceed
+/// the CURRENT `validatorCount`, which `Gate._verifySignatures` rejects outright.
+const GATE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -156,11 +167,11 @@ async fn run_target(
     }
 
     let gate = Gate::new(gate_addr, &provider);
-    let threshold: u64 = loop {
-        match gate.threshold().call().await {
-            Ok(t) => break t.try_into().unwrap_or(u64::MAX),
+    let mut view = loop {
+        match GateView::load(&gate).await {
+            Ok(v) => break v,
             Err(e) => {
-                warn!(chain_id = target.chain_id, error = %e, "read threshold failed; retrying");
+                warn!(chain_id = target.chain_id, error = %e, "read gate params failed; retrying");
                 tokio::time::sleep(retry).await;
             }
         }
@@ -170,15 +181,13 @@ async fn run_target(
         keeper = %signer.address(),
         gate = %gate_addr,
         chain_id = target.chain_id,
-        threshold,
+        threshold = view.threshold,
+        validator_count = view.validator_count,
         "target loop started"
     );
 
-    // Validator-membership memo for this gate, kept across ticks (a set change is
-    // picked up on keeper restart). See `quorum_count`.
-    let mut member_cache: std::collections::HashMap<Address, bool> = std::collections::HashMap::new();
-
     loop {
+        view.refresh_if_stale(&gate).await;
         // Allowlist for this tick. Fail-closed: if the sig-store is unreachable,
         // skip the tick rather than claim on a stale view. None => file mode
         // (no central allowlist, enforcement disabled).
@@ -205,8 +214,9 @@ async fn run_target(
             // refunding most: a transfer the allowlist rejects never collects
             // transfer signatures at all, so it would fail the threshold check,
             // never reach this branch, and its funds would stay locked forever.
-            if quorum_count(&gate, &rec.cancel_signatures, &mut member_cache).await >= threshold {
-                match try_cancel(&gate, &rec).await {
+            let cancel_sigs = view.member_signatures(&gate, &rec.cancel_signatures).await;
+            if cancel_sigs.len() as u64 >= view.threshold {
+                match try_cancel(&gate, &rec, &cancel_sigs).await {
                     // The DB `refund_status` is advanced by the indexer when it
                     // observes the resulting `Cancelled` event on-chain, not
                     // reported here — the keeper's word is not authoritative for a
@@ -223,7 +233,8 @@ async fn run_target(
                 continue;
             }
 
-            if quorum_count(&gate, &rec.signatures, &mut member_cache).await < threshold {
+            let claim_sigs = view.member_signatures(&gate, &rec.signatures).await;
+            if (claim_sigs.len() as u64) < view.threshold {
                 continue;
             }
             // Second enforcement gate (validators are the first): never submit a
@@ -241,7 +252,7 @@ async fn run_target(
                 }
             }
 
-            match try_claim(&gate, &rec).await {
+            match try_claim(&gate, &rec, &claim_sigs).await {
                 Ok(Some(tx)) => {
                     if let Err(e) = source.mark_claimed(&rec.submission_id, &tx).await {
                         warn!(
@@ -300,11 +311,11 @@ async fn run_source_refunds(
     }
 
     let gate = Gate::new(gate_addr, &provider);
-    let threshold: u64 = loop {
-        match gate.threshold().call().await {
-            Ok(t) => break t.try_into().unwrap_or(u64::MAX),
+    let mut view = loop {
+        match GateView::load(&gate).await {
+            Ok(v) => break v,
             Err(e) => {
-                warn!(chain_id = src.chain_id, error = %e, "read threshold failed; retrying");
+                warn!(chain_id = src.chain_id, error = %e, "read gate params failed; retrying");
                 tokio::time::sleep(retry).await;
             }
         }
@@ -314,22 +325,23 @@ async fn run_source_refunds(
         keeper = %signer.address(),
         gate = %gate_addr,
         chain_id = src.chain_id,
-        threshold,
+        threshold = view.threshold,
+        validator_count = view.validator_count,
         "source refund loop started"
     );
 
-    let mut member_cache: std::collections::HashMap<Address, bool> = std::collections::HashMap::new();
-
     loop {
+        view.refresh_if_stale(&gate).await;
         let records = store.load_all().await.unwrap_or_default();
         for rec in records {
             if rec.chain_id_from != src.chain_id {
                 continue;
             }
-            if quorum_count(&gate, &rec.refund_signatures, &mut member_cache).await < threshold {
+            let refund_sigs = view.member_signatures(&gate, &rec.refund_signatures).await;
+            if (refund_sigs.len() as u64) < view.threshold {
                 continue;
             }
-            match try_refund(&gate, &rec).await {
+            match try_refund(&gate, &rec, &refund_sigs).await {
                 // As with cancel, the indexer records `refund_status = refunded`
                 // from the observed on-chain `Refunded` event; the keeper does not
                 // report a state that gates the candidate list.
@@ -349,9 +361,15 @@ async fn run_source_refunds(
 
 /// Submit `claim()` for one record. Returns `Some(tx_hash)` on a fresh claim,
 /// `None` if it was already executed (by us or another keeper).
+///
+/// `sigs` MUST already be filtered to the gate's on-chain validator set (see
+/// [`GateView::member_signatures`]). The record's own `signatures` field is
+/// deliberately NOT read here: it may contain signatures from any key at all, and
+/// forwarding those is what makes a transfer permanently unclaimable.
 async fn try_claim<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
+    sigs: &[SignerSig],
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
@@ -377,7 +395,7 @@ async fn try_claim<P: Provider>(
     let native_sender = bytes_of(&rec.native_sender)?;
 
     // signatures MUST be ordered by signer address, strictly ascending
-    let signatures = sorted_signatures(&rec.signatures)?;
+    let signatures = sorted_signatures(sigs)?;
 
     info!(submission_id = %rec.submission_id, sigs = signatures.len(), "submitting claim()");
 
@@ -423,9 +441,12 @@ async fn try_claim<P: Provider>(
 
 /// Submit `cancel()` on the destination. `None` if it is already executed
 /// (claimed or cancelled) — either way there is nothing to burn.
+///
+/// `sigs` MUST already be validator-filtered — see [`try_claim`].
 async fn try_cancel<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
+    sigs: &[SignerSig],
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
     if gate.executed(submission_id).call().await? {
@@ -437,7 +458,7 @@ async fn try_cancel<P: Provider>(
 
     info!(
         submission_id = %rec.submission_id,
-        sigs = rec.cancel_signatures.len(),
+        sigs = sigs.len(),
         "submitting cancel() — burning the transfer on the destination"
     );
 
@@ -450,7 +471,7 @@ async fn try_cancel<P: Provider>(
             bytes_of(&rec.receiver)?,
             bytes_of(&rec.auto_params)?,
             bytes_of(&rec.native_sender)?,
-            sorted_signatures(&rec.cancel_signatures)?,
+            sorted_signatures(sigs)?,
         )
         .send()
         .await
@@ -477,9 +498,12 @@ async fn try_cancel<P: Provider>(
 
 /// Submit `refund()` on the source. `None` if already refunded, if this gate
 /// never emitted the id, or if we don't know which token was locked.
+///
+/// `sigs` MUST already be validator-filtered — see [`try_claim`].
 async fn try_refund<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
+    sigs: &[SignerSig],
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
@@ -509,7 +533,7 @@ async fn try_refund<P: Provider>(
 
     info!(
         submission_id = %rec.submission_id,
-        sigs = rec.refund_signatures.len(),
+        sigs = sigs.len(),
         "submitting refund() — returning locked funds on the source"
     );
 
@@ -523,7 +547,7 @@ async fn try_refund<P: Provider>(
             bytes_of(&rec.receiver)?,
             bytes_of(&rec.auto_params)?,
             bytes_of(&rec.native_sender)?,
-            sorted_signatures(&rec.refund_signatures)?,
+            sorted_signatures(sigs)?,
         )
         .send()
         .await
@@ -546,46 +570,122 @@ async fn try_refund<P: Provider>(
     Ok(Some(format!("{:#x}", receipt.transaction_hash)))
 }
 
-/// Count how many of `sigs` were signed by a member of `gate`'s on-chain
-/// validator set.
+/// The keeper's live view of one gate: the signature `threshold`, the
+/// `validatorCount` that bounds how long a signature array may be, and a
+/// per-signer membership memo.
 ///
-/// The sig-store verifies only that a signature recovers to its claimed signer,
-/// not that the signer is a validator — so an outsider can deposit a
-/// structurally valid signature over a submissionId. Counting it toward the
-/// off-chain quorum would make the keeper submit a claim/cancel/refund the Gate
-/// is guaranteed to reject (it re-checks every signer against `isValidator`),
-/// burning gas on a revert every tick. Counting only members closes that.
+/// ## Why the array must be filtered, not merely counted
 ///
-/// `cache` memoizes membership per signer across ticks; a validator-set change is
-/// picked up on keeper restart. Fail-closed: an `isValidator` read error leaves
-/// the signer uncounted for this tick (we wait rather than submit a doomed tx)
-/// and is not cached.
-async fn quorum_count<P: Provider>(
-    gate: &Gate::GateInstance<P>,
-    sigs: &[SignerSig],
-    cache: &mut std::collections::HashMap<Address, bool>,
-) -> u64 {
-    let mut count = 0u64;
-    for s in sigs {
-        let Ok(addr) = Address::from_str(&s.signer) else { continue };
-        let member = match cache.get(&addr) {
-            Some(&m) => m,
-            None => match gate.isValidator(addr).call().await {
-                Ok(m) => {
-                    cache.insert(addr, m);
-                    m
-                }
-                Err(e) => {
-                    warn!(signer = %s.signer, error = %e, "isValidator read failed; not counting this signer toward quorum this tick");
-                    continue;
-                }
-            },
-        };
-        if member {
-            count += 1;
+/// The sig-store verifies only that a signature recovers to its claimed signer —
+/// NOT that the signer is a validator. Anyone able to write to the store (any
+/// validator, the keeper, or any holder of the shared token) can therefore
+/// deposit structurally valid signatures from throwaway keys.
+///
+/// Counting only members was necessary but not sufficient. The keeper used to
+/// count members for the quorum decision and then forward the record's ENTIRE
+/// signature list as calldata. `Gate._verifySignatures` rejects any array longer
+/// than `validatorCount`, so two junk signatures against a 3-validator gate made
+/// every submission revert `TooManySignatures` — forever, since the off-chain
+/// quorum still read as satisfied and the tick retried. The transfer became
+/// permanently unclaimable.
+///
+/// So membership is now a FILTER, and the filtered list is the only thing that
+/// ever reaches calldata. Store signers are deduplicated by `(submission_id,
+/// signer)`, and members are a subset of the on-chain set, so the resulting array
+/// can never exceed `validatorCount` — `TooManySignatures` is unreachable.
+struct GateView {
+    threshold: u64,
+    /// Bounds the signature array `Gate._verifySignatures` will accept.
+    validator_count: usize,
+    /// Per-signer membership, refreshed on [`GATE_REFRESH_INTERVAL`].
+    members: HashMap<Address, bool>,
+    refreshed_at: Instant,
+}
+
+impl GateView {
+    async fn load<P: Provider>(gate: &Gate::GateInstance<P>) -> anyhow::Result<Self> {
+        let threshold = gate.threshold().call().await?;
+        let validator_count = gate.validatorCount().call().await?;
+        Ok(GateView {
+            threshold: threshold.try_into().unwrap_or(u64::MAX),
+            validator_count: validator_count.try_into().unwrap_or(usize::MAX),
+            members: HashMap::new(),
+            refreshed_at: Instant::now(),
+        })
+    }
+
+    /// Re-read the gate's parameters once the memo is older than
+    /// [`GATE_REFRESH_INTERVAL`], dropping the membership cache with them.
+    ///
+    /// A read failure leaves the previous (still usable) view in place and retries
+    /// on the next tick — the alternative, treating an RPC blip as "no validators",
+    /// would stall delivery entirely.
+    async fn refresh_if_stale<P: Provider>(&mut self, gate: &Gate::GateInstance<P>) {
+        if self.refreshed_at.elapsed() < GATE_REFRESH_INTERVAL {
+            return;
+        }
+        match GateView::load(gate).await {
+            Ok(fresh) => *self = fresh,
+            Err(e) => {
+                warn!(error = %e, "refreshing gate params failed; keeping the previous view");
+                // Back off a full interval rather than retrying every tick.
+                self.refreshed_at = Instant::now();
+            }
         }
     }
-    count
+
+    /// Those `sigs` signed by a member of the gate's on-chain validator set.
+    ///
+    /// Fail-closed: an `isValidator` read error drops that signer for this tick
+    /// (we wait rather than submit a doomed tx) and is not cached.
+    async fn member_signatures<P: Provider>(
+        &mut self,
+        gate: &Gate::GateInstance<P>,
+        sigs: &[SignerSig],
+    ) -> Vec<SignerSig> {
+        let mut resolved = Vec::with_capacity(sigs.len());
+        for s in sigs {
+            let Ok(addr) = Address::from_str(&s.signer) else { continue };
+            let member = match self.members.get(&addr) {
+                Some(&m) => m,
+                None => match gate.isValidator(addr).call().await {
+                    Ok(m) => {
+                        self.members.insert(addr, m);
+                        m
+                    }
+                    Err(e) => {
+                        warn!(signer = %s.signer, error = %e, "isValidator read failed; dropping this signer for this tick");
+                        continue;
+                    }
+                },
+            };
+            resolved.push((addr, member, s));
+        }
+        filter_members(resolved, self.validator_count)
+    }
+}
+
+/// Keep only member signatures, then cap the result at `validator_count`.
+///
+/// Split from the I/O so the rule is unit-testable. The cap is belt-and-braces:
+/// distinct members can only exceed `validator_count` when the memo is stale
+/// (a validator removed on-chain within the refresh window). Truncating after the
+/// caller sorts would break the ascending-order requirement, so we cap here and
+/// let [`sorted_signatures`] order what survives — a short array reverts
+/// `NotEnoughSignatures`, which is retryable, rather than `TooManySignatures`,
+/// which was not.
+fn filter_members(
+    resolved: Vec<(Address, bool, &SignerSig)>,
+    validator_count: usize,
+) -> Vec<SignerSig> {
+    let mut kept: Vec<(Address, SignerSig)> = resolved
+        .into_iter()
+        .filter(|(_, member, _)| *member)
+        .map(|(addr, _, s)| (addr, s.clone()))
+        .collect();
+    kept.sort_by(|a, b| a.0.cmp(&b.0));
+    kept.truncate(validator_count);
+    kept.into_iter().map(|(_, s)| s).collect()
 }
 
 /// Signatures ordered by recovered signer ascending, as every Gate entry point
@@ -606,4 +706,104 @@ fn bytes_of(hex_str: &str) -> anyhow::Result<Bytes> {
         return Ok(Bytes::new());
     }
     Ok(Bytes::from(hex::decode(s)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A signer whose address is `byte` repeated — lets tests control ordering.
+    fn sig(byte: u8) -> SignerSig {
+        SignerSig {
+            signer: format!("{:#x}", Address::repeat_byte(byte)),
+            signature: format!("0x{}", hex::encode([byte; 65])),
+        }
+    }
+
+    /// What `member_signatures` hands to `filter_members` after its RPC reads.
+    fn resolved<'a>(pairs: &[(&'a SignerSig, bool)]) -> Vec<(Address, bool, &'a SignerSig)> {
+        pairs
+            .iter()
+            .map(|(s, member)| (Address::from_str(&s.signer).unwrap(), *member, *s))
+            .collect()
+    }
+
+    /// THE regression. Before the fix the keeper counted only validators toward
+    /// quorum but forwarded the record's ENTIRE signature list as calldata. Two
+    /// signatures from throwaway keys pushed the array past `validatorCount`, and
+    /// `Gate._verifySignatures` reverted `TooManySignatures` on every retry —
+    /// permanently unclaimable.
+    #[test]
+    fn junk_signatures_never_reach_the_calldata() {
+        let (v1, v2) = (sig(0x11), sig(0x22));
+        let (junk1, junk2) = (sig(0xAA), sig(0xBB));
+        // A 3-validator / threshold-2 gate; the store holds 2 real + 2 forged.
+        let validator_count = 3;
+
+        // The pre-fix path: forward `rec.signatures` verbatim. Pin the defect so
+        // this test fails loudly if anyone reintroduces it.
+        let unfiltered = [&v1, &junk1, &v2, &junk2].len();
+        assert!(
+            unfiltered > validator_count,
+            "premise of this regression: the unfiltered array overflows the gate's cap"
+        );
+
+        let kept = filter_members(
+            resolved(&[(&v1, true), (&junk1, false), (&v2, true), (&junk2, false)]),
+            validator_count,
+        );
+
+        assert_eq!(kept.len(), 2, "only validator signatures may be submitted");
+        assert!(
+            kept.iter().all(|s| s.signer != junk1.signer && s.signer != junk2.signer),
+            "a non-validator signature reached the calldata"
+        );
+        // The Gate's own cap must now be unreachable from the keeper.
+        assert!(
+            kept.len() <= validator_count,
+            "array would revert TooManySignatures at the gate"
+        );
+        // ...and quorum is still met, so the transfer is claimable.
+        assert!(kept.len() >= 2, "junk signatures must not deny a real quorum");
+    }
+
+    /// The stale-memo guard: if validators are removed on-chain inside the refresh
+    /// window, a cached `true` could otherwise build an array longer than the
+    /// CURRENT `validatorCount`. Capping turns that into a retryable
+    /// `NotEnoughSignatures` instead of a permanent `TooManySignatures`.
+    #[test]
+    fn array_is_capped_at_the_current_validator_count() {
+        let sigs: Vec<SignerSig> = (1u8..=4).map(sig).collect();
+        let pairs: Vec<(&SignerSig, bool)> = sigs.iter().map(|s| (s, true)).collect();
+
+        let kept = filter_members(resolved(&pairs), 2);
+
+        assert_eq!(kept.len(), 2, "must not exceed the gate's validatorCount");
+    }
+
+    /// The Gate requires strictly ascending signers; capping must not disturb the
+    /// ordering `sorted_signatures` then relies on.
+    #[test]
+    fn survivors_stay_in_ascending_signer_order() {
+        let (a, b, c) = (sig(0x33), sig(0x11), sig(0x22));
+        let kept = filter_members(resolved(&[(&a, true), (&b, true), (&c, true)]), 3);
+
+        let addrs: Vec<Address> =
+            kept.iter().map(|s| Address::from_str(&s.signer).unwrap()).collect();
+        let mut sorted = addrs.clone();
+        sorted.sort();
+        assert_eq!(addrs, sorted, "signers must be strictly ascending");
+
+        // And the encoded array the gate actually receives round-trips.
+        let encoded = sorted_signatures(&kept).expect("valid hex signatures");
+        assert_eq!(encoded.len(), 3);
+    }
+
+    /// A record carrying nothing but forged signatures must not reach quorum.
+    #[test]
+    fn all_junk_yields_no_quorum() {
+        let (j1, j2, j3) = (sig(0xAA), sig(0xBB), sig(0xCC));
+        let kept = filter_members(resolved(&[(&j1, false), (&j2, false), (&j3, false)]), 3);
+        assert!(kept.is_empty(), "no forged signature may count toward quorum");
+    }
 }

@@ -14,6 +14,30 @@ import {BridgeHash} from "./BridgeHash.sol";
 ///         and releases funds exactly once (replay-safe).
 /// @dev    EVM <-> EVM, lock/unlock model: the target gate holds pre-funded
 ///         liquidity of the local token registered for a debridgeId.
+///
+/// @dev    LIQUIDITY MODEL — read before adding a corridor (finding L-6).
+///
+///         This gate keeps ONE balance per ERC-20, not one per corridor. `claim`
+///         releases `tokenOf[debridgeId]` from that shared balance with no
+///         per-`debridgeId` accounting, so every corridor mapped to the same
+///         local token draws on the same pot. Consequences to plan around:
+///
+///           * Corridors are NOT isolated. If chains B and C both bridge into
+///             this gate's USDC, a surge (or a compromise) on B can exhaust the
+///             liquidity C's users depend on. The failure surfaces as a claim
+///             reverting on transfer, which the two-phase refund then recovers —
+///             availability, not loss.
+///           * Locked value on the source and claimable value on the destination
+///             are related only by operator provisioning. Nothing on-chain
+///             enforces that this gate holds enough to honour what other chains
+///             have locked against it.
+///
+///         Two ways to bound that, neither implemented here because both change
+///         how operators provision and are a product decision rather than a
+///         defect fix: per-`debridgeId` balance accounting (credit on `send` from
+///         the paired chain, debit on `claim`), or a per-corridor rate/volume cap.
+///         Until then, treat shared-token corridors as one trust domain and size
+///         liquidity for their combined worst case.
 contract Gate {
     using SafeERC20 for IERC20;
 
@@ -149,6 +173,10 @@ contract Gate {
     error AlreadyRefunded(bytes32 submissionId);
     /// @dev the `token` passed to `refund` is not the one `debridgeId` commits to
     error TokenMismatch(bytes32 debridgeId, address token);
+    /// @dev `setLocalToken` is write-once: a registered corridor cannot be
+    ///      repointed at a different asset, because in-flight claims bind only the
+    ///      `debridgeId` and would then release the new token.
+    error LocalTokenAlreadySet(bytes32 debridgeId, address current);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -226,7 +254,22 @@ contract Gate {
     }
 
     /// @notice Register the local ERC-20 that backs `debridgeId` on this chain.
+    /// @dev    WRITE-ONCE. A claim commits to a `debridgeId` — a one-way hash of
+    ///         the SOURCE asset — never to the local token, so the mapping read at
+    ///         claim time decides what is actually paid out. If it could be
+    ///         repointed, an owner (or a compromised key) could let validators sign
+    ///         a transfer of asset X and then have the very same signatures release
+    ///         asset Y, with no change to anything the validators attested. The
+    ///         same read backs `SwapRouter._settle`'s `UnexpectedAsset` guard.
+    ///
+    ///         So a nonzero mapping is immutable. Registering a corridor is still a
+    ///         plain owner action; *changing* one is not — deploy a new gate, or
+    ///         route the asset through a fresh debridgeId. `address(0)` is rejected
+    ///         because zero is the "unregistered" sentinel `claim` tests against.
     function setLocalToken(bytes32 debridgeId, address localToken) external onlyOwner {
+        if (localToken == address(0)) revert ZeroAddress();
+        address current = tokenOf[debridgeId];
+        if (current != address(0)) revert LocalTokenAlreadySet(debridgeId, current);
         tokenOf[debridgeId] = localToken;
         emit LocalTokenSet(debridgeId, localToken);
     }
@@ -399,6 +442,12 @@ contract Gate {
     ///         `BridgeHash.getCancelId(submissionId)` — a distinct signing domain,
     ///         so the validators' original transfer signatures (which authorise
     ///         *paying* this submissionId) can never be replayed to burn it.
+    ///
+    ///         Unlike {refund}, this DOES stay behind the breaker. A cancel is
+    ///         irreversible and forecloses the payout permanently, so during an
+    ///         incident it is a state change worth freezing. The asymmetry is
+    ///         deliberate: {refund} only returns funds already locked and already
+    ///         burned on the far side, so it can create no new exposure.
     function cancel(
         bytes32 debridgeId,
         uint256 amount,
@@ -438,6 +487,13 @@ contract Gate {
     /// @param token the ERC-20 originally locked. `debridgeId` is a one-way hash
     ///        of it, so it is supplied by the caller and checked here rather than
     ///        stored — untrusted input, exactly verified.
+    /// @dev    Deliberately NOT `whenNotPaused`. The breaker exists to stop new
+    ///         exposure — `send` locking more funds, `claim` releasing them — but a
+    ///         refund only returns already-locked funds to the address that locked
+    ///         them, and only after validators have attested a destination burn.
+    ///         It cannot create exposure. Halting it would trap exactly the users
+    ///         an incident stranded, for as long as the incident lasted, which is
+    ///         the opposite of what the breaker is for.
     function refund(
         address token,
         bytes32 debridgeId,
@@ -448,7 +504,7 @@ contract Gate {
         bytes calldata autoParams,
         bytes calldata nativeSender,
         bytes[] calldata signatures
-    ) external whenNotPaused returns (bytes32 submissionId) {
+    ) external returns (bytes32 submissionId) {
         submissionId = _idFor(
             debridgeId, amount, block.chainid, chainIdTo, nonce, receiver, autoParams, nativeSender
         );

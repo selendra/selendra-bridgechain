@@ -49,6 +49,13 @@ pub struct InitArgs {
     pub threshold: u32,
     /// This gate's chain id (Solana).
     pub chain_id: u64,
+    /// Hard capacity for the validator set — the config account is SIZED from
+    /// this at init and can never grow (findings H-3 / L-3).
+    pub max_validators: u32,
+    /// Hard capacity for registered corridors (destination chains).
+    pub max_corridors: u32,
+    /// May trip the circuit breaker but not release it. 32 zero bytes == none.
+    pub guardian: [u8; 32],
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
@@ -63,6 +70,17 @@ pub enum GateInstruction {
     /// (owner-gated on-chain). Appended last so discriminants 0..=4 stay stable
     /// and byte-compatible with the deployable program's enum.
     RegisterAsset { debridge_id: [u8; 32] },
+    /// H-3: owner-gated registration of a destination chain. `send` refuses any
+    /// `chain_id_to` not registered here, which is what bounds the corridor
+    /// vector an attacker could previously grow until the config no longer fit
+    /// its account.
+    RegisterCorridor { chain_id_to: u64 },
+    /// M-1: trip the circuit breaker (owner or guardian).
+    Pause,
+    /// M-1: release it (owner only — a guardian may stop but not start).
+    Unpause,
+    /// M-1: appoint or clear the pause guardian (owner only).
+    SetGuardian { guardian: [u8; 32] },
 }
 
 impl GateInstruction {

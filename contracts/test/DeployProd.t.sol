@@ -101,6 +101,38 @@ contract DeployProdTest is Test {
         dep._deploy(p);
     }
 
+    /// L-1: Gate's constructor dedupes as it registers, so `[A, B, B]` used to
+    /// pass every preflight rule (all computed against the SUPPLIED array of 3)
+    /// AND every post-deploy assertion, yet ship a 2-of-2 gate — one key short of
+    /// the quorum the operator signed off on.
+    function test_Deploy_RejectsDuplicateValidators() public {
+        DeployProd.Params memory p = _params();
+        p.validators[2] = p.validators[1]; // [A, B, B] — still length 3
+
+        vm.expectRevert(
+            abi.encodeWithSelector(DeployProd.DuplicateValidator.selector, p.validators[1])
+        );
+        dep._deploy(p);
+    }
+
+    /// A zero entry would be rejected by Gate's own constructor, but failing in
+    /// preflight gives the operator the specific reason before any gas is spent.
+    function test_Deploy_RejectsZeroValidator() public {
+        DeployProd.Params memory p = _params();
+        p.validators[1] = address(0);
+
+        vm.expectRevert(DeployProd.ZeroValidatorAddress.selector);
+        dep._deploy(p);
+    }
+
+    /// The post-deploy assertion that pins the invariant the duplicate check
+    /// establishes: what was registered equals what was supplied.
+    function test_Deploy_ValidatorCountEqualsSuppliedLength() public {
+        Gate gate = dep._deploy(_params());
+        assertEq(gate.validatorCount(), _validators().length, "dedupe must not shrink the set");
+        assertTrue(gate.threshold() * 2 > gate.validatorCount(), "threshold is a strict majority");
+    }
+
     function test_Deploy_RejectsGuardianEqualsOwner() public {
         DeployProd.Params memory p = _params();
         p.guardian = multisig;
