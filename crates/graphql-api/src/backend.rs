@@ -24,7 +24,9 @@ impl Backend {
     }
 
     pub fn remote(url: impl Into<String>) -> Self {
-        Backend::Remote(RemoteStore::new(url))
+        // L-5: read-only credential. The GraphQL API is the most exposed
+        // component, so it must hold nothing that can write.
+        Backend::Remote(RemoteStore::for_role(url, "SIG_STORE_READER_TOKEN"))
     }
 
     pub fn describe(&self) -> String {

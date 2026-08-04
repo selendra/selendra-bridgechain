@@ -21,7 +21,8 @@
 # PRODUCTION NOTES:
 #   * Postgres and the sig-store are NOT published to the host here (internal
 #     network only). The anvils/UI/GraphQL are, for local use.
-#   * Set a real secret:  SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
+#   * Set real secrets: one per service (see the sig-store block below), e.g.
+#       SIG_STORE_VALIDATOR_TOKEN=$(openssl rand -hex 32) docker compose up -d
 #   * Replace the anvil services + baked keys/addresses with your real chains.
 
 x-restart: &restart
@@ -67,10 +68,14 @@ services:
       timeout: 3s
       retries: 20
 
-  # Shared secret that authenticates the off-chain stack to the sig-store. The
-  # server requires it on every route but /health; each service sends it via
-  # SIG_STORE_TOKEN. OVERRIDE in real deployments:
-  #   SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
+  # Per-service credentials (finding L-5). Each token carries only the scopes its
+  # holder needs, so a leak from one component cannot act as another — notably the
+  # GraphQL API, the most exposed service, holds a READ-ONLY token.
+  #   read  : everyone        sign : validators
+  #   relay : keeper          admin: operators
+  # OVERRIDE all of them in real deployments, e.g.
+  #   SIG_STORE_VALIDATOR_TOKEN=$(openssl rand -hex 32) ... docker compose up -d
+  # The legacy all-scopes SIG_STORE_TOKEN is still honoured but logs a warning.
   sig-store:
     build: .
     <<: *restart
@@ -78,7 +83,10 @@ services:
     environment:
       SIG_STORE_BIND: "0.0.0.0:8080"
       DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
-      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
+      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:-dev-keeper-token}"
+      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:-dev-reader-token}"
+      SIG_STORE_ADMIN_TOKEN: "${SIG_STORE_ADMIN_TOKEN:-dev-admin-token}"
       RUST_LOG: "sig_store=info,bridge_db=info"
     depends_on:
       postgres:
@@ -95,7 +103,7 @@ services:
     <<: *restart
     command: ["validator", "/configs/val1.toml"]
     environment:
-      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
     volumes:
       - ./docker/configs:/configs:ro
       - val1-state:/data
@@ -110,7 +118,7 @@ services:
     <<: *restart
     command: ["validator", "/configs/val2.toml"]
     environment:
-      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
     volumes:
       - ./docker/configs:/configs:ro
       - val2-state:/data
@@ -125,7 +133,7 @@ services:
     <<: *restart
     command: ["validator", "/configs/val3.toml"]
     environment:
-      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
     volumes:
       - ./docker/configs:/configs:ro
       - val3-state:/data
@@ -140,7 +148,7 @@ services:
     <<: *restart
     command: ["keeper", "/configs/keeper.toml"]
     environment:
-      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
+      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:-dev-keeper-token}"
     volumes:
       - ./docker/configs:/configs:ro
     depends_on:
@@ -193,7 +201,9 @@ services:
       - "--chains-file"
       - "/configs/chains.json"
     environment:
-      SIG_STORE_TOKEN: "${SIG_STORE_TOKEN:-dev-local-bridge-token}"
+      # READ-ONLY: this service can query the store but cannot write signatures,
+      # mark transfers claimed, or edit the allowlist.
+      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:-dev-reader-token}"
       DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
       RUST_LOG: "graphql_api=info,bridge_db=info"
     volumes:

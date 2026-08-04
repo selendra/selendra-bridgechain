@@ -203,8 +203,13 @@ else
   done
 fi
 
-# Wire when anything fresh was deployed (setLocalToken is idempotent; extra
-# liquidity is harmless on a test chain). Skip entirely for a pure existing stack.
+# Wire when anything fresh was deployed (extra liquidity is harmless on a test
+# chain). Skip entirely for a pure existing stack.
+#
+# setLocalToken is now WRITE-ONCE (finding M-5): a registered corridor cannot be
+# repointed, because in-flight claims bind only the debridgeId and would then
+# release the new asset. So re-running against an already-wired gate must SKIP
+# rather than re-send, or the call reverts LocalTokenAlreadySet.
 if [[ "$DEPLOY_BRIDGE" == "true" || "$DEPLOY_TOKENS" == "true" ]]; then
   say "wiring asset meshes (liquidity + setLocalToken)"
   for sym in "${ASYMS[@]}"; do
@@ -220,7 +225,13 @@ if [[ "$DEPLOY_BRIDGE" == "true" || "$DEPLOY_TOKENS" == "true" ]]; then
         [[ "$ocid" == "$cid" ]] && continue
         otok="${ATOKEN[$sym|$ocid]}"
         pad=$(printf '%064x' "$ocid"); did=$(cast keccak "0x${pad}${otok#0x}")
-        csend "${CGATE[$i]}" "setLocalToken(bytes32,address)" "$did" "$tok" --rpc-url "${CRPC[$i]}" --private-key "$DEPLOYER_KEY"
+        # Write-once: only register a corridor that is still unset.
+        cur=$(cast call "${CGATE[$i]}" "tokenOf(bytes32)(address)" "$did" --rpc-url "${CRPC[$i]}" 2>/dev/null || echo "")
+        if [[ "${cur:-}" =~ ^0x0{40}$ || -z "${cur:-}" ]]; then
+          csend "${CGATE[$i]}" "setLocalToken(bytes32,address)" "$did" "$tok" --rpc-url "${CRPC[$i]}" --private-key "$DEPLOYER_KEY"
+        else
+          info "corridor $sym <- chain $ocid already registered on chain $cid ($cur)"
+        fi
       done
     done
   done
@@ -391,6 +402,9 @@ if [[ "$ENABLE_INDEXER" == "true" ]]; then
       [[ "$ENABLE_SWAP" == "true" && $i == "$swap_idx" && -n "${SWAP_POOL:-}" ]] && echo "pool = \"$SWAP_POOL\""
       echo "start_block = 0"
       echo "block_confirmation = $SOURCE_BLOCK_CONFIRMATION"
+      # M-7: the indexer fails closed on a 0 buffer, so carry the same
+      # instant-finality opt-in the validator config already uses.
+      echo "allow_zero_confirmation = $SOURCE_ALLOW_ZERO_CONFIRMATION"
       echo "poll_interval_ms = 500"
       echo "max_block_range = 1000"
     done

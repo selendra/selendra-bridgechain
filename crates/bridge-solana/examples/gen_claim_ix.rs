@@ -70,6 +70,11 @@ async fn main() {
         validators: validators.clone(),
         threshold: 2,
         chain_id: SOLANA_CHAIN_ID,
+        // Capacities are fixed at init and size the config account (H-3 / L-3).
+        // Headroom for a few validator rotations and destination chains.
+        max_validators: 8,
+        max_corridors: 8,
+        guardian: [0u8; 32], // none appointed in this fixture
     })
     .to_bytes();
 

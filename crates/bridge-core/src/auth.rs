@@ -1,28 +1,166 @@
-//! Shared bearer-token axum middleware for the bridge's operator/admin HTTP
-//! surfaces (the validator's operator API, sig-store). Both services gate their
-//! state-changing routes the same way: a shared secret presented as
-//! `Authorization: Bearer <token>`, compared in constant time so the token can't
-//! be recovered via early-exit timing on the comparison itself.
+//! Bearer-token authentication for the bridge's HTTP surfaces (the signature
+//! store, the validator's operator API).
+//!
+//! ## Why scopes (finding L-5)
+//!
+//! There used to be exactly one secret, `SIG_STORE_TOKEN`, shared by every
+//! validator, the keeper and the GraphQL API. Holding it granted every route. So
+//! compromising ANY one component — including the read-only GraphQL service, the
+//! most exposed of them — granted the ability to write signatures, mark transfers
+//! claimed, and rewrite the allowlist that is itself a security control.
+//!
+//! That blast radius is what made finding H-1 reachable: a single leaked token
+//! let an attacker deposit junk signatures and permanently deny the claim path.
+//!
+//! Tokens now carry [`Scope`]s and each route group demands the narrowest one
+//! that lets it work:
+//!
+//! | Scope    | Grants                                          | Held by    |
+//! |----------|-------------------------------------------------|------------|
+//! | `Read`   | read submissions, history, refund candidates    | everyone   |
+//! | `Sign`   | POST signatures and cancel/refund attestations  | validators |
+//! | `Relay`  | mark a submission claimed                       | keeper     |
+//! | `Admin`  | add/remove allowlist entries                    | operators  |
+//!
+//! A scope is a *capability*, not a role: one token may carry several. The legacy
+//! `SIG_STORE_TOKEN` is still accepted and carries all four, so existing
+//! deployments keep working — but it logs a warning, because it reinstates
+//! exactly the blast radius above.
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Bearer-token gate: reject any request that doesn't present `expected`.
+/// A capability a token may carry. Deliberately fine-grained: the point is that
+/// the GraphQL API can be given `Read` alone, so leaking its credential cannot
+/// write anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// Read submissions, history and refund candidates.
+    Read,
+    /// Write transfer signatures and cancel/refund attestations (validators).
+    Sign,
+    /// Record a claim tx against a submission (the keeper).
+    Relay,
+    /// Mutate the allowlists — itself a security control, hence its own scope.
+    Admin,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Read => "read",
+            Scope::Sign => "sign",
+            Scope::Relay => "relay",
+            Scope::Admin => "admin",
+        }
+    }
+
+    /// Everything — what the legacy single token carries.
+    pub fn all() -> HashSet<Scope> {
+        [Scope::Read, Scope::Sign, Scope::Relay, Scope::Admin].into_iter().collect()
+    }
+}
+
+/// The configured token set. Cheap to clone (one `Arc`).
+///
+/// `disabled()` is the dev-only mode in which every request is allowed; it is
+/// reported loudly by the caller rather than silently assumed.
+#[derive(Clone, Default)]
+pub struct Auth {
+    tokens: Arc<HashMap<String, HashSet<Scope>>>,
+    enforced: bool,
+}
+
+impl Auth {
+    /// Unauthenticated: every request passes. Dev only.
+    pub fn disabled() -> Auth {
+        Auth { tokens: Arc::new(HashMap::new()), enforced: false }
+    }
+
+    /// Build from (token, scopes) pairs. Empty tokens are ignored so an unset
+    /// environment variable cannot accidentally authenticate an empty header.
+    ///
+    /// A token appearing more than once accumulates the union of its scopes,
+    /// which is what lets one operator token be handed several capabilities.
+    pub fn new(entries: impl IntoIterator<Item = (String, HashSet<Scope>)>) -> Auth {
+        let mut tokens: HashMap<String, HashSet<Scope>> = HashMap::new();
+        for (token, scopes) in entries {
+            if token.is_empty() {
+                continue;
+            }
+            tokens.entry(token).or_default().extend(scopes);
+        }
+        let enforced = !tokens.is_empty();
+        Auth { tokens: Arc::new(tokens), enforced }
+    }
+
+    pub fn is_enforced(&self) -> bool {
+        self.enforced
+    }
+
+    /// Number of distinct tokens configured (for startup logging).
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Does `presented` carry `scope`?
+    ///
+    /// Compared in constant time against every configured token. We deliberately
+    /// do NOT short-circuit on the first match: returning early would make the
+    /// response time depend on which token was presented, leaking information
+    /// about the token set's ordering.
+    pub fn grants(&self, presented: &str, scope: Scope) -> bool {
+        if !self.enforced {
+            return true;
+        }
+        let mut granted = false;
+        for (token, scopes) in self.tokens.iter() {
+            let matches = ct_eq(presented.as_bytes(), token.as_bytes());
+            granted |= matches && scopes.contains(&scope);
+        }
+        granted
+    }
+}
+
+/// Extract the bearer token from a request, or `""` when absent/malformed.
+fn bearer(req: &Request) -> &str {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+}
+
+/// Middleware demanding a specific [`Scope`].
+///
+/// Wire it per route group:
+/// ```ignore
+/// .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Sign), require_scope))
+/// ```
+pub async fn require_scope(
+    State((auth, scope)): State<(Auth, Scope)>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if auth.grants(bearer(&req), scope) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Back-compat single-secret gate, still used by the validator's operator API
+/// (which has exactly one privilege level: halt this validator).
 pub async fn require_auth(
     State(expected): State<Arc<String>>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if ct_eq(presented.as_bytes(), expected.as_bytes()) {
+    if ct_eq(bearer(&req).as_bytes(), expected.as_bytes()) {
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -46,6 +184,14 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn auth() -> Auth {
+        Auth::new([
+            ("val-token".to_string(), [Scope::Read, Scope::Sign].into_iter().collect()),
+            ("keeper-token".to_string(), [Scope::Read, Scope::Relay].into_iter().collect()),
+            ("reader-token".to_string(), [Scope::Read].into_iter().collect()),
+        ])
+    }
+
     #[test]
     fn ct_eq_is_correct() {
         assert!(ct_eq(b"abc", b"abc"));
@@ -53,5 +199,76 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab")); // length mismatch
         assert!(!ct_eq(b"", b"x"));
+    }
+
+    // THE L-5 property: a leaked read-only credential must not be able to write.
+    // Under the old single shared token, the GraphQL API's secret was the
+    // validators' secret was the keeper's secret.
+    #[test]
+    fn a_read_token_cannot_write() {
+        let a = auth();
+        assert!(a.grants("reader-token", Scope::Read));
+        assert!(!a.grants("reader-token", Scope::Sign), "read-only must not sign");
+        assert!(!a.grants("reader-token", Scope::Relay), "read-only must not mark claimed");
+        assert!(!a.grants("reader-token", Scope::Admin), "read-only must not touch allowlists");
+    }
+
+    // Each component gets its own capability and nothing more.
+    #[test]
+    fn scopes_are_not_interchangeable() {
+        let a = auth();
+        assert!(a.grants("val-token", Scope::Sign));
+        assert!(!a.grants("val-token", Scope::Relay), "a validator must not mark claimed");
+        assert!(!a.grants("val-token", Scope::Admin), "a validator must not edit the allowlist");
+
+        assert!(a.grants("keeper-token", Scope::Relay));
+        assert!(!a.grants("keeper-token", Scope::Sign), "the keeper must not deposit signatures");
+    }
+
+    #[test]
+    fn unknown_and_empty_tokens_are_refused() {
+        let a = auth();
+        for t in ["", "nope", "val-token "] {
+            for s in [Scope::Read, Scope::Sign, Scope::Relay, Scope::Admin] {
+                assert!(!a.grants(t, s), "token {t:?} must not grant {}", s.as_str());
+            }
+        }
+    }
+
+    // An unset env var must not become a valid empty credential.
+    #[test]
+    fn empty_configured_tokens_are_dropped() {
+        let a = Auth::new([(String::new(), Scope::all())]);
+        assert!(!a.is_enforced(), "no usable token => no enforcement to claim");
+        assert_eq!(a.token_count(), 0);
+    }
+
+    // The legacy single secret still works, carrying every scope.
+    #[test]
+    fn legacy_single_token_carries_all_scopes() {
+        let a = Auth::new([("legacy".to_string(), Scope::all())]);
+        for s in [Scope::Read, Scope::Sign, Scope::Relay, Scope::Admin] {
+            assert!(a.grants("legacy", s));
+        }
+    }
+
+    // Dev mode: no tokens configured at all => open. Explicit, not accidental.
+    #[test]
+    fn disabled_auth_allows_everything() {
+        let a = Auth::disabled();
+        assert!(!a.is_enforced());
+        assert!(a.grants("", Scope::Admin));
+    }
+
+    // One token may hold several capabilities (an operator key, say).
+    #[test]
+    fn duplicate_entries_union_their_scopes() {
+        let a = Auth::new([
+            ("op".to_string(), [Scope::Read].into_iter().collect()),
+            ("op".to_string(), [Scope::Admin].into_iter().collect()),
+        ]);
+        assert!(a.grants("op", Scope::Read));
+        assert!(a.grants("op", Scope::Admin));
+        assert!(!a.grants("op", Scope::Sign));
     }
 }

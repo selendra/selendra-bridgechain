@@ -1,0 +1,170 @@
+name: CI
+
+# Every fix in remediation-plan.md is a regression test somewhere in here.
+# Without this workflow they were silently un-enforced: the repository had no CI
+# at all, so a revert of any of them would have gone unnoticed.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Also non-blocking until the tree is run through `cargo fmt --all` once;
+      # flipping this on a large unformatted diff would bury real failures.
+      - name: Format (non-blocking — run `cargo fmt --all` to make this blocking)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # Non-blocking for now: the tree carries a handful of pre-existing lints
+      # (11 at the last audit). Clear those, then drop `continue-on-error` and add
+      # `-D warnings` so new lints cannot accumulate.
+      - name: Clippy (non-blocking — see note)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+      - name: Tests
+        run: cargo test --workspace --all-targets
+
+  solana-gate:
+    name: Solana gate — host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/solana-gate
+
+      # The program is EXCLUDED from the root workspace (its deps are pinned to
+      # the on-chain runtime), so it needs its own invocation. These are the
+      # host-runnable authorization predicates — see the note in `deploy-readiness`
+      # below for what they deliberately do not cover.
+      - name: Tests
+        run: cargo test --manifest-path crates/solana-gate/Cargo.toml --lib
+
+      - name: Clippy (non-blocking — see note in the `rust` job)
+        continue-on-error: true
+        run: cargo clippy --manifest-path crates/solana-gate/Cargo.toml --all-targets
+
+  contracts:
+    name: Solidity — forge test + coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build
+        run: forge build --sizes
+
+      - name: Tests
+        run: forge test -vv
+
+      # Known-failing today: `forge coverage` hits stack-too-deep on Gate.send and
+      # the --ir-minimum fallback throws a Yul stack exception. Tracked in
+      # remediation-plan.md (P4). Non-blocking until that is resolved, so the
+      # signal is visible without wedging every PR.
+      - name: Coverage (non-blocking)
+        continue-on-error: true
+        run: forge coverage --report summary
+
+  frontend:
+    name: Frontend — build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+  static:
+    name: Compose + shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker compose config
+        run: docker compose config --quiet
+
+      # Every generated config in these scripts is a place a fail-closed check can
+      # be silently mis-emitted (findings H1 / M-7), so at minimum they must parse.
+      - name: Shell syntax
+        run: bash -n scripts/*.sh scripts/testing/*.sh docker/*.sh
+
+      - name: shellcheck
+        continue-on-error: true
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S warning scripts/*.sh scripts/testing/*.sh docker/*.sh
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-readiness:
+    name: Solana SBF build (deploy gate)
+    runs-on: ubuntu-latest
+    # The host tests in `solana-gate` cover authorization logic. They cannot cover
+    # what only the real target enforces:
+    #   * compute-unit budget — secp256k1_recover is ~25k CU per signature, so a
+    #     5-of-7 gate spends ~175k on recovery alone against a 200k default;
+    #   * the 4 KB SBF stack frame limit;
+    #   * the deployed .so artifact itself.
+    # Non-blocking while the Solana leg is unwired (finding M-3); make this
+    # REQUIRED before the program is ever deployed.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.26/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Build BPF
+        run: cargo build-sbf --manifest-path crates/solana-gate/Cargo.toml

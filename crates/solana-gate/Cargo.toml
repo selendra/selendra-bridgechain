@@ -25,3 +25,13 @@ thiserror = "1"
 
 [features]
 no-entrypoint = []
+
+# Account-level tests. `solana-program-test` runs the program NATIVELY via
+# `processor!(process_instruction)` — no SBF toolchain required — inside a real
+# test bank, so rent, lamports, account ownership, PDA derivation and CPI all
+# behave as on-chain. This is what actually exercises the handlers; the
+# `c1_tests` module only covers the pure authorization predicates.
+[dev-dependencies]
+solana-program-test = "=1.18.26"
+solana-sdk = "=1.18.26"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

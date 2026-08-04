@@ -139,6 +139,7 @@ rpc = "$SRC_RPC"
 gate = "$GATE_SRC"
 start_block = 0
 block_confirmation = 0
+allow_zero_confirmation = true   # anvil is instant-final
 poll_interval_ms = 500
 max_block_range = 1000
 
@@ -148,6 +149,7 @@ rpc = "$DST_RPC"
 gate = "$GATE_DST"
 start_block = 0
 block_confirmation = 0
+allow_zero_confirmation = true   # anvil is instant-final
 poll_interval_ms = 500
 max_block_range = 1000
 EOF

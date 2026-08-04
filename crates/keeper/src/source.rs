@@ -18,7 +18,8 @@ pub enum Source {
 impl Source {
     pub fn from_config(cfg: &Store) -> anyhow::Result<Self> {
         if let Some(url) = &cfg.url {
-            Ok(Source::Remote(RemoteStore::new(url.clone())))
+            // L-5: read + mark-claimed. Cannot deposit signatures.
+            Ok(Source::Remote(RemoteStore::for_role(url.clone(), "SIG_STORE_KEEPER_TOKEN")))
         } else if let Some(dir) = &cfg.dir {
             Ok(Source::File(PathBuf::from(dir)))
         } else {

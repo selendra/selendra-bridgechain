@@ -15,8 +15,9 @@ chain_id = 1337
 rpc = "http://anvil-src:8545"
 gate = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 start_block = 0
-# anvil is instant-final; on a real chain set a finality buffer (finding H1).
+# anvil is instant-final; on a real chain set a finality buffer (findings H1/M-7).
 block_confirmation = 0
+allow_zero_confirmation = true   # NEVER set this on a real chain
 poll_interval_ms = 500
 max_block_range = 1000
 
@@ -26,5 +27,6 @@ rpc = "http://anvil-dst:8545"
 gate = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 start_block = 0
 block_confirmation = 0
+allow_zero_confirmation = true   # NEVER set this on a real chain
 poll_interval_ms = 500
 max_block_range = 1000

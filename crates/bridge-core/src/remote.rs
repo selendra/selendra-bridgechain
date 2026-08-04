@@ -19,10 +19,24 @@ pub struct RemoteStore {
 }
 
 impl RemoteStore {
+    /// Build a client for the calling service, presenting the narrowest
+    /// credential it has (finding L-5).
+    ///
+    /// `role_env` is the service's own variable — `SIG_STORE_VALIDATOR_TOKEN`,
+    /// `SIG_STORE_KEEPER_TOKEN`, `SIG_STORE_READER_TOKEN` — and wins when set.
+    /// `SIG_STORE_TOKEN` remains the fallback so existing single-secret
+    /// deployments keep working; it just grants far more than any one service
+    /// needs, which is the thing worth migrating away from.
+    pub fn for_role(base: impl Into<String>, role_env: &str) -> Self {
+        let token = std::env::var(role_env)
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(|| std::env::var("SIG_STORE_TOKEN").ok());
+        Self::with_token(base, token)
+    }
+
+    /// Legacy constructor: the shared all-scopes secret only.
     pub fn new(base: impl Into<String>) -> Self {
-        // The sig-store is an authenticated trust boundary. If `SIG_STORE_TOKEN`
-        // is set, every request carries `Authorization: Bearer <token>` so the
-        // server accepts us; unset means the server is in open dev mode.
         Self::with_token(base, std::env::var("SIG_STORE_TOKEN").ok())
     }
 
