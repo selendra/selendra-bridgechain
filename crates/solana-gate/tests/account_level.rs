@@ -18,15 +18,15 @@
 //! covered by `c1_tests::init_requires_upgrade_authority`. Tests below therefore
 //! seed the config account directly, exactly as a successful `init` would leave it.
 //!
-//! **Nothing past an SPL CPI is covered.** `register_asset`, `send`'s lock and
-//! `claim`'s release all `invoke` into the SPL token program, which is not in this
-//! bank. So H-2's `create_marker` — the transfer/allocate/assign on a
-//! griefer-funded PDA — is still unexecuted; it sits behind `claim`'s asset checks.
-//! Closing that needs `spl_token.so` added to the bank.
+//! Everything else IS covered, including the SPL-backed paths: `solana-program-test`
+//! bundles the SPL token program (`programs::spl_programs`), so `send`'s lock,
+//! `claim`'s release and `refund`'s payout all execute for real here against
+//! genuine token accounts.
 //!
-//! What IS executed below: `process_register_corridor`, `process_set_paused`,
-//! `process_set_guardian`, `process_set_validator`, and `send`'s pause + corridor
-//! guards — i.e. the live paths for findings H-3, L-3 and M-1.
+//! Executed below: `process_register_corridor`, `process_set_paused`,
+//! `process_set_guardian`, `process_set_validator`, `process_register_asset`,
+//! `process_send`, `process_claim`, `process_cancel` and `process_refund` —
+//! i.e. the live paths for findings H-2, H-3, M-1, M-2, M-6 and L-3.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::instruction::{AccountMeta, Instruction};
@@ -36,7 +36,7 @@ use solana_sdk::account::Account;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 
-use solana_gate::{process_instruction, Config, GateInstruction, SendArgs};
+use solana_gate::{process_instruction, CancelArgs, Config, GateInstruction, SendArgs};
 
 const PROGRAM_ID: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const CHAIN_ID: u64 = 7565164; // Solana
@@ -55,6 +55,19 @@ fn config_space(validators: u32, corridors: u32) -> usize {
 /// A bank with the gate registered and its config PDA already initialized —
 /// owner-gated instructions are then driven by `owner`, which is funded.
 async fn setup(max_validators: u32, max_corridors: u32, guardian: Pubkey) -> (ProgramTestContext, Keypair) {
+    setup_with_validators(max_validators, max_corridors, guardian, vec![[1u8; 20], [2u8; 20], [3u8; 20]], 2).await
+}
+
+/// As [`setup`], but with a caller-chosen validator set and threshold — needed by
+/// the quorum tests, which must seed the addresses their real signatures recover
+/// to rather than placeholder bytes.
+async fn setup_with_validators(
+    max_validators: u32,
+    max_corridors: u32,
+    guardian: Pubkey,
+    validators: Vec<[u8; 20]>,
+    threshold: u32,
+) -> (ProgramTestContext, Keypair) {
     let owner = Keypair::new();
     let mut pt = ProgramTest::new("solana_gate", PROGRAM_ID, processor!(process_instruction));
 
@@ -73,8 +86,8 @@ async fn setup(max_validators: u32, max_corridors: u32, guardian: Pubkey) -> (Pr
     let cfg = Config {
         owner: owner.pubkey(),
         guardian,
-        validators: vec![[1u8; 20], [2u8; 20], [3u8; 20]],
-        threshold: 2,
+        validators,
+        threshold,
         chain_id: CHAIN_ID,
         paused: false,
         max_validators,
@@ -108,13 +121,19 @@ async fn exec(
     instruction: Instruction,
     extra: &[&Keypair],
 ) -> Result<(), solana_sdk::transaction::TransactionError> {
+    // A FRESH blockhash per call. Reusing `ctx.last_blockhash` for an identical
+    // instruction produces a byte-identical transaction, which the bank
+    // deduplicates and reports as success — making a replay test pass for the
+    // wrong reason (it never reached the program at all). Taken before the
+    // signer borrows so `ctx` is not aliased.
+    let blockhash = ctx.get_new_latest_blockhash().await.unwrap_or(ctx.last_blockhash);
     let mut signers: Vec<&Keypair> = vec![&ctx.payer];
     signers.extend_from_slice(extra);
     let tx = Transaction::new_signed_with_payer(
         &[instruction],
         Some(&ctx.payer.pubkey()),
         &signers,
-        ctx.last_blockhash,
+        blockhash,
     );
     ctx.banks_client.process_transaction(tx).await.map_err(|e| match e {
         solana_program_test::BanksClientError::TransactionError(te) => te,
@@ -154,6 +173,8 @@ fn send_instruction(signer: Pubkey, chain_id_to: u64) -> Instruction {
             AccountMeta::new(Pubkey::new_unique(), false), // user_token
             AccountMeta::new(Pubkey::new_unique(), false), // vault
             AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new(Pubkey::new_unique(), false), // sent record (M-2)
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
         ],
     )
 }
@@ -350,4 +371,808 @@ async fn validator_set_is_capped_at_the_declared_capacity() {
     let err = exec(&mut ctx, add(5), &[&owner]).await.expect_err("past capacity must fail");
     assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
     assert_eq!(read_config(&mut ctx).await.validators.len(), 4, "state unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// M-2 — the destination-side burn, executed
+//
+// `cancel` moves no funds, so unlike `refund` it needs neither the asset registry
+// nor the SPL token program — which makes it fully drivable here.
+// ---------------------------------------------------------------------------
+
+fn executed_pda(id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"executed", id], &PROGRAM_ID).0
+}
+
+/// Recompute the submissionId exactly as the program does, so the test can derive
+/// the marker PDA the instruction will touch.
+fn submission_id_for(args: &CancelArgs, chain_id_to: u64) -> [u8; 32] {
+    use solana_program::keccak;
+    fn be32(v: u64) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[24..].copy_from_slice(&v.to_be_bytes());
+        o
+    }
+    keccak::hashv(&[
+        &be32(1), // SUBMISSION_PREFIX
+        &args.debridge_id,
+        &be32(args.chain_id_from),
+        &be32(chain_id_to),
+        &be32(args.amount),
+        &args.receiver,
+        &be32(args.nonce),
+    ])
+    .to_bytes()
+}
+
+fn cancel_args(signatures: Vec<Vec<u8>>) -> CancelArgs {
+    CancelArgs {
+        debridge_id: [9u8; 32],
+        amount: 100,
+        chain_id_from: DEST_CHAIN,
+        nonce: 0,
+        receiver: vec![0xAB; 32],
+        auto: None,
+        native_sender: vec![0x11; 20],
+        signatures,
+    }
+}
+
+fn cancel_instruction(args: CancelArgs, payer: Pubkey) -> (Instruction, [u8; 32]) {
+    let id = submission_id_for(&args, CHAIN_ID);
+    let instruction = ix(
+        GateInstruction::Cancel(args),
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new(executed_pda(&id), false),
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    (instruction, id)
+}
+
+/// Without a validator quorum over the CANCEL digest, nothing is burned. This is
+/// the guard that stops anyone simply erasing a healthy in-flight transfer.
+#[tokio::test]
+async fn cancel_without_a_quorum_is_refused_and_burns_nothing() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+
+    let (instruction, id) = cancel_instruction(cancel_args(vec![]), owner.pubkey());
+    let err = exec(&mut ctx, instruction, &[&owner])
+        .await
+        .expect_err("no signatures must not reach the threshold");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+
+    // Nothing was created, so the transfer stays claimable.
+    let marker = ctx.banks_client.get_account(executed_pda(&id)).await.unwrap();
+    assert!(marker.is_none(), "a refused cancel must leave no marker");
+}
+
+/// A transfer signature must not be replayable as a cancel. The two are signed
+/// over different digests (`submissionId` vs `keccak(2 || submissionId)`), so a
+/// transfer quorum recovers to the wrong addresses here and cannot reach the
+/// threshold — the same domain separation `BridgeHash` enforces on the EVM side.
+#[tokio::test]
+async fn a_transfer_signature_cannot_be_replayed_as_a_cancel() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+
+    // 65-byte structurally valid signatures that are not over the cancel digest.
+    let junk = vec![vec![0x1bu8; 65], vec![0x1bu8; 65]];
+    let (instruction, id) = cancel_instruction(cancel_args(junk), owner.pubkey());
+
+    let err = exec(&mut ctx, instruction, &[&owner])
+        .await
+        .expect_err("signatures from the wrong domain must not authorise a burn");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+    assert!(ctx.banks_client.get_account(executed_pda(&id)).await.unwrap().is_none());
+}
+
+/// A paused gate refuses to burn as well as to send — cancel is irreversible and
+/// forecloses the payout, so it is deliberately NOT exempt the way refund is.
+#[tokio::test]
+async fn a_paused_gate_refuses_cancel() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    exec(&mut ctx, pause(owner.pubkey()), &[&owner]).await.expect("pause");
+
+    let (instruction, _) = cancel_instruction(cancel_args(vec![]), owner.pubkey());
+    let err = exec(&mut ctx, instruction, &[&owner]).await.expect_err("paused");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// M-2 — a REAL quorum actually burns the transfer
+//
+// The tests above prove `cancel` refuses. These prove it works, which is the
+// half that matters for recovering stuck funds: without a working burn there is
+// no precondition for a source-side refund, and an unclaimable EVM->Solana
+// transfer stays locked forever.
+// ---------------------------------------------------------------------------
+
+/// A validator identity: a secp256k1 key plus the EVM address it recovers to.
+struct Validator {
+    secret: libsecp256k1::SecretKey,
+    address: [u8; 20],
+}
+
+impl Validator {
+    fn new(seed: u8) -> Validator {
+        let secret = libsecp256k1::SecretKey::parse(&[seed; 32]).expect("valid scalar");
+        let public = libsecp256k1::PublicKey::from_secret_key(&secret);
+        // address = keccak(uncompressed pubkey without the 0x04 tag)[12..]
+        let uncompressed = public.serialize();
+        let hash = solana_program::keccak::hashv(&[&uncompressed[1..]]).to_bytes();
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&hash[12..]);
+        Validator { secret, address }
+    }
+
+    /// A 65-byte r||s||v signature over the EIP-191 digest of `message`, exactly
+    /// as the EVM validators produce and `verify_threshold` expects.
+    fn sign(&self, message: &[u8; 32]) -> Vec<u8> {
+        let digest =
+            solana_program::keccak::hashv(&[b"\x19Ethereum Signed Message:\n32", message])
+                .to_bytes();
+        let (sig, recid) =
+            libsecp256k1::sign(&libsecp256k1::Message::parse(&digest), &self.secret);
+        let mut out = sig.serialize().to_vec(); // r||s, 64 bytes
+        out.push(recid.serialize() + 27); // v in {27, 28}
+        out
+    }
+}
+
+/// Signatures sorted ascending by signer address, as the gate requires (the
+/// ordering is what de-duplicates signers on-chain).
+fn quorum(validators: &[&Validator], message: &[u8; 32]) -> Vec<Vec<u8>> {
+    let mut signed: Vec<([u8; 20], Vec<u8>)> =
+        validators.iter().map(|v| (v.address, v.sign(message))).collect();
+    signed.sort_by_key(|(addr, _)| *addr);
+    signed.into_iter().map(|(_, sig)| sig).collect()
+}
+
+fn cancel_digest(id: &[u8; 32]) -> [u8; 32] {
+    fn be32(v: u64) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[24..].copy_from_slice(&v.to_be_bytes());
+        o
+    }
+    solana_program::keccak::hashv(&[&be32(2), id]).to_bytes()
+}
+
+#[tokio::test]
+async fn a_real_quorum_burns_the_transfer_and_the_burn_is_final() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let (mut ctx, owner) = setup_with_validators(
+        8,
+        4,
+        Pubkey::default(),
+        vec![v1.address, v2.address, v3.address],
+        2,
+    )
+    .await;
+
+    let args = cancel_args(vec![]);
+    let id = submission_id_for(&args, CHAIN_ID);
+    let sigs = quorum(&[&v1, &v2], &cancel_digest(&id));
+
+    let (instruction, id2) = cancel_instruction(cancel_args(sigs.clone()), owner.pubkey());
+    assert_eq!(id, id2, "test and program must agree on the submissionId");
+
+    exec(&mut ctx, instruction, &[&owner]).await.expect("a 2-of-3 quorum must burn it");
+
+    // The marker exists, is program-owned, and says CANCELLED rather than CLAIMED
+    // — a consumer must be able to tell "burned" from "delivered".
+    let marker = ctx
+        .banks_client
+        .get_account(executed_pda(&id))
+        .await
+        .unwrap()
+        .expect("the burn must leave a marker");
+    assert_eq!(marker.owner, PROGRAM_ID, "marker must be program-owned");
+    assert_eq!(marker.data, vec![2u8], "marker must record CANCELLED, not CLAIMED");
+
+    // The burn is final: a second cancel cannot re-authorise another refund.
+    let (again, _) = cancel_instruction(cancel_args(sigs), owner.pubkey());
+    let err = exec(&mut ctx, again, &[&owner]).await.expect_err("re-cancel must fail");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+}
+
+/// One signature against a threshold of two is not a quorum. Pins that the
+/// threshold is actually enforced, rather than any signature passing.
+#[tokio::test]
+async fn a_sub_threshold_quorum_does_not_burn() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let (mut ctx, owner) = setup_with_validators(
+        8,
+        4,
+        Pubkey::default(),
+        vec![v1.address, v2.address, v3.address],
+        2,
+    )
+    .await;
+
+    let id = submission_id_for(&cancel_args(vec![]), CHAIN_ID);
+    let sigs = quorum(&[&v1], &cancel_digest(&id)); // only one
+
+    let (instruction, _) = cancel_instruction(cancel_args(sigs), owner.pubkey());
+    let err = exec(&mut ctx, instruction, &[&owner]).await.expect_err("1-of-3 < threshold 2");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+    assert!(ctx.banks_client.get_account(executed_pda(&id)).await.unwrap().is_none());
+}
+
+/// Outsiders cannot burn a transfer however many of them sign: `verify_threshold`
+/// counts only configured validators.
+#[tokio::test]
+async fn signatures_from_non_validators_never_reach_the_threshold() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let (outsider_a, outsider_b) = (Validator::new(9), Validator::new(10));
+    let (mut ctx, owner) = setup_with_validators(
+        8,
+        4,
+        Pubkey::default(),
+        vec![v1.address, v2.address, v3.address],
+        2,
+    )
+    .await;
+
+    let id = submission_id_for(&cancel_args(vec![]), CHAIN_ID);
+    let sigs = quorum(&[&outsider_a, &outsider_b], &cancel_digest(&id));
+
+    let (instruction, _) = cancel_instruction(cancel_args(sigs), owner.pubkey());
+    let err = exec(&mut ctx, instruction, &[&owner]).await.expect_err("outsiders are not a quorum");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+    assert!(ctx.banks_client.get_account(executed_pda(&id)).await.unwrap().is_none());
+}
+
+/// THE domain-separation property, with real signatures: a validator's TRANSFER
+/// signature (over the raw submissionId) must not authorise a burn. Under a
+/// shared digest this quorum would succeed and anyone able to read the signature
+/// store could destroy healthy in-flight transfers.
+#[tokio::test]
+async fn a_genuine_transfer_quorum_cannot_burn_a_transfer() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let (mut ctx, owner) = setup_with_validators(
+        8,
+        4,
+        Pubkey::default(),
+        vec![v1.address, v2.address, v3.address],
+        2,
+    )
+    .await;
+
+    let id = submission_id_for(&cancel_args(vec![]), CHAIN_ID);
+    // Signed over the submissionId itself — a real, valid TRANSFER quorum.
+    let transfer_quorum = quorum(&[&v1, &v2], &id);
+
+    let (instruction, _) = cancel_instruction(cancel_args(transfer_quorum), owner.pubkey());
+    let err = exec(&mut ctx, instruction, &[&owner])
+        .await
+        .expect_err("a transfer quorum must not authorise a burn");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+    assert!(
+        ctx.banks_client.get_account(executed_pda(&id)).await.unwrap().is_none(),
+        "nothing may be burned by a replayed transfer quorum"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The SPL-backed paths: claim (H-2) and refund (M-2)
+//
+// `solana-program-test` bundles the SPL token program, so these paths ARE
+// reachable here — which closes the two gaps the header note used to describe.
+// Accounts are pre-baked with `Pack` rather than built via CPI setup
+// transactions; the bank cannot tell the difference and the tests stay short.
+// ---------------------------------------------------------------------------
+
+use solana_program::program_pack::Pack;
+use solana_sdk::program_option::COption;
+
+fn vault_authority() -> Pubkey {
+    Pubkey::find_program_address(&[b"vault_authority"], &PROGRAM_ID).0
+}
+
+fn asset_pda(debridge_id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"asset", debridge_id], &PROGRAM_ID).0
+}
+
+fn sent_pda(id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"sent", id], &PROGRAM_ID).0
+}
+
+fn refunded_pda(id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"refunded", id], &PROGRAM_ID).0
+}
+
+fn mint_account() -> Account {
+    let mut data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint {
+        mint_authority: COption::None,
+        supply: 1_000_000,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    }
+    .pack_into_slice(&mut data);
+    Account { lamports: 10_000_000, data, owner: spl_token::id(), executable: false, rent_epoch: 0 }
+}
+
+/// An initialized SPL token account. `delegate`/`close_authority` are settable so
+/// the M-6 test can build the vault it must reject.
+fn token_account(
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+    delegate: COption<Pubkey>,
+    close_authority: COption<Pubkey>,
+) -> Account {
+    let mut data = vec![0u8; spl_token::state::Account::LEN];
+    spl_token::state::Account {
+        mint,
+        owner,
+        amount,
+        delegate,
+        state: spl_token::state::AccountState::Initialized,
+        is_native: COption::None,
+        delegated_amount: 0,
+        close_authority,
+    }
+    .pack_into_slice(&mut data);
+    Account { lamports: 10_000_000, data, owner: spl_token::id(), executable: false, rent_epoch: 0 }
+}
+
+fn spl_balance(account: &Account) -> u64 {
+    spl_token::state::Account::unpack(&account.data).expect("an SPL token account").amount
+}
+
+/// A bank with a mint, a registered asset, a funded vault, and a user token
+/// account — i.e. everything the SPL-backed instructions need.
+struct AssetFixture {
+    ctx: ProgramTestContext,
+    owner: Keypair,
+    mint: Pubkey,
+    vault: Pubkey,
+    user_token: Pubkey,
+    debridge_id: [u8; 32],
+}
+
+async fn setup_with_asset(
+    validators: Vec<[u8; 20]>,
+    threshold: u32,
+    vault_balance: u64,
+    user_balance: u64,
+) -> AssetFixture {
+    let owner = Keypair::new();
+    let mint = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
+    let user_token = Pubkey::new_unique();
+    let debridge_id = [9u8; 32];
+
+    let mut pt = ProgramTest::new("solana_gate", PROGRAM_ID, processor!(process_instruction));
+    pt.add_account(
+        owner.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let cfg = Config {
+        owner: owner.pubkey(),
+        guardian: Pubkey::default(),
+        validators,
+        threshold,
+        chain_id: CHAIN_ID,
+        paused: false,
+        max_validators: 8,
+        max_corridors: 4,
+        nonce_to: vec![(DEST_CHAIN, 0)], // corridor pre-registered
+    };
+    let mut cfg_data = vec![0u8; config_space(8, 4)];
+    cfg.serialize(&mut &mut cfg_data[..]).unwrap();
+    pt.add_account(
+        config_pda(),
+        Account {
+            lamports: 10_000_000_000,
+            data: cfg_data,
+            owner: PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // The asset registry entry governance would have created.
+    let asset = solana_gate::AssetConfig { debridge_id, mint, vault };
+    let mut asset_data = vec![0u8; 1 + 32 + 32 + 32];
+    asset.serialize(&mut &mut asset_data[..]).unwrap();
+    pt.add_account(
+        asset_pda(&debridge_id),
+        Account {
+            lamports: 10_000_000,
+            data: asset_data,
+            owner: PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    pt.add_account(mint, mint_account());
+    pt.add_account(
+        vault,
+        token_account(mint, vault_authority(), vault_balance, COption::None, COption::None),
+    );
+    pt.add_account(
+        user_token,
+        token_account(mint, owner.pubkey(), user_balance, COption::None, COption::None),
+    );
+
+    AssetFixture { ctx: pt.start_with_context().await, owner, mint, vault, user_token, debridge_id }
+}
+
+/// THE H-2 test, finally executed rather than asserted.
+///
+/// A submissionId is public — it is in the source chain's `Sent` event and in the
+/// signature store — so anyone can derive `["executed", id]` and transfer the
+/// rent-exempt minimum to it BEFORE the keeper claims. Under the old guard
+/// (`lamports() > 0`) and the old `create_account` call, that permanently blocked
+/// the claim, and with no cancel/refund on this program the funds were stuck for
+/// good. A claim must now sail straight past a pre-funded marker.
+#[tokio::test]
+async fn a_claim_succeeds_even_when_the_marker_pda_was_pre_funded_by_a_griefer() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let mut fx =
+        setup_with_asset(vec![v1.address, v2.address, v3.address], 2, 1_000, 0).await;
+
+    // The claim releases to a token account whose ADDRESS is the signed receiver.
+    let receiver_token = Pubkey::new_unique();
+    fx.ctx.set_account(
+        &receiver_token,
+        &token_account(fx.mint, Pubkey::new_unique(), 0, COption::None, COption::None).into(),
+    );
+
+    let args = solana_gate::ClaimArgs {
+        debridge_id: fx.debridge_id,
+        amount: 250,
+        chain_id_from: DEST_CHAIN,
+        nonce: 0,
+        receiver: receiver_token.to_bytes().to_vec(),
+        auto: None,
+        native_sender: vec![0x11; 20],
+        signatures: vec![],
+    };
+    let id = claim_submission_id(&args);
+
+    // The griefing move: fund the marker PDA so `create_account` would fail and
+    // the old `lamports() > 0` guard would report AlreadyExecuted.
+    let griefed = Account {
+        lamports: 1_000_000,
+        data: vec![],
+        owner: solana_sdk::system_program::id(),
+        executable: false,
+        rent_epoch: 0,
+    };
+    fx.ctx.set_account(&executed_pda(&id), &griefed.into());
+
+    let sigs = quorum(&[&v1, &v2], &id); // transfer domain: the raw submissionId
+    let instruction = ix(
+        GateInstruction::Claim(solana_gate::ClaimArgs { signatures: sigs, ..args }),
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(executed_pda(&id), false),
+            AccountMeta::new(fx.owner.pubkey(), true),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new(receiver_token, false),
+            AccountMeta::new_readonly(vault_authority(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+    exec(&mut fx.ctx, instruction, &[&owner])
+        .await
+        .expect("a pre-funded marker must NOT block a legitimate claim");
+
+    // Funds moved, and the marker now says CLAIMED.
+    let recv = fx.ctx.banks_client.get_account(receiver_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&recv), 250, "the receiver must be paid");
+    let marker = fx.ctx.banks_client.get_account(executed_pda(&id)).await.unwrap().unwrap();
+    assert_eq!(marker.owner, PROGRAM_ID);
+    assert_eq!(marker.data, vec![1u8], "marker must record CLAIMED");
+}
+
+/// Recompute a claim's submissionId (destination side: chain_id_to is ours).
+fn claim_submission_id(args: &solana_gate::ClaimArgs) -> [u8; 32] {
+    use solana_program::keccak;
+    fn be32(v: u64) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[24..].copy_from_slice(&v.to_be_bytes());
+        o
+    }
+    keccak::hashv(&[
+        &be32(1),
+        &args.debridge_id,
+        &be32(args.chain_id_from),
+        &be32(CHAIN_ID),
+        &be32(args.amount),
+        &args.receiver,
+        &be32(args.nonce),
+    ])
+    .to_bytes()
+}
+
+/// Source-side submissionId (chain_id_from is ours).
+fn send_submission_id(debridge_id: &[u8; 32], amount: u64, receiver: &[u8], nonce: u64) -> [u8; 32] {
+    use solana_program::keccak;
+    fn be32(v: u64) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[24..].copy_from_slice(&v.to_be_bytes());
+        o
+    }
+    keccak::hashv(&[
+        &be32(1),
+        debridge_id,
+        &be32(CHAIN_ID),
+        &be32(DEST_CHAIN),
+        &be32(amount),
+        receiver,
+        &be32(nonce),
+    ])
+    .to_bytes()
+}
+
+fn refund_digest(id: &[u8; 32]) -> [u8; 32] {
+    fn be32(v: u64) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[24..].copy_from_slice(&v.to_be_bytes());
+        o
+    }
+    solana_program::keccak::hashv(&[&be32(3), id]).to_bytes()
+}
+
+/// The whole point of M-2: funds locked by `send` can be recovered.
+///
+/// Before this existed, an EVM→Solana transfer that could not be claimed left the
+/// source deposit locked forever — the Solana gate had no `cancel` to burn the
+/// destination and no `refund` to pay anyone back. This drives the source half
+/// end-to-end: lock, then repay, with a real validator quorum over the refund
+/// digest.
+#[tokio::test]
+async fn refund_returns_locked_funds_to_the_account_that_sent_them() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let mut fx =
+        setup_with_asset(vec![v1.address, v2.address, v3.address], 2, 0, 500).await;
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+
+    let amount = 300u64;
+    let receiver = vec![0xEEu8; 20];
+    let id = send_submission_id(&fx.debridge_id, amount, &receiver, 0);
+
+    // --- lock ---
+    let send = ix(
+        GateInstruction::Send(SendArgs {
+            debridge_id: fx.debridge_id,
+            amount,
+            chain_id_to: DEST_CHAIN,
+            receiver: receiver.clone(),
+            auto: None,
+        }),
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(fx.user_token, false),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new(sent_pda(&id), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    exec(&mut fx.ctx, send, &[&owner]).await.expect("send must lock the funds");
+
+    let user = fx.ctx.banks_client.get_account(fx.user_token).await.unwrap().unwrap();
+    let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&user), 200, "user debited");
+    assert_eq!(spl_balance(&vault), 300, "vault credited");
+
+    // The origin proof exists — this is what `refund` will trust instead of calldata.
+    let sent = fx.ctx.banks_client.get_account(sent_pda(&id)).await.unwrap().unwrap();
+    assert_eq!(sent.owner, PROGRAM_ID, "sent record must be program-owned");
+
+    // --- repay (the destination has been burned; validators attested a refund) ---
+    let refund = ix(
+        GateInstruction::Refund(solana_gate::RefundArgs {
+            debridge_id: fx.debridge_id,
+            amount,
+            chain_id_to: DEST_CHAIN,
+            nonce: 0,
+            receiver: receiver.clone(),
+            auto: None,
+            native_sender: owner.pubkey().to_bytes().to_vec(),
+            signatures: quorum(&[&v1, &v2], &refund_digest(&id)),
+        }),
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(sent_pda(&id), false),
+            AccountMeta::new(refunded_pda(&id), false),
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new(fx.user_token, false),
+            AccountMeta::new_readonly(vault_authority(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    exec(&mut fx.ctx, refund, &[&owner]).await.expect("a refund quorum must repay the sender");
+
+    let user = fx.ctx.banks_client.get_account(fx.user_token).await.unwrap().unwrap();
+    let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&user), 500, "the sender must be made whole");
+    assert_eq!(spl_balance(&vault), 0, "the vault must be drained by exactly the refund");
+
+    // The origin proof is retired, so it can never authorise a second payout.
+    let sent = fx.ctx.banks_client.get_account(sent_pda(&id)).await.unwrap().unwrap();
+    assert!(sent.data.iter().all(|b| *b == 0), "sent record must be zeroed on payout");
+    let marker = fx.ctx.banks_client.get_account(refunded_pda(&id)).await.unwrap().unwrap();
+    assert_eq!(marker.owner, PROGRAM_ID, "refunded marker must exist");
+}
+
+/// A refund quorum is not a licence to drain the vault twice.
+#[tokio::test]
+async fn a_refund_cannot_be_replayed() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let mut fx = setup_with_asset(vec![v1.address, v2.address, v3.address], 2, 0, 500).await;
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+
+    let amount = 300u64;
+    let receiver = vec![0xEEu8; 20];
+    let id = send_submission_id(&fx.debridge_id, amount, &receiver, 0);
+
+    let send = ix(
+        GateInstruction::Send(SendArgs {
+            debridge_id: fx.debridge_id,
+            amount,
+            chain_id_to: DEST_CHAIN,
+            receiver: receiver.clone(),
+            auto: None,
+        }),
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(fx.user_token, false),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new(sent_pda(&id), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    exec(&mut fx.ctx, send, &[&owner]).await.unwrap();
+
+    let build_refund = |sigs: Vec<Vec<u8>>| {
+        ix(
+            GateInstruction::Refund(solana_gate::RefundArgs {
+                debridge_id: fx.debridge_id,
+                amount,
+                chain_id_to: DEST_CHAIN,
+                nonce: 0,
+                receiver: receiver.clone(),
+                auto: None,
+                native_sender: owner.pubkey().to_bytes().to_vec(),
+                signatures: sigs,
+            }),
+            vec![
+                AccountMeta::new_readonly(config_pda(), false),
+                AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+                AccountMeta::new(sent_pda(&id), false),
+                AccountMeta::new(refunded_pda(&id), false),
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(fx.vault, false),
+                AccountMeta::new(fx.user_token, false),
+                AccountMeta::new_readonly(vault_authority(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ],
+        )
+    };
+    let sigs = quorum(&[&v1, &v2], &refund_digest(&id));
+
+    exec(&mut fx.ctx, build_refund(sigs.clone()), &[&owner]).await.expect("first refund");
+    let err = exec(&mut fx.ctx, build_refund(sigs), &[&owner])
+        .await
+        .expect_err("a second refund must be refused");
+    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+
+    let user = fx.ctx.banks_client.get_account(fx.user_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&user), 500, "the sender must not be paid twice");
+}
+
+/// M-6, executed: a vault carrying a `delegate` or `close_authority` must be
+/// refused at registration.
+///
+/// Owning the vault proves the program CAN move it; it does not prove nobody else
+/// can. A delegate transfers up to `delegated_amount` with no involvement from the
+/// owner PDA, and a close authority sweeps the account — both entirely outside
+/// this program, past every check it makes.
+#[tokio::test]
+async fn register_asset_refuses_a_vault_someone_else_can_move() {
+    for (delegate, close_authority, label) in [
+        (COption::Some(Pubkey::new_unique()), COption::None, "delegate"),
+        (COption::None, COption::Some(Pubkey::new_unique()), "close authority"),
+    ] {
+        let owner = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        let debridge_id = [42u8; 32];
+
+        let mut pt = ProgramTest::new("solana_gate", PROGRAM_ID, processor!(process_instruction));
+        pt.add_account(
+            owner.pubkey(),
+            Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        let cfg = Config {
+            owner: owner.pubkey(),
+            guardian: Pubkey::default(),
+            validators: vec![[1u8; 20]],
+            threshold: 1,
+            chain_id: CHAIN_ID,
+            paused: false,
+            max_validators: 8,
+            max_corridors: 4,
+            nonce_to: vec![],
+        };
+        let mut cfg_data = vec![0u8; config_space(8, 4)];
+        cfg.serialize(&mut &mut cfg_data[..]).unwrap();
+        pt.add_account(
+            config_pda(),
+            Account {
+                lamports: 10_000_000_000,
+                data: cfg_data,
+                owner: PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        pt.add_account(mint, mint_account());
+        // The vault is correctly owned by the vault-authority PDA and holds the
+        // right mint — everything the old check looked at — but is reachable by
+        // someone else.
+        pt.add_account(
+            vault,
+            token_account(mint, vault_authority(), 0, delegate, close_authority),
+        );
+
+        let mut ctx = pt.start_with_context().await;
+        let instruction = ix(
+            GateInstruction::RegisterAsset { debridge_id },
+            vec![
+                AccountMeta::new_readonly(config_pda(), false),
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(asset_pda(&debridge_id), false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new_readonly(vault, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ],
+        );
+
+        let err = exec(&mut ctx, instruction, &[&owner])
+            .await
+            .expect_err("a vault reachable by someone else must be refused");
+        assert!(format!("{err:?}").contains("InvalidAccountData"), "{label}: got {err:?}");
+        assert!(
+            ctx.banks_client.get_account(asset_pda(&debridge_id)).await.unwrap().is_none(),
+            "{label}: nothing may be registered"
+        );
+    }
 }

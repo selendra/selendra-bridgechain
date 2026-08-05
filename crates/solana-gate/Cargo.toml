@@ -35,3 +35,8 @@ no-entrypoint = []
 solana-program-test = "=1.18.26"
 solana-sdk = "=1.18.26"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Real secp256k1 signing, so tests can produce genuine validator quorums rather
+# than only exercising the refusal paths. libsecp256k1 0.6 rather than k256:
+# solana-program 1.18 pins curve25519-dalek 3.2.1, which caps zeroize at <1.4,
+# and k256 0.13 requires zeroize ^1.5. 0.6 is already in the resolved tree.
+libsecp256k1 = "0.6"

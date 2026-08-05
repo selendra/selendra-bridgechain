@@ -1,0 +1,31 @@
+# solana-relayer — the Solana leg's validator (finding M-3).
+#
+# Runs as its own process: solana-client and alloy cannot coexist in one binary
+# (Solana 1.18 caps zeroize at <1.4 via curve25519-dalek; alloy needs ^1.5), so
+# this cannot live inside `validator`. It reaches the same sig-store over HTTP.
+
+[source]
+chain_id = 7565164                  # deBridge's Solana chain id — hashed into every submissionId
+rpc = "https://api.mainnet-beta.solana.com"
+program_id = "REPLACE_WITH_DEPLOYED_GATE_PROGRAM_ID"
+
+# SECURITY: `finalized` only. `confirmed`/`processed` can be rolled back by a
+# fork, which would mean signing a Sent whose deposit never settles while the
+# destination has already paid out. The relayer refuses anything else unless
+# allow_unfinalized is set — use that ONLY against a local test validator.
+commitment = "finalized"
+# allow_unfinalized = true
+
+poll_interval_ms = 2000
+state_file = "/data/solana-relayer-state.json"
+max_batch = 100
+
+[signer]
+# The SAME secp256k1 key this validator uses on the EVM side: one validator set
+# signs for both VMs. Prefer the env var so the key never lands on disk.
+private_key_env = "SOLANA_RELAYER_KEY"
+
+[store]
+url = "http://sig-store:8080"
+# Validator-scoped token (finding L-5): this process signs, so `Sign` is all it needs.
+token_env = "SIG_STORE_VALIDATOR_TOKEN"

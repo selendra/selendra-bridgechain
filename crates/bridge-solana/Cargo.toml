@@ -17,11 +17,21 @@ license = { workspace = true }
 # this workspace; built with `cargo build-sbf`). It is a thin entrypoint over the
 # same logic proven here.
 
+[features]
+default = ["recover"]
+# secp256k1 signature recovery (pulls k256 — see the note on that dependency).
+recover = ["dep:k256"]
+
 [dependencies]
 # keccak256 — same primitive as Solana's `keccak` syscall.
 sha3 = "0.10"
 # secp256k1 ECDSA recovery — same as Solana's `secp256k1_recover` syscall.
-k256 = { version = "0.13", features = ["ecdsa"] }
+# OPTIONAL (finding M-3): k256 0.13 requires zeroize ^1.5, while solana-client
+# 1.18 pins ed25519-dalek 1.0.1 -> curve25519-dalek 3.2.1 -> zeroize <1.4. A
+# consumer that needs to talk to a Solana RPC therefore cannot have k256 in its
+# tree, so recovery is behind a default-on feature it can switch off. Hashing and
+# event parsing — all the source side needs — stay available either way.
+k256 = { version = "0.13", features = ["ecdsa"], optional = true }
 # Borsh wire format — how a Solana program (de)serializes instruction data.
 borsh = { version = "1", features = ["derive"] }
 # base64 — decode the `Program data:` lines Solana's `sol_log_data` emits.

@@ -70,3 +70,8 @@ scripts/run.config.local
 .playwright-mcp
 .DS_Store
 heap_info.json
+
+# Docker-side cargo/rustup caches from the Solana toolchain image
+# (scripts/testing/solana-onchain.sh mounts the repo into the container).
+.docker-cargo/
+.docker-rustup/

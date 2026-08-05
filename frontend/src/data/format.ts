@@ -101,3 +101,50 @@ export function shortHex(hex: string, lead = 6, tail = 4): string {
 export function isAddress(v: string): boolean {
   return /^0x[0-9a-fA-F]{40}$/.test(v.trim());
 }
+
+/** deBridge's chain id for Solana — the value the gates hash into a submissionId. */
+export const SOLANA_CHAIN_ID = 7565164;
+
+/**
+ * True for a well-formed base58 Solana account key (32 bytes).
+ *
+ * Base58 excludes 0, O, I and l precisely so visually similar characters cannot
+ * be confused, and an encoded 32-byte key lands in 32–44 characters.
+ */
+export function isSolanaAccount(v: string): boolean {
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v.trim());
+}
+
+/**
+ * Validate a bridge receiver for the destination chain (finding L-4).
+ *
+ * The two VMs want different things, and getting it wrong is expensive:
+ *
+ *  - **EVM destinations** take a 20-byte address.
+ *  - **Solana destinations** take a 32-byte key that must be the recipient's
+ *    **SPL associated token account**, NOT their wallet address. The gate
+ *    releases funds to the account whose address the validators signed, so a
+ *    wallet pubkey produces a transfer that can never be claimed. It is now
+ *    recoverable — the Solana gate finally has cancel/refund — but it still
+ *    costs the user the round trip, and nothing upstream used to say so.
+ *
+ * Returns `null` when valid, or a message explaining what is wrong.
+ */
+export function receiverProblem(receiver: string, destinationChainId: number | null): string | null {
+  const v = receiver.trim();
+  if (!v) return "Enter a receiver";
+
+  if (destinationChainId === SOLANA_CHAIN_ID) {
+    if (isAddress(v)) {
+      return "That is an EVM address. A Solana destination needs a base58 account key.";
+    }
+    if (!isSolanaAccount(v)) return "Enter a valid Solana account key (base58)";
+    return null;
+  }
+
+  if (isSolanaAccount(v) && !isAddress(v)) {
+    return "That looks like a Solana key. This destination needs a 0x EVM address.";
+  }
+  if (!isAddress(v)) return "Enter a valid 0x address";
+  return null;
+}

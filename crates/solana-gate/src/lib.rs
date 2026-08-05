@@ -47,6 +47,13 @@ use solana_program::{
 /// deBridge's chain id for Solana mainnet (also the hash-fixture value).
 pub const SOLANA_CHAIN_ID: u64 = 7565164;
 const SUBMISSION_PREFIX: u64 = 1;
+/// Domain prefix for a destination-side CANCEL attestation, matching
+/// `BridgeHash.CANCEL_PREFIX`. A validator signature over a cancelId authorises
+/// burning a transfer on the destination so it can never be claimed.
+const CANCEL_PREFIX: u64 = 2;
+/// Domain prefix for a source-side REFUND attestation, matching
+/// `BridgeHash.REFUND_PREFIX`.
+const REFUND_PREFIX: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // Instructions (Borsh) — mirrors bridge_solana::instruction::GateInstruction.
@@ -122,6 +129,46 @@ pub enum GateInstruction {
     Unpause,
     /// M-1: appoint or clear the pause guardian (owner only).
     SetGuardian { guardian: Pubkey },
+    /// M-2, DESTINATION side: burn a transfer so it can never be claimed here,
+    /// unlocking a source-chain refund. Moves no funds. Permissionless — the
+    /// validator threshold over `cancelId` is the authorisation.
+    Cancel(CancelArgs),
+    /// M-2, SOURCE side: return locked funds to the account that sent them, after
+    /// the destination has been burned. Permissionless for the same reason.
+    Refund(RefundArgs),
+}
+
+/// Everything needed to recompute a submissionId on the DESTINATION side, plus
+/// the cancel quorum. Mirrors `Gate.cancel`'s parameters.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
+pub struct CancelArgs {
+    pub debridge_id: [u8; 32],
+    pub amount: u64,
+    pub chain_id_from: u64,
+    pub nonce: u64,
+    pub receiver: Vec<u8>,
+    pub auto: Option<AutoParamsWire>,
+    pub native_sender: Vec<u8>,
+    /// Signatures over `cancelId(submissionId)` — a different domain from the
+    /// transfer signatures, so those can never be replayed to burn a transfer.
+    pub signatures: Vec<Vec<u8>>,
+}
+
+/// Everything needed to recompute a submissionId on the SOURCE side, plus the
+/// refund quorum. Mirrors `Gate.refund`'s parameters — except `amount` and the
+/// destination are NOT taken from here: they come from the program's own
+/// `SentRecord`, so a caller cannot inflate a payout.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
+pub struct RefundArgs {
+    pub debridge_id: [u8; 32],
+    pub amount: u64,
+    pub chain_id_to: u64,
+    pub nonce: u64,
+    pub receiver: Vec<u8>,
+    pub auto: Option<AutoParamsWire>,
+    pub native_sender: Vec<u8>,
+    /// Signatures over `refundId(submissionId)`.
+    pub signatures: Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +300,61 @@ pub struct AssetConfig {
     pub vault: Pubkey,
 }
 
+/// Source-side proof that THIS gate locked funds for a submissionId, and where
+/// they must go back to — the Solana analogue of `Gate.sentBy` (finding M-2).
+///
+/// Two jobs, both essential to `refund`:
+///   1. **origin proof** — the `["sent", submissionId]` PDA existing at all is the
+///      only evidence this gate really emitted that submission. Without it a
+///      validator quorum could authorise a refund for a transfer that never
+///      happened here.
+///   2. **refund destination** — `native_sender` is only folded into the
+///      submissionId when auto-params are present, so for a plain transfer it is
+///      NOT hash-bound and a caller could name anyone. This record is written by
+///      the program at lock time, so it is authoritative; calldata is not.
+///
+/// `amount` and `mint` are recorded too, so `refund` never has to trust the
+/// caller for how much to release or from which vault.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default)]
+pub struct SentRecord {
+    pub debridge_id: [u8; 32],
+    /// The signer that locked the funds.
+    pub sender: Pubkey,
+    /// The SPL token account debited — where `refund` returns the funds.
+    pub source_token: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
+/// Borsh size of a [`SentRecord`]: 32 + 32 + 32 + 32 + 8.
+const SENT_RECORD_LEN: usize = 32 + 32 + 32 + 32 + 8;
+
+/// Load the `["sent", submissionId]` record, refusing any account that is not the
+/// canonical program-owned PDA. Mirrors [`load_config`]'s posture: a forged record
+/// would let a caller name their own refund destination and amount.
+fn load_sent_record(
+    program_id: &Pubkey,
+    submission_id: &[u8; 32],
+    sent_ai: &AccountInfo,
+) -> Result<SentRecord, ProgramError> {
+    let (expected, _bump) =
+        Pubkey::find_program_address(&[b"sent", submission_id], program_id);
+    if sent_ai.key != &expected {
+        msg!("sent account is not the canonical [\"sent\", submissionId] PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if sent_ai.owner != program_id {
+        msg!("sent account is not program-owned");
+        return Err(ProgramError::IllegalOwner);
+    }
+    if sent_ai.data_is_empty() {
+        // Never sent from this gate (or already refunded and closed).
+        return Err(GateError::NotSent.into());
+    }
+    SentRecord::deserialize(&mut &sent_ai.data.borrow()[..])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
 /// Load the canonical asset binding for `debridge_id`, refusing any account that
 /// is not the program-owned `["asset", debridge_id]` PDA. Mirrors [`load_config`].
 fn load_asset(
@@ -333,6 +435,17 @@ fn verify_upgrade_authority(
 /// `cancel` exists (claimed vs burned), which a zero-length account cannot.
 const MARKER_LEN: usize = 1;
 
+/// Marker byte: this submission was CLAIMED — funds released here.
+const MARKER_CLAIMED: u8 = 1;
+/// Marker byte: this submission was CANCELLED — burned, funds never released and
+/// never can be. The precondition for a source-side refund.
+///
+/// One marker PDA serves both states, exactly as `Gate.executed` does on the EVM
+/// side: its existence blocks any second terminal action, and the byte says which
+/// action happened. A zero-length marker could not carry that distinction, which
+/// is why H-2's rewrite gave it a data byte.
+const MARKER_CANCELLED: u8 = 2;
+
 /// Pure replay predicate (host-testable) — finding H-2.
 ///
 /// The old guard was `lamports() > 0 || !data_is_empty()`, which anyone could
@@ -360,6 +473,7 @@ fn create_marker<'a>(
     system_program: &AccountInfo<'a>,
     seeds: &[&[u8]],
     bump: u8,
+    state: u8,
 ) -> ProgramResult {
     let rent = Rent::get()?.minimum_balance(MARKER_LEN);
     let have = marker.lamports();
@@ -385,9 +499,69 @@ fn create_marker<'a>(
         &[&signer_seeds],
     )?;
     // Non-zero so `data_is_empty()` reads false even if a future reader forgets
-    // the owner half of the predicate.
-    marker.data.borrow_mut()[0] = 1;
+    // the owner half of the predicate, and it records WHICH terminal state was
+    // reached (claimed vs cancelled).
+    debug_assert!(state != 0, "a marker state of 0 would read as 'not executed'");
+    marker.data.borrow_mut()[0] = state;
     Ok(())
+}
+
+/// Create and populate the `["sent", id]` origin-proof PDA. Uses the same
+/// pre-funding-tolerant sequence as [`create_marker`], for the same reason: the
+/// submissionId is derivable in advance, so the address can be griefed with
+/// lamports before the send lands.
+#[allow(clippy::too_many_arguments)]
+fn create_sent_record<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    sent: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    id: &[u8; 32],
+    bump: u8,
+    record: &SentRecord,
+) -> ProgramResult {
+    if is_already_executed(sent.owner, sent.data_len(), program_id) {
+        // A live record for this id already exists — impossible under a monotonic
+        // per-corridor nonce, so treat it as a replay rather than overwrite it.
+        return Err(GateError::AlreadyExecuted.into());
+    }
+    let rent = Rent::get()?.minimum_balance(SENT_RECORD_LEN);
+    let have = sent.lamports();
+    if have < rent {
+        invoke(
+            &system_instruction::transfer(payer.key, sent.key, rent - have),
+            &[payer.clone(), sent.clone(), system_program.clone()],
+        )?;
+    }
+    let bump_slice = [bump];
+    let signer_seeds: &[&[u8]] = &[b"sent", id, &bump_slice];
+    invoke_signed(
+        &system_instruction::allocate(sent.key, SENT_RECORD_LEN as u64),
+        &[sent.clone(), system_program.clone()],
+        &[signer_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(sent.key, program_id),
+        &[sent.clone(), system_program.clone()],
+        &[signer_seeds],
+    )?;
+    record.serialize(&mut &mut sent.data.borrow_mut()[..])?;
+    Ok(())
+}
+
+/// Domain-separated digest a validator signs to authorise CANCELLING a transfer
+/// on this (destination) chain. Byte-identical to `BridgeHash.getCancelId`.
+fn cancel_id(submission_id: &[u8; 32]) -> [u8; 32] {
+    keccak::hashv(&[&be32(CANCEL_PREFIX), submission_id]).to_bytes()
+}
+
+/// Domain-separated digest a validator signs to authorise REFUNDING a cancelled
+/// transfer on this (source) chain. Byte-identical to `BridgeHash.getRefundId`.
+///
+/// The distinct prefixes are what keep the three quorums independent: a transfer
+/// signature can never be replayed as a cancel, nor a cancel as a refund.
+fn refund_id(submission_id: &[u8; 32]) -> [u8; 32] {
+    keccak::hashv(&[&be32(REFUND_PREFIX), submission_id]).to_bytes()
 }
 
 /// Read the SPL mint + owner of a token account, asserting it is a real SPL
@@ -490,6 +664,16 @@ pub enum GateError {
     /// config account was sized for at init.
     #[error("at capacity — the config account was sized for fewer entries")]
     AtCapacity,
+    /// M-2: refund asked for a submissionId this gate never emitted (or one
+    /// already refunded — the record is closed on payout).
+    #[error("this gate never sent that submissionId")]
+    NotSent,
+    /// M-2: the transfer was already claimed here, so it cannot be cancelled.
+    #[error("already claimed — cannot cancel")]
+    AlreadyClaimed,
+    /// M-2: the destination has not been burned, so no refund is authorised.
+    #[error("destination not cancelled")]
+    NotCancelled,
 }
 
 impl From<GateError> for ProgramError {
@@ -629,7 +813,187 @@ pub fn process_instruction(
         GateInstruction::SetGuardian { guardian } => {
             process_set_guardian(program_id, accounts, guardian)
         }
+        GateInstruction::Cancel(args) => process_cancel(program_id, accounts, args),
+        GateInstruction::Refund(args) => process_refund(program_id, accounts, args),
     }
+}
+
+/// Accounts: [config, executed_pda(w), payer(s,w), system_program]
+///
+/// M-2, DESTINATION side. Burn a transfer so `claim` can never release funds for
+/// it, which is the precondition for a source-side refund.
+///
+/// ## Why this has to exist
+///
+/// The bridge's refund design is ordered on purpose: a refund that merely waited
+/// out a timeout would be a double-spend, because the transfer's claim signatures
+/// still exist. So the destination must be provably burned FIRST. Solana had no
+/// way to do that, which meant any EVM→Solana transfer that could not be claimed
+/// (unregistered asset, empty vault, a griefed marker) locked the source deposit
+/// forever with no recovery path at all.
+///
+/// Moves no funds, so it needs neither the asset registry nor the SPL token
+/// program — only the canonical config, for the validator set.
+fn process_cancel(program_id: &Pubkey, accounts: &[AccountInfo], args: CancelArgs) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let executed_ai = next_account_info(it)?;
+    let payer = next_account_info(it)?;
+    let system_program = next_account_info(it)?;
+
+    let cfg = load_config(program_id, config_ai)?;
+    if cfg.paused {
+        return Err(GateError::Paused.into());
+    }
+
+    let id = submission_id(
+        &args.debridge_id,
+        args.amount,
+        args.chain_id_from,
+        cfg.chain_id,
+        args.nonce,
+        &args.receiver,
+        args.auto.as_ref(),
+        &args.native_sender,
+    );
+
+    let (expected_executed, bump) = Pubkey::find_program_address(&[b"executed", &id], program_id);
+    if executed_ai.key != &expected_executed {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    // Already claimed OR already cancelled — either way it is spent here, and
+    // re-cancelling must not re-authorise a second refund.
+    if is_already_executed(executed_ai.owner, executed_ai.data_len(), program_id) {
+        return Err(GateError::AlreadyExecuted.into());
+    }
+
+    // A cancel quorum, NOT a transfer quorum: distinct digest domain.
+    verify_threshold(&cfg, &cancel_id(&id), &args.signatures)?;
+
+    create_marker(
+        program_id,
+        payer,
+        executed_ai,
+        system_program,
+        &[b"executed", &id],
+        bump,
+        MARKER_CANCELLED,
+    )?;
+
+    emit_lifecycle(CANCELLED_EVENT_TAG, &id, &args.debridge_id, args.chain_id_from, args.nonce);
+    msg!("CANCELLED {}", bs58_id(&id));
+    Ok(())
+}
+
+/// Accounts: [config, asset, sent_pda(w), refunded_pda(w), payer(s,w), vault(w),
+///            source_token(w), vault_authority, spl_token_program, system_program]
+///
+/// M-2, SOURCE side. Return locked funds to the token account they came from,
+/// after the destination has been burned.
+///
+/// Three independent guards stand between a caller and the vault, mirroring
+/// `Gate.refund`:
+///   * the `["sent", id]` record must exist — proof THIS gate locked these funds,
+///     and the authoritative destination and amount (calldata is not trusted);
+///   * a validator threshold over `refundId`, a quorum that only forms after the
+///     validators have observed `Cancelled` on the destination;
+///   * the asset registry must bind `debridge_id` to the vault being drained.
+///
+/// The `["refunded", id]` marker is the replay guard, and the `sent` record is
+/// zeroed on payout so it can never authorise a second one.
+fn process_refund(program_id: &Pubkey, accounts: &[AccountInfo], args: RefundArgs) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let asset_ai = next_account_info(it)?;
+    let sent_ai = next_account_info(it)?;
+    let refunded_ai = next_account_info(it)?;
+    let payer = next_account_info(it)?;
+    let vault = next_account_info(it)?;
+    let source_token = next_account_info(it)?;
+    let vault_authority = next_account_info(it)?;
+    let token_program = next_account_info(it)?;
+    let system_program = next_account_info(it)?;
+
+    let cfg = load_config(program_id, config_ai)?;
+    // NOTE: deliberately NOT gated on `cfg.paused`, mirroring `Gate.refund`. The
+    // breaker stops new exposure; a refund only returns already-locked funds to
+    // the account that locked them, after an attested burn. Halting it would trap
+    // exactly the users an incident stranded.
+
+    let id = submission_id(
+        &args.debridge_id,
+        args.amount,
+        cfg.chain_id,
+        args.chain_id_to,
+        args.nonce,
+        &args.receiver,
+        args.auto.as_ref(),
+        &args.native_sender,
+    );
+
+    // Replay guard first, so a repeat costs the caller a failed tx and nothing else.
+    let (expected_refunded, refunded_bump) =
+        Pubkey::find_program_address(&[b"refunded", &id], program_id);
+    if refunded_ai.key != &expected_refunded {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if is_already_executed(refunded_ai.owner, refunded_ai.data_len(), program_id) {
+        return Err(GateError::AlreadyExecuted.into());
+    }
+
+    // Origin proof + authoritative payout details.
+    let sent = load_sent_record(program_id, &id, sent_ai)?;
+    if &sent.debridge_id != &args.debridge_id {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    verify_threshold(&cfg, &refund_id(&id), &args.signatures)?;
+
+    // The vault must be the one governance registered for this asset, and the
+    // destination must be the exact token account that was debited.
+    let asset = load_asset(program_id, &args.debridge_id, asset_ai)?;
+    if source_token.key != &sent.source_token {
+        msg!("refund destination is not the token account that was debited");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let (vault_mint, _) = spl_mint_and_owner(vault, token_program.key)?;
+    let (dest_mint, _) = spl_mint_and_owner(source_token, token_program.key)?;
+    verify_asset_binding(&asset, token_program.key, vault.key, &vault_mint, &dest_mint)?;
+
+    // Effects before interaction: mark refunded and retire the origin proof, so a
+    // reentrant or repeated call finds nothing left to authorise.
+    create_marker(
+        program_id,
+        payer,
+        refunded_ai,
+        system_program,
+        &[b"refunded", &id],
+        refunded_bump,
+        MARKER_CLAIMED,
+    )?;
+    sent_ai.data.borrow_mut().fill(0);
+
+    let (auth, auth_bump) = Pubkey::find_program_address(&[b"vault_authority"], program_id);
+    if vault_authority.key != &auth {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let transfer = spl_token::instruction::transfer(
+        token_program.key,
+        vault.key,
+        source_token.key,
+        vault_authority.key,
+        &[],
+        sent.amount, // from OUR record, never from calldata
+    )?;
+    invoke_signed(
+        &transfer,
+        &[vault.clone(), source_token.clone(), vault_authority.clone(), token_program.clone()],
+        &[&[b"vault_authority", &[auth_bump]]],
+    )?;
+
+    emit_lifecycle(REFUNDED_EVENT_TAG, &id, &args.debridge_id, cfg.chain_id, args.nonce);
+    msg!("REFUNDED {}", bs58_id(&id));
+    Ok(())
 }
 
 /// Accounts: [config_pda(w), payer(s,w), system_program, program, program_data]
@@ -820,6 +1184,9 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     let user_token = next_account_info(it)?;
     let vault = next_account_info(it)?;
     let token_program = next_account_info(it)?;
+    // M-2: the `["sent", id]` record `refund` needs as its origin proof.
+    let sent_ai = next_account_info(it)?;
+    let system_program = next_account_info(it)?;
 
     // C1: bind the chain id + nonce sequence to the canonical config, so a forged
     // config can't rewrite them and desync the off-chain nonce/submissionId.
@@ -860,6 +1227,29 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     // effects before interaction
     cfg.bump_nonce(args.chain_id_to)?;
     cfg.store(config_ai)?;
+
+    // M-2: record the origin proof + refund destination BEFORE the lock, so a
+    // transfer can never exist without a way back. The per-corridor nonce makes
+    // the submissionId unique, so this can never overwrite a live record.
+    let (expected_sent, sent_bump) = Pubkey::find_program_address(&[b"sent", &id], program_id);
+    if sent_ai.key != &expected_sent {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    create_sent_record(
+        program_id,
+        payer,
+        sent_ai,
+        system_program,
+        &id,
+        sent_bump,
+        &SentRecord {
+            debridge_id: args.debridge_id,
+            sender: *payer.key,
+            source_token: *user_token.key,
+            mint: asset.mint,
+            amount: args.amount,
+        },
+    )?;
 
     // Emit the Sent event as structured program data for the validator's source,
     // carrying the registered mint as the locked asset identity (H5).
@@ -951,7 +1341,15 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     verify_threshold(&cfg, &id, &args.signatures)?;
 
     // Create the executed marker (effects before interaction).
-    create_marker(program_id, payer, executed_ai, system_program, &[b"executed", &id], bump)?;
+    create_marker(
+        program_id,
+        payer,
+        executed_ai,
+        system_program,
+        &[b"executed", &id],
+        bump,
+        MARKER_CLAIMED,
+    )?;
 
     // Release: vault -> receiver, signed by the vault-authority PDA. Assert the
     // supplied vault_authority IS the canonical PDA (defense in depth: the SPL
@@ -1147,6 +1545,42 @@ struct SentEvent {
 
 const SENT_EVENT_TAG: &[u8] = b"BRIDGE_SENT";
 const SENT_EVENT_VERSION: u8 = 1;
+
+/// M-2 lifecycle events. Same `sol_log_data` framing and versioning as
+/// [`SentEvent`], so the indexer decodes all three the same way. These are what
+/// let the off-chain refund loop observe a Solana burn/payout as an on-chain
+/// fact, exactly as it observes `Gate.Cancelled`/`Gate.Refunded` on the EVM side.
+const CANCELLED_EVENT_TAG: &[u8] = b"BRIDGE_CANCELLED";
+const REFUNDED_EVENT_TAG: &[u8] = b"BRIDGE_REFUNDED";
+
+/// The payload both lifecycle events carry — mirrors the EVM `Cancelled`/
+/// `Refunded` event fields.
+#[derive(BorshSerialize)]
+struct LifecycleEvent {
+    version: u8,
+    submission_id: [u8; 32],
+    debridge_id: [u8; 32],
+    chain_id: u64,
+    nonce: u64,
+}
+
+fn emit_lifecycle(
+    tag: &[u8],
+    id: &[u8; 32],
+    debridge_id: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+) {
+    let event = LifecycleEvent {
+        version: SENT_EVENT_VERSION,
+        submission_id: *id,
+        debridge_id: *debridge_id,
+        chain_id,
+        nonce,
+    };
+    let bytes = borsh::to_vec(&event).expect("borsh serialize LifecycleEvent");
+    solana_program::log::sol_log_data(&[tag, &bytes]);
+}
 
 /// Emit the `Sent` event via `sol_log_data` (base64 program data in the tx logs)
 /// so the validator's Solana source can decode it with
@@ -1419,6 +1853,66 @@ mod c1_tests {
         assert!(!vault_is_exclusively_controlled(Some(someone), None), "delegate drains it");
         assert!(!vault_is_exclusively_controlled(None, Some(someone)), "close authority sweeps it");
         assert!(!vault_is_exclusively_controlled(Some(someone), Some(someone)));
+    }
+
+    // ---------------------------------------------------------------
+    // M-2 — the cancel/refund digest domains
+    // ---------------------------------------------------------------
+
+    /// The Solana gate must derive `cancelId`/`refundId` byte-identically to
+    /// `BridgeHash.sol`, or a validator's attestation signed for one VM would not
+    /// verify on the other and the refund path would silently never form a quorum.
+    ///
+    /// These expected values are ground truth taken from Solidity itself
+    /// (`BridgeHash.getCancelId` / `getRefundId`, cross-checked with `cast keccak`)
+    /// for `submissionId = 0x1111…11`.
+    #[test]
+    fn cancel_and_refund_ids_match_bridgehash_sol() {
+        let id = [0x11u8; 32];
+
+        let expected_cancel =
+            hex_literal("5f53d5916a01e246eeb5fd7d9e96634532fe35b576656d6244780290984a5eee");
+        let expected_refund =
+            hex_literal("3457405ce2152b6317347888618027bd5912e3026e48a5654384dbcb99a45b6e");
+
+        assert_eq!(cancel_id(&id), expected_cancel, "cancelId diverged from BridgeHash.sol");
+        assert_eq!(refund_id(&id), expected_refund, "refundId diverged from BridgeHash.sol");
+    }
+
+    /// The three domains must be pairwise distinct — that separation is the only
+    /// thing stopping a transfer quorum (which authorises PAYING a transfer) from
+    /// being replayed to burn it, or a cancel quorum from being replayed to claw
+    /// funds back on the source.
+    #[test]
+    fn the_three_signing_domains_are_distinct() {
+        let id = [0x11u8; 32];
+        let transfer = id;
+        let cancel = cancel_id(&id);
+        let refund = refund_id(&id);
+
+        assert_ne!(transfer, cancel, "a transfer signature must not authorise a burn");
+        assert_ne!(transfer, refund, "a transfer signature must not authorise a refund");
+        assert_ne!(cancel, refund, "a cancel attestation must not authorise a refund");
+    }
+
+    /// Decode a 64-char hex string into a 32-byte array (test helper — the program
+    /// itself never parses hex).
+    fn hex_literal(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex");
+        }
+        out
+    }
+
+    /// A marker byte must distinguish the two terminal states, so a consumer can
+    /// tell "delivered" from "burned" — a zero-length marker could not, which is
+    /// why H-2's rewrite gave it a data byte.
+    #[test]
+    fn claimed_and_cancelled_markers_are_distinguishable() {
+        assert_ne!(MARKER_CLAIMED, MARKER_CANCELLED);
+        assert_ne!(MARKER_CLAIMED, 0, "0 would read as 'not executed'");
+        assert_ne!(MARKER_CANCELLED, 0, "0 would read as 'not executed'");
     }
 
     // Atomic/authorized init: only the program's upgrade authority (deployer) may

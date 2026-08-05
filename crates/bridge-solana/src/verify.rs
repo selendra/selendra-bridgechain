@@ -7,6 +7,7 @@
 //! + `keccak` to recover each signer's 20-byte Ethereum address, exactly as we
 //! do below with `k256`. So one validator set, one key each, signs for both VMs.
 
+#[cfg(feature = "recover")]
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
 use crate::hash::keccak;
@@ -38,6 +39,7 @@ pub fn eth_signed_digest(submission_id: &[u8; 32]) -> [u8; 32] {
 /// `sig65` is `r(32) || s(32) || v(1)` with `v ∈ {27, 28}` (OZ ECDSA form) — the
 /// exact bytes the validator wrote to the store. On Solana this is
 /// `secp256k1_recover(digest, v-27, r||s)` then `keccak(pubkey)[12..]`.
+#[cfg(feature = "recover")]
 pub fn recover_evm_address(digest: &[u8; 32], sig65: &[u8]) -> Result<[u8; 20], VerifyError> {
     if sig65.len() != 65 {
         return Err(VerifyError::BadLength);
@@ -66,6 +68,7 @@ pub fn recover_evm_address(digest: &[u8; 32], sig65: &[u8]) -> Result<[u8; 20], 
 /// by recovered signer address strictly ascending (which both de-duplicates and
 /// bounds work), and at least `threshold` of them must be known validators.
 /// Returns the count of valid validator signatures on success.
+#[cfg(feature = "recover")]
 pub fn verify_threshold(
     submission_id: &[u8; 32],
     signatures: &[Vec<u8>],

@@ -13,7 +13,7 @@ members = [
 # The deployable Solana BPF program is built with the Solana toolchain
 # (`cargo build-sbf`), not the host workspace — its solana-program/spl-token deps
 # don't compile for the host target.
-exclude = ["crates/solana-gate"]
+exclude = ["crates/solana-gate", "crates/solana-relayer"]
 
 [workspace.package]
 version = "0.1.0"

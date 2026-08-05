@@ -81,6 +81,41 @@ pub enum GateInstruction {
     Unpause,
     /// M-1: appoint or clear the pause guardian (owner only).
     SetGuardian { guardian: [u8; 32] },
+    /// M-2, DESTINATION side: burn a transfer so it can never be claimed,
+    /// unlocking a source-chain refund. Moves no funds.
+    Cancel(CancelArgs),
+    /// M-2, SOURCE side: return locked funds after the destination was burned.
+    Refund(RefundArgs),
+}
+
+/// Destination-side burn. `signatures` are over `cancelId(submissionId)` — a
+/// different digest domain from the transfer signatures, so a transfer quorum can
+/// never be replayed to burn a healthy transfer.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CancelArgs {
+    pub debridge_id: [u8; 32],
+    pub amount: u64,
+    pub chain_id_from: u64,
+    pub nonce: u64,
+    pub receiver: Vec<u8>,
+    pub auto: Option<AutoParamsWire>,
+    pub native_sender: Vec<u8>,
+    pub signatures: Vec<Vec<u8>>,
+}
+
+/// Source-side payout. `signatures` are over `refundId(submissionId)`. The amount
+/// actually released comes from the program's own `["sent", id]` record, not from
+/// this struct, so a caller cannot inflate it.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RefundArgs {
+    pub debridge_id: [u8; 32],
+    pub amount: u64,
+    pub chain_id_to: u64,
+    pub nonce: u64,
+    pub receiver: Vec<u8>,
+    pub auto: Option<AutoParamsWire>,
+    pub native_sender: Vec<u8>,
+    pub signatures: Vec<Vec<u8>>,
 }
 
 impl GateInstruction {

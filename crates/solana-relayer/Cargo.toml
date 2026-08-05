@@ -1,0 +1,45 @@
+[package]
+name = "solana-relayer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The Solana leg's off-chain runner: scan Sent, sign, and submit claims"
+
+# EXCLUDED from the root workspace, and it has to be (finding M-3).
+#
+# `solana-client` 1.18 pins ed25519-dalek 1.0.1 -> curve25519-dalek 3.2.1, which
+# caps `zeroize` at <1.4. Alloy needs zeroize ^1.5. The two cannot coexist in one
+# binary: adding solana-client to `validator`/`keeper` fails to resolve outright
+# (verified). So the Solana leg runs as its OWN process, talking to the same
+# sig-store over HTTP — which is the right boundary anyway, since it shares no
+# chain client with the EVM side.
+
+[dependencies]
+# NOT bridge-core: its `alloy-primitives` dependency is unconditional (it backs
+# the core hashing), and alloy's zeroize ^1.5 cannot coexist with solana-client's
+# <1.4 pin. Making it optional would mean gutting bridge-core for every other
+# service. The record below is a WIRE CONTRACT with the sig-store, not shared
+# logic, so this crate defines its own copy — see `record.rs`. All real protocol
+# logic still comes from bridge-solana.
+# The alloy-free Solana protocol logic: hashing, signature recovery, event parsing.
+# default-features = false drops k256, which cannot coexist with solana-client
+# (see the note at the top of this file). Hashing and event parsing — everything
+# the source side needs — remain available; signing/sorting uses libsecp256k1.
+bridge-solana = { path = "../bridge-solana", default-features = false }
+solana-client = "=1.18.26"
+solana-sdk = "=1.18.26"
+solana-program = "=1.18.26"
+libsecp256k1 = "0.6"
+borsh = { version = "1", features = ["derive"] }
+# native-tls, NOT rustls: the rustls stack pulls a zeroize that cannot coexist
+# with solana-client 1.18 (verified by isolating each dependency).
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-transaction-status = "=1.18.26"
+toml = "0.8"
+anyhow = "1"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,27 @@
+# Toolchain image for the Solana leg: Rust + the Solana platform tools.
+#
+# The official `solanalabs/solana` image ships `solana-test-validator` and
+# `cargo-build-sbf` but NOT cargo, so `cargo-build-sbf` cannot read package
+# metadata and fails immediately. This image supplies both, which is what any
+# real build of `crates/solana-gate` needs — and what the SBF job in CI installs.
+#
+# Build:  docker build -f docker/Dockerfile.solana -t bridge-solana-tools .
+# Use:    docker run --rm -v "$PWD:/work" -w /work bridge-solana-tools \
+#           cargo-build-sbf --manifest-path crates/solana-gate/Cargo.toml
+FROM rust:1-bookworm
+
+ARG SOLANA_VERSION=v1.18.26
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      curl ca-certificates bzip2 libssl-dev pkg-config build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+# The Anza installer provides solana, solana-test-validator and cargo-build-sbf.
+RUN sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_VERSION}/install)"
+ENV PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
+
+# Pre-fetch the SBF platform-tools so the first real build doesn't pay for it.
+RUN cargo-build-sbf --version || true
+
+WORKDIR /work

@@ -13,7 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hash::{self, amount_word, AutoParams};
-use crate::verify::{verify_threshold, VerifyError};
+#[cfg(feature = "recover")]
+use crate::verify::verify_threshold;
+use crate::verify::VerifyError;
 
 /// 20-byte EVM validator address.
 pub type Address = [u8; 20];
@@ -72,6 +74,8 @@ pub struct SolanaGate {
     /// Source-side per-target-chain monotonic nonce.
     nonce_to: BTreeMap<u64, u64>,
     /// Replay guard: a submissionId may execute at most once.
+    // Only read by `claim`, which needs the `recover` feature.
+    #[cfg_attr(not(feature = "recover"), allow(dead_code))]
     executed: BTreeSet<Bytes32>,
     /// Asset registry: which local SPL mint backs a debridgeId here.
     token_of: BTreeMap<Bytes32, Bytes32>,
@@ -172,6 +176,9 @@ impl SolanaGate {
     /// Verify a threshold of validator signatures and release funds once.
     /// `receiver` is a 32-byte Solana token account for EVM→Solana.
     #[allow(clippy::too_many_arguments)]
+    /// Requires the `recover` feature: verifying a quorum means recovering
+    /// signer addresses, which needs k256 (see the note in Cargo.toml).
+    #[cfg(feature = "recover")]
     pub fn claim(
         &mut self,
         debridge_id: Bytes32,
@@ -263,6 +270,8 @@ impl SolanaGate {
 }
 
 /// Read a 32-byte Solana pubkey/token account from `receiver`.
+// Only used by `claim`, which needs the `recover` feature.
+#[cfg_attr(not(feature = "recover"), allow(dead_code))]
 fn to_pubkey(receiver: &[u8]) -> Result<Bytes32, GateError> {
     if receiver.len() != 32 {
         return Err(GateError::BadReceiver(receiver.len()));

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Dropdown, type DropdownOption } from "./Dropdown";
 import { TxBanner, type TxState } from "./TxBanner";
 import { ArrowRight, Glyph, Help } from "./icons";
-import { chainViz, formatUnits, formatUnitsRaw, isAddress, parseUnits, shortHex } from "../data/format";
+import { chainViz, formatUnits, formatUnitsRaw, isAddress, parseUnits, shortHex, receiverProblem } from "../data/format";
 import { fetchSubmission, fetchSwapPool, fetchSwapQuote } from "../api/client";
 import { useDebounced, usePoll } from "../api/hooks";
 import {
@@ -185,7 +185,11 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
 
   const tokenOk = isAddress(token);
   const gateOk = isAddress(gate);
-  const receiverOk = isAddress(receiver);
+  // L-4: validate the receiver against the DESTINATION VM, not just as an EVM
+  // address. A Solana destination needs a base58 SPL token account; a wallet
+  // pubkey there produces a transfer the gate can never release.
+  const receiverIssue = receiverProblem(receiver, toChainId);
+  const receiverOk = receiverIssue === null;
   const routerOk = isAddress(router);
   const finalTokenOk = isAddress(finalToken);
   const spender = crossSwap ? router : gate;
@@ -473,7 +477,7 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   else if (crossSwap && !routerOk) button = { label: "Enter the Router address", disabled: true };
   else if (crossSwap && !finalTokenOk) button = { label: "Enter a destination token", disabled: true };
   else if (toChainId == null) button = { label: "Pick a destination", disabled: true };
-  else if (!receiverOk) button = { label: crossSwap ? "Enter a valid final receiver" : "Enter a valid receiver", disabled: true };
+  else if (!receiverOk) button = { label: receiverIssue ?? "Enter a valid receiver", disabled: true };
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
   else if (insufficient) button = { label: "Insufficient balance", disabled: true };
   else if (crossSwap && !corridorOk) button = { label: "Corridor not configured", disabled: true };

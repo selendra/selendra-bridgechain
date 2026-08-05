@@ -18,7 +18,10 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::gate::Sent;
 use crate::hash::AutoParams;
-use crate::instruction::{AutoParamsWire, ClaimArgs, GateInstruction};
+use crate::instruction::AutoParamsWire;
+#[cfg(feature = "recover")]
+use crate::instruction::{ClaimArgs, GateInstruction};
+#[cfg(feature = "recover")]
 use crate::verify::{eth_signed_digest, recover_evm_address};
 
 /// First field of the Solana gate's `Sent` program-data event — lets the
@@ -203,6 +206,7 @@ fn wire_to_auto(w: &AutoParamsWire, native_sender: &[u8]) -> AutoParams {
 ///
 /// Signatures are sorted by recovered signer address strictly ascending — exactly
 /// the order the gate's `verify` step requires.
+#[cfg(feature = "recover")]
 pub fn build_claim_instruction(
     sent: &Sent,
     mut signatures: Vec<Vec<u8>>,
