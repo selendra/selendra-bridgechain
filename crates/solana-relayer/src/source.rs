@@ -31,6 +31,52 @@ use crate::config::SourceChain;
 use crate::state::Cursor;
 use crate::store::{SignerSig, Store, SubmissionRecord};
 
+/// One entry from `getSignaturesForAddress`.
+type SignatureEntry = solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+/// Pagination depth for [`Scanner::collect_since_cursor`]. 100 pages × the
+/// default 100-signature batch = 10k transactions of backlog before an operator
+/// has to intervene.
+const MAX_PAGES: usize = 100;
+
+/// What to do after reading one page of signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageAction {
+    /// The page reached the cursor (or the start of history): the collected range
+    /// is contiguous and safe to process.
+    Complete,
+    /// The page was full, so older signatures above the cursor remain unread.
+    KeepWalking,
+    /// Full pages all the way to [`MAX_PAGES`] — the backlog is deeper than we
+    /// will walk. Fail rather than process a range with a hole under it.
+    TooDeep,
+}
+
+/// The pagination rule, extracted so the thing that actually went wrong is
+/// testable without an RPC.
+///
+/// The bug this encodes: a page that comes back FULL is the RPC saying "I hit
+/// `limit` before I hit `until`" — i.e. there is more history between this page
+/// and the cursor. Treating a full page as the end of the range is what silently
+/// skipped events.
+fn next_page_action(
+    page_len: usize,
+    max_batch: usize,
+    has_cursor: bool,
+    page_index: usize,
+) -> PageAction {
+    if page_len < max_batch {
+        return PageAction::Complete; // reached `until`, or ran out of history
+    }
+    if !has_cursor {
+        return PageAction::Complete; // first run: start at the tip by design
+    }
+    if page_index + 1 >= MAX_PAGES {
+        return PageAction::TooDeep;
+    }
+    PageAction::KeepWalking
+}
+
 /// Recompute a submissionId from a decoded event, exactly as the program did.
 ///
 /// This is THE check: we sign the id we derived, never the one we were handed.
@@ -137,36 +183,90 @@ impl Scanner {
         }
     }
 
-    async fn tick(&mut self) -> anyhow::Result<usize> {
+    /// Every signature newer than the cursor, oldest-first.
+    ///
+    /// **This has to paginate.** `getSignaturesForAddress` walks BACKWARDS from
+    /// the tip (or from `before`) and stops at `until` *or* at `limit`, whichever
+    /// comes first — so a single call on a backlog larger than `limit` returns the
+    /// NEWEST `limit` signatures and silently omits the older ones sitting right
+    /// above the cursor. Processing that page and advancing the cursor to its
+    /// newest entry would skip the omitted range **permanently**: those `Sent`
+    /// events would never be signed, and the transfers behind them would never
+    /// reach quorum. That is H-3's "cursor advanced past unhandled logs", one
+    /// layer down.
+    ///
+    /// So we walk back page by page until a page reaches the cursor, and only
+    /// then hand the caller a contiguous range. If the backlog is deeper than
+    /// `max_batch * MAX_PAGES` we return an error and leave the cursor put: the
+    /// next tick retries the same range. Falling behind is recoverable; a hole is
+    /// not.
+    async fn collect_since_cursor(&self) -> anyhow::Result<Vec<SignatureEntry>> {
         let until = self
             .cursor
             .last_signature
             .as_deref()
             .and_then(|s| Signature::from_str(s).ok());
 
-        let sigs = self
-            .rpc
-            .get_signatures_for_address_with_config(
-                &self.program_id,
-                GetConfirmedSignaturesForAddress2Config {
-                    until,
-                    limit: Some(self.cfg.max_batch),
-                    commitment: Some(self.rpc.commitment()),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let mut newest_first: Vec<SignatureEntry> = Vec::new();
+        let mut before: Option<Signature> = None;
 
-        if sigs.is_empty() {
+        for page in 0..MAX_PAGES {
+            let sigs = self
+                .rpc
+                .get_signatures_for_address_with_config(
+                    &self.program_id,
+                    GetConfirmedSignaturesForAddress2Config {
+                        before,
+                        until,
+                        limit: Some(self.cfg.max_batch),
+                        commitment: Some(self.rpc.commitment()),
+                    },
+                )
+                .await?;
+
+            let action = next_page_action(sigs.len(), self.cfg.max_batch, until.is_some(), page);
+            let oldest = sigs.last().map(|s| s.signature.clone());
+            newest_first.extend(sigs);
+
+            match action {
+                PageAction::Complete => {
+                    if until.is_none() && page == 0 && !newest_first.is_empty() {
+                        info!("no cursor — starting from the current tip, not replaying history");
+                    }
+                    return Ok(newest_first.into_iter().rev().collect());
+                }
+                PageAction::TooDeep => anyhow::bail!(
+                    "backlog exceeds {} signatures without reaching the cursor; refusing to \
+                     advance past unscanned history — raise max_batch or investigate the stall",
+                    MAX_PAGES * self.cfg.max_batch
+                ),
+                PageAction::KeepWalking => {}
+            }
+
+            before = match oldest.as_deref().and_then(|s| Signature::from_str(s).ok()) {
+                Some(s) => Some(s),
+                None => anyhow::bail!("RPC returned an unparseable signature while paginating"),
+            };
+        }
+        unreachable!("the loop returns or bails on its last iteration")
+    }
+
+    async fn tick(&mut self) -> anyhow::Result<usize> {
+        // Oldest-first, so the nonce sequence and the cursor advance monotonically.
+        let entries = self.collect_since_cursor().await?;
+        if entries.is_empty() {
             return Ok(0);
         }
 
-        // The RPC returns newest-first; process oldest-first so the nonce sequence
-        // and the cursor advance monotonically.
         let mut handled = 0usize;
-        for entry in sigs.iter().rev() {
+        for entry in &entries {
             if entry.err.is_some() {
-                continue; // a failed tx emitted no committed event
+                // A failed tx emitted no committed event, but it still counts as
+                // scanned — the cursor must move past it or the next tick re-reads
+                // the same range forever.
+                self.cursor.last_signature = Some(entry.signature.clone());
+                self.cursor.save(&self.cfg.state_file)?;
+                continue;
             }
             let signature = Signature::from_str(&entry.signature)?;
             let tx = self
@@ -305,6 +405,44 @@ mod tests {
         let mut sent = sample();
         sent.amount += 1; // the classic: inflate the payout
         assert_ne!(recompute(&sent), sent.submission_id, "tampering must be detectable");
+    }
+
+    /// THE cursor bug, stated as a rule.
+    ///
+    /// `getSignaturesForAddress` walks backwards from the tip and stops at
+    /// `until` OR `limit`. A full page therefore means "I hit the limit first" —
+    /// there is unread history between this page and the cursor. The scanner used
+    /// to process that page and set the cursor to its newest entry, which skipped
+    /// the unread range permanently: those `Sent` events were never signed, so
+    /// their transfers could never reach quorum.
+    #[test]
+    fn a_full_page_means_there_is_more_history_below_it() {
+        // Backlog deeper than one page, cursor present -> must keep walking.
+        assert_eq!(
+            next_page_action(100, 100, true, 0),
+            PageAction::KeepWalking,
+            "a full page must never be treated as the end of the range"
+        );
+        // Short page -> the walk reached the cursor; the range is contiguous.
+        assert_eq!(next_page_action(37, 100, true, 0), PageAction::Complete);
+        assert_eq!(next_page_action(0, 100, true, 3), PageAction::Complete);
+    }
+
+    /// A first run has no cursor, so there is no range to be contiguous WITH:
+    /// starting at the tip is deliberate, not a skip.
+    #[test]
+    fn the_first_run_starts_at_the_tip() {
+        assert_eq!(next_page_action(100, 100, false, 0), PageAction::Complete);
+    }
+
+    /// Falling too far behind must fail loudly and leave the cursor put. Silently
+    /// processing a range with a hole under it is the failure mode we are fixing;
+    /// re-reading the same range next tick is merely slow.
+    #[test]
+    fn an_unwalkable_backlog_fails_instead_of_skipping() {
+        assert_eq!(next_page_action(100, 100, true, MAX_PAGES - 1), PageAction::TooDeep);
+        // Still walkable one page earlier.
+        assert_eq!(next_page_action(100, 100, true, MAX_PAGES - 2), PageAction::KeepWalking);
     }
 
     /// The signature must recover to the address we claim, or the store rejects it.

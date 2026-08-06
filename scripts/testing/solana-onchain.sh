@@ -37,6 +37,8 @@ fi
 
 echo
 echo "== [2/3] cargo-build-sbf — the real BPF target =="
+# FIRST RUN IS SLOW (~25 min): cargo-build-sbf downloads the platform-tools
+# toolchain before it can compile anything. Subsequent runs reuse it."
 # Runs as root because the platform-tools SDK lives under /root in the image;
 # ownership of the artifacts is handed back afterwards.
 docker run --rm -v "$ROOT:/work" -w /work "$IMAGE" sh -c "

@@ -118,10 +118,10 @@ export function SwapView({ chains, wallet }: Props) {
 
   // --- actions -----------------------------------------------------------
   const doApprove = async () => {
-    if (!pool || !tin || !wallet.address) return;
+    if (!pool || !tin || !wallet.address || chainId == null) return;
     setTx({ kind: "pending", label: `Approving ${tin.symbol || "token"}…` });
     try {
-      const hash = await sendApprove(wallet.request, wallet.address, tin.token, pool.address, amountBase);
+      const hash = await sendApprove(wallet.request, wallet.address, tin.token, pool.address, amountBase, chainId);
       setTx({ kind: "pending", label: "Confirming approval…", hash });
       await waitReceipt(wallet.request, hash);
       await refreshOnchain();
@@ -132,7 +132,7 @@ export function SwapView({ chains, wallet }: Props) {
   };
 
   const doSwap = async () => {
-    if (!pool || !tin || !tout || !wallet.address) return;
+    if (!pool || !tin || !tout || !wallet.address || chainId == null) return;
     setTx({ kind: "pending", label: "Swapping…" });
     try {
       const hash = await sendSwap(
@@ -143,7 +143,8 @@ export function SwapView({ chains, wallet }: Props) {
         tout.token,
         amountBase,
         minOut,
-        wallet.address
+        wallet.address,
+        chainId
       );
       setTx({ kind: "pending", label: "Confirming swap…", hash });
       const r = await waitReceipt(wallet.request, hash);

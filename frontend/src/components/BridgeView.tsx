@@ -56,9 +56,17 @@ type Stage = "idle" | "awaiting-execution" | "ready-to-finalize" | "finalized";
 // persisted so a page refresh or a wallet-chain switch doesn't strand an in-flight
 // transfer with no way to finalize it. On mount we restore it and then re-derive
 // the live stage from the backend (indexed history / sig-store), so the resumed
-// state reflects reality, not stale memory. Keyed by corridor so distinct
-// in-flight transfers don't clobber each other.
-const PENDING_STORE_KEY = "bridge.pendingSwap.v1";
+// state reflects reality, not stale memory.
+//
+// Keyed by SUBMISSION ID, not one fixed key. Under a single key a second
+// swap-and-bridge overwrites the first, and since finalize() needs exactly the
+// fields captured from the source `Sent` log — debridgeId, amount, nonce,
+// remoteRouter, the swap intent — the overwritten transfer loses its only
+// recovery action. The stable arrives on the destination router and just sits
+// there: nothing else in the UI can reconstruct those values.
+const PENDING_STORE_PREFIX = "bridge.pendingSwap.v2.";
+/** The v1 single-key layout this replaces; migrated on first load, then removed. */
+const LEGACY_PENDING_KEY = "bridge.pendingSwap.v1";
 
 interface PersistedFlow {
   pending: PendingSwap;
@@ -67,35 +75,66 @@ interface PersistedFlow {
 
 // PendingSwap carries bigint fields (amount/nonce/finalMinOut) that JSON can't
 // represent — tag+stringify on write, revive on read.
+const bigintReplacer = (_k: string, v: unknown) =>
+  typeof v === "bigint" ? { __bigint: v.toString() } : v;
+
+const bigintReviver = (_k: string, v: unknown) =>
+  v && typeof v === "object" && typeof (v as { __bigint?: string }).__bigint === "string"
+    ? BigInt((v as { __bigint: string }).__bigint)
+    : v;
+
 function savePendingFlow(flow: PersistedFlow | null) {
   try {
-    if (!flow || flow.stage === "idle") {
-      localStorage.removeItem(PENDING_STORE_KEY);
-      return;
-    }
+    if (!flow || flow.stage === "idle") return;
     localStorage.setItem(
-      PENDING_STORE_KEY,
-      JSON.stringify(flow, (_k, v) => (typeof v === "bigint" ? { __bigint: v.toString() } : v))
+      PENDING_STORE_PREFIX + flow.pending.submissionId.toLowerCase(),
+      JSON.stringify(flow, bigintReplacer)
     );
   } catch {
     /* storage disabled/full — non-fatal, we just lose refresh-resume */
   }
 }
 
-function loadPendingFlow(): PersistedFlow | null {
+/** Drop one finished flow. Only ever removes its own key. */
+function clearPendingFlow(submissionId: string) {
   try {
-    const raw = localStorage.getItem(PENDING_STORE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw, (_k, v) =>
-      v && typeof v === "object" && typeof (v as { __bigint?: string }).__bigint === "string"
-        ? BigInt((v as { __bigint: string }).__bigint)
-        : v
-    ) as PersistedFlow;
+    localStorage.removeItem(PENDING_STORE_PREFIX + submissionId.toLowerCase());
+  } catch {
+    /* storage disabled — nothing to clear */
+  }
+}
+
+function parseFlow(raw: string): PersistedFlow | null {
+  try {
+    const parsed = JSON.parse(raw, bigintReviver) as PersistedFlow;
     if (!parsed?.pending?.submissionId || parsed.stage === "idle") return null;
     return parsed;
   } catch {
     return null;
   }
+}
+
+/** Every unfinished flow, so none is silently lost. */
+export function loadPendingFlows(): PersistedFlow[] {
+  const out: PersistedFlow[] = [];
+  try {
+    // Migrate a v1 record, if any, into its own key before reading.
+    const legacy = localStorage.getItem(LEGACY_PENDING_KEY);
+    if (legacy) {
+      const flow = parseFlow(legacy);
+      if (flow) savePendingFlow(flow);
+      localStorage.removeItem(LEGACY_PENDING_KEY);
+    }
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(PENDING_STORE_PREFIX)) continue;
+      const flow = parseFlow(localStorage.getItem(key) ?? "");
+      if (flow) out.push(flow);
+    }
+  } catch {
+    return out;
+  }
+  return out;
 }
 
 export function BridgeView({ chains, wallet, onReview }: Props) {
@@ -129,19 +168,28 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   // device switch doesn't lose the finalize recovery action. The awaiting →
   // ready transition is then re-driven from the backend (see the poll effect),
   // so the restored stage is reconciled with the indexed on-chain reality.
+  // How many other unfinished transfers are waiting, so the user is told rather
+  // than left to discover that only one of them is on screen.
+  const [otherPendingCount, setOtherPendingCount] = useState(0);
+
   useEffect(() => {
-    const restored = loadPendingFlow();
+    const flows = loadPendingFlows();
+    // Resume the one that still needs an action first; a `finalized` record is
+    // only kept so the confirmation survives a refresh.
+    const restored = flows.find((f) => f.stage !== "finalized") ?? flows[0];
     if (restored) {
       setPending(restored.pending);
       setStage(restored.stage);
       setCrossSwap(true); // a persisted flow is always a cross-chain swap
+      setOtherPendingCount(flows.length - 1);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist (or clear) the recovery action whenever it changes.
+  // Persist the recovery action whenever it changes. Writes only this transfer's
+  // key, so a concurrent in-flight transfer is never overwritten.
   useEffect(() => {
-    savePendingFlow(pending && stage !== "idle" ? { pending, stage } : null);
+    if (pending && stage !== "idle") savePendingFlow({ pending, stage });
   }, [pending, stage]);
 
   // Default destination = first chain that isn't the source. Skipped once a
@@ -195,13 +243,30 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   const spender = crossSwap ? router : gate;
   const spenderOk = crossSwap ? routerOk : gateOk;
 
+  // Which token+chain the numbers above were actually read for. `decimals` is
+  // the dangerous one: it scales the amount into base units, so reading it for
+  // token A and then encoding a transfer of token B is off by 10^(decA-decB).
+  // Switching from an 18-decimal token to a 6-decimal one and submitting before
+  // the read lands would send a million times the intended amount. `null` means
+  // "no trustworthy read yet" and blocks the submit button — never fall back to
+  // a stale value, and never to a guessed 18.
+  const [readFor, setReadFor] = useState<string | null>(null);
+  const readKey = `${fromChainId ?? "?"}:${token.toLowerCase()}:${spender.toLowerCase()}`;
+  const onchainStale = readFor !== readKey;
+
   // On-chain reads (decimals/balance/allowance) against the connected chain.
   const refreshOnchain = useCallback(async () => {
     if (!wallet.address || !tokenOk) {
+      setReadFor(null);
       setBalance(null);
       setAllowance(null);
       return;
     }
+    // Invalidate first: everything below describes the PREVIOUS token until the
+    // awaits resolve, and a submit in that window is the bug.
+    setReadFor(null);
+    setBalance(null);
+    setAllowance(null);
     try {
       const dec = await readDecimals(wallet.request, token).catch(() => 18);
       setDecimals(Number.isFinite(dec) && dec > 0 && dec <= 36 ? dec : 18);
@@ -211,17 +276,20 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
       ]);
       setBalance(b);
       setAllowance(a);
+      setReadFor(readKey);
     } catch {
       setBalance(null);
       setAllowance(null);
+      setReadFor(null);
     }
-  }, [wallet.address, wallet.request, token, spender, tokenOk, spenderOk]);
+  }, [wallet.address, wallet.request, token, spender, tokenOk, spenderOk, readKey]);
 
   useEffect(() => {
     refreshOnchain();
   }, [refreshOnchain]);
 
-  const amountBase = tokenOk ? parseUnits(amount, decimals) : 0n;
+  // Only meaningful once the reads match the selected token (see `onchainStale`).
+  const amountBase = tokenOk && !onchainStale ? parseUnits(amount, decimals) : 0n;
   const needsApprove = allowance != null && amountBase > 0n && spenderOk && allowance < amountBase;
   const insufficient = balance != null && amountBase > balance;
   const busy = tx.kind === "pending";
@@ -309,10 +377,10 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   const corridorOk = !!remoteRouterHex && remoteRouterHex !== "0x";
 
   const doApprove = async () => {
-    if (!wallet.address) return;
+    if (!wallet.address || fromChainId == null) return;
     setTx({ kind: "pending", label: crossSwap ? "Approving router…" : "Approving token…" });
     try {
-      const hash = await sendApprove(wallet.request, wallet.address, token, spender, amountBase);
+      const hash = await sendApprove(wallet.request, wallet.address, token, spender, amountBase, fromChainId);
       setTx({ kind: "pending", label: "Confirming approval…", hash });
       await waitReceipt(wallet.request, hash);
       await refreshOnchain();
@@ -323,10 +391,20 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   };
 
   const doSend = async () => {
-    if (!wallet.address || toChainId == null) return;
+    if (!wallet.address || toChainId == null || fromChainId == null) return;
     setTx({ kind: "pending", label: "Locking + emitting…" });
     try {
-      const hash = await sendBridge(wallet.request, wallet.address, gate, token, amountBase, toChainId, receiver, "0x");
+      const hash = await sendBridge(
+        wallet.request,
+        wallet.address,
+        gate,
+        token,
+        amountBase,
+        toChainId,
+        receiver,
+        fromChainId,
+        "0x"
+      );
       setTx({ kind: "pending", label: "Confirming send…", hash });
       const r = await waitReceipt(wallet.request, hash);
       if (!r.success) throw new Error("Send reverted on-chain");
@@ -352,7 +430,8 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
         toChainId,
         finalToken,
         receiver,
-        finalMinOut
+        finalMinOut,
+        fromChainId
       );
       setTx({ kind: "pending", label: "Confirming…", hash });
       const r = await waitReceiptFull(wallet.request, hash);
@@ -408,7 +487,7 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   }, [stage, pending]);
 
   const doFinalize = async () => {
-    if (!wallet.address || !pending || !finalizeReg?.router) return;
+    if (!wallet.address || !pending || !finalizeReg?.router || finalizeChainId == null) return;
     setTx({ kind: "pending", label: "Finalizing…" });
     try {
       const nativeSenderHex = "0x" + pending.routerSrc.replace(/^0x/i, "").toLowerCase();
@@ -427,7 +506,9 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
         Number(pending.nonce),
         pending.remoteRouter,
         autoParams,
-        nativeSenderHex
+        nativeSenderHex,
+        // finalize() runs on the DESTINATION chain, not `pending.chainIdFrom`.
+        finalizeChainId
       );
       setTx({ kind: "pending", label: "Confirming finalize…", hash });
       const r = await waitReceipt(wallet.request, hash);
@@ -440,8 +521,20 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   };
 
   const resetFlow = () => {
+    if (pending) clearPendingFlow(pending.submissionId);
+    // Another unfinished transfer may be waiting behind this one — surface it
+    // instead of dropping straight back to a blank form.
+    const remaining = loadPendingFlows().find((f) => f.stage !== "finalized");
+    if (remaining) {
+      setPending(remaining.pending);
+      setStage(remaining.stage);
+      setOtherPendingCount(Math.max(0, loadPendingFlows().length - 1));
+      setTx({ kind: "idle" });
+      return;
+    }
     setStage("idle");
     setPending(null);
+    setOtherPendingCount(0);
     setTx({ kind: "idle" });
   };
 
@@ -478,6 +571,9 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
   else if (crossSwap && !finalTokenOk) button = { label: "Enter a destination token", disabled: true };
   else if (toChainId == null) button = { label: "Pick a destination", disabled: true };
   else if (!receiverOk) button = { label: receiverIssue ?? "Enter a valid receiver", disabled: true };
+  // Until the reads match the selected token, `decimals` may still describe the
+  // previous one — refuse to encode an amount with it rather than guess.
+  else if (onchainStale) button = { label: "Reading token…", disabled: true };
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
   else if (insufficient) button = { label: "Insufficient balance", disabled: true };
   else if (crossSwap && !corridorOk) button = { label: "Corridor not configured", disabled: true };
@@ -551,6 +647,7 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
             <div className="token-picker">
               <Dropdown
                 variant="token"
+                placeholder="Custom address"
                 value={fromReg.tokens.some((t) => eqAddr(t.address, token)) ? token.toLowerCase() : ""}
                 options={fromReg.tokens.map((t) => ({
                   value: t.address.toLowerCase(),
@@ -726,6 +823,12 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
         <div className="notice notice--warn">
           Claimed on {finalizeName} — click below to swap the bridged stable into the final token. This step is
           permissionless; anyone can complete it.
+        </div>
+      )}
+      {otherPendingCount > 0 && (
+        <div className="notice" data-testid="other-pending">
+          {otherPendingCount} other unfinished transfer{otherPendingCount > 1 ? "s" : ""} saved on this device — you'll
+          be taken to {otherPendingCount > 1 ? "them" : "it"} after finishing this one.
         </div>
       )}
 

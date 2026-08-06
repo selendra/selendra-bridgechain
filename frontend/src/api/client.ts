@@ -13,7 +13,10 @@ import type {
   SwapPoolInfo,
 } from "./types";
 
-const API_BASE = import.meta.env.VITE_API ?? "";
+// `import.meta.env` is injected by Vite. Guard the whole access so this module
+// can also be imported outside a Vite build (the test runner does exactly that
+// to exercise the query builders directly).
+const API_BASE = import.meta.env?.VITE_API ?? "";
 
 export async function gql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
   const res = await fetch(`${API_BASE}/graphql`, {
@@ -26,6 +29,28 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
   if (json.errors && json.errors.length) throw new Error(json.errors[0].message);
   if (!json.data) throw new Error("empty GraphQL response");
   return json.data;
+}
+
+/**
+ * Guard a number that is about to be spliced into a GraphQL document as a
+ * literal.
+ *
+ * `chainId`/`limit` are `u64` arguments with no convenient variable scalar name,
+ * so they are inlined rather than bound. That is only safe while they really are
+ * integers: TypeScript's `number` is a compile-time claim, and these values
+ * originate from backend JSON and wallet responses. A non-integer would be
+ * interpolated verbatim into the query text — closing the argument list and
+ * appending arbitrary selections. Enforce the claim at the boundary instead of
+ * documenting it.
+ *
+ * Its three callers are `async` on purpose. A `Promise`-returning function that
+ * throws SYNCHRONOUSLY sidesteps every `.catch()` its callers attach, so a
+ * rejected argument would crash a render instead of being handled like any other
+ * failed fetch. `async` turns the throw into a rejection.
+ */
+function intLiteral(name: string, v: number): string {
+  if (!Number.isSafeInteger(v) || v < 0) throw new Error(`${name} must be a non-negative integer`);
+  return String(v);
 }
 
 export async function health(): Promise<boolean> {
@@ -97,13 +122,14 @@ export function fetchHistory(filter?: HistoryFilter): Promise<HistoryEntry[]> {
   ).then((d) => d.history);
 }
 
-export function fetchSwapHistory(chainId?: number, limit?: number): Promise<SwapHistoryEntry[]> {
+export async function fetchSwapHistory(chainId?: number, limit?: number): Promise<SwapHistoryEntry[]> {
   // chainId/limit are u64 args (not InputObject fields), which — like
   // swapQuote's chainId — don't have a convenient GraphQL variable scalar
-  // name, so inline them as validated integer literals rather than variables.
+  // name, so inline them as integer literals rather than variables. See
+  // `intLiteral`: the integer-ness is enforced, not assumed.
   const args = [
-    chainId != null ? `chainId: ${chainId}` : null,
-    limit != null ? `limit: ${limit}` : null,
+    chainId != null ? `chainId: ${intLiteral("chainId", chainId)}` : null,
+    limit != null ? `limit: ${intLiteral("limit", limit)}` : null,
   ]
     .filter(Boolean)
     .join(", ");
@@ -119,16 +145,16 @@ export function fetchSwapHistory(chainId?: number, limit?: number): Promise<Swap
 // chainId is inlined as an integer literal (it's a validated number, not free
 // text) to sidestep the u64 GraphQL scalar name; string args use variables.
 
-export function fetchSwapPool(chainId: number): Promise<SwapPoolInfo | null> {
+export async function fetchSwapPool(chainId: number): Promise<SwapPoolInfo | null> {
   return gql<{ swapPool: SwapPoolInfo | null }>(
-    `{ swapPool(chainId: ${chainId}) {
+    `{ swapPool(chainId: ${intLiteral("chainId", chainId)}) {
          chainId address stable
          tokens { token symbol decimals price reserve maxSwapUsd isStable }
        } }`
   ).then((d) => d.swapPool);
 }
 
-export function fetchSwapQuote(
+export async function fetchSwapQuote(
   chainId: number,
   tokenIn: string,
   tokenOut: string,
@@ -136,7 +162,7 @@ export function fetchSwapQuote(
 ): Promise<string | null> {
   return gql<{ swapQuote: string | null }>(
     `query Q($in: String!, $out: String!, $amt: String!) {
-       swapQuote(chainId: ${chainId}, tokenIn: $in, tokenOut: $out, amountIn: $amt)
+       swapQuote(chainId: ${intLiteral("chainId", chainId)}, tokenIn: $in, tokenOut: $out, amountIn: $amt)
      }`,
     { in: tokenIn, out: tokenOut, amt: amountIn }
   ).then((d) => d.swapQuote);

@@ -63,6 +63,14 @@ export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
 
         {loading && !data && <div className="drawer__body">Loading…</div>}
         {error && !data && <div className="drawer__body notice notice--error">Couldn’t load: {error}</div>}
+        {/* The store answered, and it has never heard of this id. Saying so beats
+            an empty drawer, which reads as a still-loading one forever. */}
+        {!loading && !error && !data && (
+          <div className="drawer__body notice">
+            The signature store has no record of this submission. It may have been pruned, or the
+            backend may be pointed at a different store.
+          </div>
+        )}
 
         {data && (
           <div className="drawer__body">

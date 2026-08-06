@@ -640,7 +640,7 @@ fn bincode_deserialize_loader_state(
         .map_err(|_| ProgramError::InvalidAccountData)
 }
 
-#[derive(thiserror::Error, Debug, Copy, Clone)]
+#[derive(thiserror::Error, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum GateError {
     #[error("amount must be non-zero")]
     ZeroAmount,
@@ -674,6 +674,13 @@ pub enum GateError {
     /// M-2: the destination has not been burned, so no refund is authorised.
     #[error("destination not cancelled")]
     NotCancelled,
+    /// More signatures than the gate has validators. A correct array can never
+    /// be longer (signers are distinct and ascending), so this is either junk
+    /// padding or a bug — and recovering each one costs ~25k CU, which is how a
+    /// padded array bricks `claim`/`cancel`/`refund` for good. See
+    /// [`verify_threshold`]. Mirrors `Gate.sol`'s `TooManySignatures`.
+    #[error("more signatures than validators")]
+    TooManySignatures,
 }
 
 impl From<GateError> for ProgramError {
@@ -758,7 +765,27 @@ fn recover_evm_address(digest: &[u8; 32], sig65: &[u8]) -> Result<[u8; 20], Gate
     Ok(addr)
 }
 
+/// Verify a threshold of distinct validator signatures over `id`.
+///
+/// **The length cap is a liveness control, not a nicety.** `secp256k1_recover`
+/// costs ~25k compute units, so the loop below spends the *entire* 200k default
+/// budget on eight signatures. The signature store accepts a signature from any
+/// key that recovers to its claimed signer — it does not know the validator set —
+/// so anyone holding a `Sign`-scoped token can append junk-but-recoverable
+/// signatures to a pending submission. Without this cap a relayer forwards them
+/// all, every `claim`/`cancel`/`refund` for that submission runs out of compute
+/// before reaching quorum, and the transfer is stuck *forever* — the recovery
+/// paths are DoS'd by the same trick that blocks the payout.
+///
+/// `Gate.sol::_verifySignatures` has carried the same cap since `16ed706`
+/// (`TooManySignatures`); this is its Solana counterpart. Rejecting on length
+/// before the first recover keeps the refusal cheap, and it costs an honest
+/// relayer nothing: a correct array never holds more signatures than there are
+/// validators, because they must be strictly ascending and distinct.
 fn verify_threshold(cfg: &Config, id: &[u8; 32], signatures: &[Vec<u8>]) -> Result<(), GateError> {
+    if signatures.len() > cfg.validators.len() {
+        return Err(GateError::TooManySignatures);
+    }
     let digest = eth_signed_digest(id);
     let mut last = [0u8; 20];
     let mut have_last = false;
@@ -1913,6 +1940,114 @@ mod c1_tests {
         assert_ne!(MARKER_CLAIMED, MARKER_CANCELLED);
         assert_ne!(MARKER_CLAIMED, 0, "0 would read as 'not executed'");
         assert_ne!(MARKER_CANCELLED, 0, "0 would read as 'not executed'");
+    }
+
+    // -----------------------------------------------------------------------
+    // Signature-array length cap. `secp256k1_recover` is ~25k CU, so an
+    // unbounded array is a compute-budget bomb: eight junk signatures exhaust
+    // the 200k default before quorum is reached, and because claim, cancel AND
+    // refund all funnel through `verify_threshold`, the payout and both recovery
+    // paths die together. The store will accept junk (it authenticates a
+    // signature against its claimed signer, not against the validator set), so
+    // the gate has to refuse it here.
+    // -----------------------------------------------------------------------
+
+    /// A config with `n` validators. The signature bytes in these tests never
+    /// need to recover — the cap must reject on LENGTH ALONE, before the first
+    /// (expensive) recover, which is the entire point.
+    fn cfg_with_validators(n: usize) -> Config {
+        Config {
+            owner: Pubkey::new_unique(),
+            guardian: Pubkey::default(),
+            validators: (0..n).map(|i| [i as u8; 20]).collect(),
+            threshold: 2,
+            chain_id: 7565164,
+            paused: false,
+            max_validators: 32,
+            max_corridors: 8,
+            nonce_to: vec![],
+        }
+    }
+
+    #[test]
+    fn more_signatures_than_validators_is_refused() {
+        let cfg = cfg_with_validators(3);
+        let id = [0x11u8; 32];
+
+        // 4 signatures against a 3-validator set: impossible for an honest array
+        // (signers must be distinct and ascending), so it is padding.
+        let padded = vec![vec![0u8; 65]; 4];
+        assert_eq!(
+            verify_threshold(&cfg, &id, &padded),
+            Err(GateError::TooManySignatures),
+            "a padded array must be refused on length, before any recover"
+        );
+    }
+
+    /// The griefing scenario in full: two junk signatures on top of a legitimate
+    /// 2-of-3 quorum. Before the cap this array was accepted into the recover
+    /// loop and burned ~125k CU; the cap turns it into a cheap, immediate
+    /// refusal, so the honest relayer's next (unpadded) attempt still lands.
+    #[test]
+    fn junk_padding_cannot_force_the_expensive_path() {
+        let cfg = cfg_with_validators(3);
+        let id = [0x11u8; 32];
+
+        let quorum_plus_junk = vec![vec![0u8; 65]; 5];
+        assert_eq!(
+            verify_threshold(&cfg, &id, &quorum_plus_junk),
+            Err(GateError::TooManySignatures)
+        );
+    }
+
+    /// The cap must not touch honest arrays: exactly `validatorCount` signatures
+    /// is legal and has to reach the recover loop (where these all-zero bytes
+    /// then fail as bad signatures — proving we got PAST the length check).
+    #[test]
+    fn an_array_no_longer_than_the_validator_set_passes_the_cap() {
+        let cfg = cfg_with_validators(3);
+        let id = [0x11u8; 32];
+
+        for len in 1..=3usize {
+            let sigs = vec![vec![0u8; 65]; len];
+            assert_eq!(
+                verify_threshold(&cfg, &id, &sigs),
+                Err(GateError::BadSignature),
+                "{len} signatures must reach the recover loop, not the length cap"
+            );
+        }
+    }
+
+    /// Every path that spends validator authority shares one cap, because an
+    /// attacker who could only brick `claim` would still strand the funds — the
+    /// recovery instructions must survive the same padding.
+    #[test]
+    fn claim_cancel_and_refund_share_the_cap() {
+        let cfg = cfg_with_validators(2);
+        let id = [0x11u8; 32];
+        let padded = vec![vec![0u8; 65]; 3];
+
+        for digest in [id, cancel_id(&id), refund_id(&id)] {
+            assert_eq!(
+                verify_threshold(&cfg, &digest, &padded),
+                Err(GateError::TooManySignatures),
+                "every signing domain must reject padding"
+            );
+        }
+    }
+
+    /// Adding `TooManySignatures` must not renumber the existing errors: clients
+    /// (and the account-level suite) match on `ProgramError::Custom(n)`, so a
+    /// shifted discriminant silently changes what every other failure means.
+    #[test]
+    fn error_discriminants_are_append_only() {
+        assert_eq!(ProgramError::from(GateError::ZeroAmount), ProgramError::Custom(1));
+        assert_eq!(ProgramError::from(GateError::AlreadyExecuted), ProgramError::Custom(3));
+        assert_eq!(ProgramError::from(GateError::NotEnoughSignatures), ProgramError::Custom(5));
+        assert_eq!(ProgramError::from(GateError::Paused), ProgramError::Custom(8));
+        assert_eq!(ProgramError::from(GateError::NotCancelled), ProgramError::Custom(12));
+        // The new variant lands after every pre-existing one.
+        assert_eq!(ProgramError::from(GateError::TooManySignatures), ProgramError::Custom(13));
     }
 
     // Atomic/authorized init: only the program's upgrade authority (deployer) may

@@ -9,7 +9,11 @@ const LABEL: Record<SubmissionStatus, string> = {
 };
 
 export function StatusBadge({ status }: { status: SubmissionStatus }) {
-  return <span className={`badge badge--${status.toLowerCase()}`}>{LABEL[status]}</span>;
+  // Fall back to the raw value. The union is a compile-time claim about what the
+  // backend sends; if it ever grows a variant, an unmapped status must show
+  // SOMETHING — a blank badge reads as "no status", which is a different and
+  // much more reassuring statement than "a status this UI doesn't know".
+  return <span className={`badge badge--${String(status).toLowerCase()}`}>{LABEL[status] ?? status}</span>;
 }
 
 const REFUND_LABEL: Record<string, string> = {

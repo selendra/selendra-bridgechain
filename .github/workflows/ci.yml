@@ -66,12 +66,30 @@ jobs:
       # the on-chain runtime), so it needs its own invocation. These are the
       # host-runnable authorization predicates — see the note in `deploy-readiness`
       # below for what they deliberately do not cover.
+      # --lib is the predicate tests; the account_level suite drives the real
+      # handlers in a solana-program-test bank (no SBF toolchain needed).
       - name: Tests
-        run: cargo test --manifest-path crates/solana-gate/Cargo.toml --lib
+        run: cargo test --manifest-path crates/solana-gate/Cargo.toml
 
       - name: Clippy (non-blocking — see note in the `rust` job)
         continue-on-error: true
         run: cargo clippy --manifest-path crates/solana-gate/Cargo.toml --all-targets
+
+  solana-relayer:
+    name: Solana relayer — build + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/solana-relayer
+
+      # Excluded from the root workspace on purpose: solana-client's dependency
+      # tree is mutually exclusive with alloy's (finding M-3), so it needs its own
+      # invocation and its own lockfile.
+      - name: Tests
+        run: cargo test --manifest-path crates/solana-relayer/Cargo.toml
 
   contracts:
     name: Solidity — forge test + coverage
@@ -101,7 +119,7 @@ jobs:
         run: forge coverage --report summary
 
   frontend:
-    name: Frontend — build
+    name: Frontend — build + tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -114,8 +132,33 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
 
+      # `tsc -b` is the gate that would have caught the duplicate
+      # `SOLANA_CHAIN_ID` export that shipped a non-compiling frontend: every
+      # Rust and Solidity suite stayed green while `bun run build` was broken.
       - name: Build
         run: bun run build
+
+      # The e2e project drives the real app in Chromium; the browser is a
+      # separate download from the npm package.
+      - name: Install Playwright browsers
+        run: bunx playwright install --with-deps chromium
+
+      # Unit project: the calldata encoders, unit math, receiver validation and
+      # GraphQL query construction — the pure functions that turn user input
+      # into bytes, where a wrong offset is invisible in a screenshot.
+      # E2E project: the whole app against a mocked backend and a mocked
+      # EIP-1193 wallet, including the chain-id binding on writes and the
+      # swap-and-bridge finalize recovery.
+      - name: Tests
+        run: bunx playwright test
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
 
   static:
     name: Compose + shell syntax
@@ -130,6 +173,13 @@ jobs:
       # be silently mis-emitted (findings H1 / M-7), so at minimum they must parse.
       - name: Shell syntax
         run: bash -n scripts/*.sh scripts/testing/*.sh docker/*.sh
+
+      # A v4 lockfile silently breaks `cargo build-sbf` (platform-tools ships
+      # cargo 1.75). Cheap to assert here; expensive to discover at deploy time.
+      - name: solana-gate lockfile stays v3
+        run: |
+          v=$(sed -n 's/^version = //p' crates/solana-gate/Cargo.lock | head -1)
+          [ "$v" = "3" ] || { echo "crates/solana-gate/Cargo.lock is v$v; the SBF toolchain needs v3"; exit 1; }
 
       - name: shellcheck
         continue-on-error: true
@@ -147,7 +197,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   deploy-readiness:
-    name: Solana SBF build (deploy gate)
+    name: Solana SBF build + deploy (deploy gate)
     runs-on: ubuntu-latest
     # The host tests in `solana-gate` cover authorization logic. They cannot cover
     # what only the real target enforces:
@@ -161,10 +211,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Solana toolchain
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.26/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-
-      - name: Build BPF
-        run: cargo build-sbf --manifest-path crates/solana-gate/Cargo.toml
+      # Everything runs in Docker so the job needs no host Solana toolchain, and
+      # it matches exactly what a developer runs locally.
+      #
+      # NOTE: crates/solana-gate/Cargo.lock must stay at lockfile version 3.
+      # Solana 1.18's platform-tools ships cargo 1.75, which cannot parse v4 —
+      # a v4 lockfile fails the SBF build outright while every host-side test
+      # still passes, so nothing else in this workflow would catch it.
+      - name: SBF build + deploy into a live validator
+        run: bash scripts/testing/solana-onchain.sh

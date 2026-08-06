@@ -3,6 +3,7 @@
 // derived deterministically for unknown ids). No fake token registry, no fake
 // USD prices — token metadata now comes live from the swap pool.
 
+/** deBridge's chain id for Solana — the value the gates hash into a submissionId. */
 export const SOLANA_CHAIN_ID = 7565164;
 
 const CHAIN_PALETTE: Record<number, { gradient: [string, string]; short: string }> = {
@@ -101,9 +102,6 @@ export function shortHex(hex: string, lead = 6, tail = 4): string {
 export function isAddress(v: string): boolean {
   return /^0x[0-9a-fA-F]{40}$/.test(v.trim());
 }
-
-/** deBridge's chain id for Solana — the value the gates hash into a submissionId. */
-export const SOLANA_CHAIN_ID = 7565164;
 
 /**
  * True for a well-formed base58 Solana account key (32 bytes).

@@ -14,13 +14,20 @@ interface DropdownProps {
   onChange: (value: string) => void;
   /** Compact = token pill (right side); full = chain selector (left side). */
   variant?: "chain" | "token";
+  /** Shown when `value` matches no option (e.g. a hand-typed custom address). */
+  placeholder?: string;
 }
 
 /** A small custom select — closes on outside click / Escape. */
-export function Dropdown({ options, value, onChange, variant = "chain" }: DropdownProps) {
+export function Dropdown({ options, value, onChange, variant = "chain", placeholder = "Custom" }: DropdownProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const selected = options.find((o) => o.value === value) ?? options[0];
+  // Match ONLY on the parent's value. This used to fall back to `options[0]`,
+  // which displayed the first token as if it were selected while the parent
+  // still held a different address — so the trigger could read "USDC" while the
+  // transfer being built was for something else entirely. A control must never
+  // claim a selection its owner does not have.
+  const selected = options.find((o) => o.value === value) ?? null;
 
   useEffect(() => {
     if (!open) return;
@@ -38,7 +45,7 @@ export function Dropdown({ options, value, onChange, variant = "chain" }: Dropdo
 
   // No options yet (e.g. chains still loading from the backend). Hooks above
   // always run, so this early return is safe.
-  if (!selected) {
+  if (!options.length) {
     return (
       <div className={`dd dd--${variant}`}>
         <button type="button" className="dd__trigger" disabled>
@@ -50,9 +57,17 @@ export function Dropdown({ options, value, onChange, variant = "chain" }: Dropdo
 
   return (
     <div className={`dd dd--${variant}`} ref={ref}>
-      <button type="button" className="dd__trigger" onClick={() => setOpen((v) => !v)}>
-        {selected.glyph}
-        <span className="dd__label">{selected.label}</span>
+      <button
+        type="button"
+        className="dd__trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {selected?.glyph}
+        <span className={`dd__label${selected ? "" : " dd__label--empty"}`}>
+          {selected ? selected.label : placeholder}
+        </span>
         <ChevronDown size={16} className="dd__chev" />
       </button>
       {open && (

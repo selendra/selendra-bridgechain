@@ -1176,3 +1176,100 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Signature-array length cap, executed.
+//
+// `secp256k1_recover` costs ~25k CU. `verify_threshold` used to loop over every
+// signature supplied, so an array longer than the validator set was a compute
+// bomb: the transaction ran out of budget before reaching quorum. The sig-store
+// authenticates a signature against its CLAIMED signer — not against the
+// validator set — so anyone with a `Sign`-scoped token can append junk from
+// throwaway keys to a pending submission, and a relayer that forwards it makes
+// the transfer permanently unclaimable.
+//
+// Worse, `claim`, `cancel` and `refund` share one verifier. Padding the array
+// kills the payout AND both recovery paths together, which is the difference
+// between a delayed transfer and a lost one.
+//
+// `Gate.sol` has carried the equivalent cap since `16ed706` (`TooManySignatures`).
+// These tests prove the Solana gate now refuses the same shape, cheaply, through
+// the real handler.
+// ---------------------------------------------------------------------------
+
+/// `ProgramError::Custom(n)` for a `GateError` — the discriminant is
+/// `index + 1`. `TooManySignatures` is the last variant.
+const TOO_MANY_SIGNATURES: u32 = 13;
+
+fn is_custom(err: &solana_sdk::transaction::TransactionError, code: u32) -> bool {
+    matches!(
+        err,
+        solana_sdk::transaction::TransactionError::InstructionError(
+            _,
+            solana_sdk::instruction::InstructionError::Custom(c),
+        ) if *c == code
+    )
+}
+
+/// A three-validator gate padded with junk: refused on length, before any
+/// recover, and nothing is burned.
+#[tokio::test]
+async fn a_padded_cancel_is_refused_on_length_and_burns_nothing() {
+    // setup() seeds three validators, threshold 2.
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+
+    // Four structurally valid 65-byte signatures against a 3-validator set.
+    // An honest array can never be this long: signers must be distinct and
+    // strictly ascending, so there are at most three of them.
+    let padded = vec![vec![0x1bu8; 65]; 4];
+    let (instruction, id) = cancel_instruction(cancel_args(padded), owner.pubkey());
+
+    let err = exec(&mut ctx, instruction, &[&owner])
+        .await
+        .expect_err("more signatures than validators must be refused");
+    assert!(
+        is_custom(&err, TOO_MANY_SIGNATURES),
+        "expected TooManySignatures, got {err:?}"
+    );
+
+    // The transfer is untouched, so an honest (unpadded) attempt still works.
+    assert!(
+        ctx.banks_client.get_account(executed_pda(&id)).await.unwrap().is_none(),
+        "a refused cancel must leave no marker"
+    );
+}
+
+/// The griefing volume that used to exhaust the compute budget. It must now cost
+/// the gate a length comparison, not eight signature recoveries.
+#[tokio::test]
+async fn a_heavily_padded_array_never_reaches_the_recover_loop() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+
+    // Eight recoveries ≈ 200k CU: the entire default budget.
+    let padded = vec![vec![0x1bu8; 65]; 8];
+    let (instruction, _) = cancel_instruction(cancel_args(padded), owner.pubkey());
+
+    let err = exec(&mut ctx, instruction, &[&owner]).await.expect_err("must be refused");
+    assert!(
+        is_custom(&err, TOO_MANY_SIGNATURES),
+        "a padded array must fail on the cap, not on compute exhaustion: {err:?}"
+    );
+}
+
+/// The cap must not break an honest array. Exactly `validatorCount` signatures is
+/// legal and has to reach the recover loop — where these placeholder bytes then
+/// fail as BAD SIGNATURES, which is how we know the length check let them past.
+#[tokio::test]
+async fn an_array_within_the_validator_count_still_reaches_verification() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+
+    for len in 1..=3usize {
+        let (instruction, _) =
+            cancel_instruction(cancel_args(vec![vec![0x1bu8; 65]; len]), owner.pubkey());
+        let err = exec(&mut ctx, instruction, &[&owner]).await.expect_err("junk is still junk");
+        assert!(
+            !is_custom(&err, TOO_MANY_SIGNATURES),
+            "{len} signatures must pass the length cap and fail on verification instead: {err:?}"
+        );
+    }
+}

@@ -267,8 +267,44 @@ export async function readRouterGate(req: Eip1193Request, router: string): Promi
 
 // --- writes (eth_sendTransaction) ---------------------------------------
 
-async function sendTx(req: Eip1193Request, from: string, to: string, data: string): Promise<string> {
-  return (await req({ method: "eth_sendTransaction", params: [{ from, to, data }] })) as string;
+/** Thrown when the wallet is on a different chain than the one the UI built the
+ *  transaction for. Distinct from a generic error so callers can say so plainly. */
+export class WrongChainError extends Error {
+  constructor(readonly expected: number, readonly actual: number) {
+    super(`Wallet is on chain ${actual}, but this transaction is for chain ${expected}. Switch networks and try again.`);
+    this.name = "WrongChainError";
+  }
+}
+
+/**
+ * Every write is bound to the chain the UI encoded it for. Two independent guards:
+ *
+ *  1. **Re-read `eth_chainId` immediately before signing.** The React `chainId`
+ *     that gated the button is a snapshot delivered by a `chainChanged` event; it
+ *     can lag the wallet, and the user can switch networks while the amount is
+ *     being typed or a quote is in flight. Contract addresses are NOT chain-scoped
+ *     by the wallet — the same address on another chain is a different contract
+ *     (or nothing), so an `approve`/`send` landing on the wrong chain can approve
+ *     an unknown spender or lock funds in a contract that will never emit `Sent`.
+ *
+ *  2. **Send `chainId` in the transaction itself**, so the wallet performs the
+ *     same check independently and rejects a mismatch even if the RPC read above
+ *     was answered by a stale provider.
+ */
+async function sendTx(
+  req: Eip1193Request,
+  from: string,
+  to: string,
+  data: string,
+  chainId: number
+): Promise<string> {
+  const live = Number(await req({ method: "eth_chainId" }));
+  if (!Number.isFinite(live) || live !== chainId) throw new WrongChainError(chainId, live);
+  const hexChainId = "0x" + chainId.toString(16);
+  return (await req({
+    method: "eth_sendTransaction",
+    params: [{ from, to, data, chainId: hexChainId }],
+  })) as string;
 }
 
 export function sendApprove(
@@ -276,9 +312,10 @@ export function sendApprove(
   from: string,
   token: string,
   spender: string,
-  amount: bigint
+  amount: bigint,
+  chainId: number
 ): Promise<string> {
-  return sendTx(req, from, token, encodeApprove(spender, amount));
+  return sendTx(req, from, token, encodeApprove(spender, amount), chainId);
 }
 
 export function sendSwap(
@@ -289,9 +326,10 @@ export function sendSwap(
   tokenOut: string,
   amountIn: bigint,
   minAmountOut: bigint,
-  to: string
+  to: string,
+  chainId: number
 ): Promise<string> {
-  return sendTx(req, from, pool, encodeSwap(tokenIn, tokenOut, amountIn, minAmountOut, to));
+  return sendTx(req, from, pool, encodeSwap(tokenIn, tokenOut, amountIn, minAmountOut, to), chainId);
 }
 
 export function sendBridge(
@@ -302,9 +340,16 @@ export function sendBridge(
   amount: bigint,
   chainIdTo: number,
   receiverHex: string,
+  chainIdFrom: number,
   autoParamsHex = "0x"
 ): Promise<string> {
-  return sendTx(req, from, gate, encodeSend(token, amount, BigInt(chainIdTo), receiverHex, autoParamsHex));
+  return sendTx(
+    req,
+    from,
+    gate,
+    encodeSend(token, amount, BigInt(chainIdTo), receiverHex, autoParamsHex),
+    chainIdFrom
+  );
 }
 
 export function sendSwapAndBridge(
@@ -317,13 +362,15 @@ export function sendSwapAndBridge(
   chainIdTo: number,
   finalToken: string,
   finalReceiver: string,
-  finalMinOut: bigint
+  finalMinOut: bigint,
+  chainIdFrom: number
 ): Promise<string> {
   return sendTx(
     req,
     from,
     router,
-    encodeSwapAndBridge(tokenIn, amountIn, minStableOut, BigInt(chainIdTo), finalToken, finalReceiver, finalMinOut)
+    encodeSwapAndBridge(tokenIn, amountIn, minStableOut, BigInt(chainIdTo), finalToken, finalReceiver, finalMinOut),
+    chainIdFrom
   );
 }
 
@@ -337,13 +384,17 @@ export function sendFinalize(
   nonce: number,
   receiverHex: string,
   autoParamsHex: string,
-  nativeSenderHex: string
+  nativeSenderHex: string,
+  /** The chain `router` lives on — the DESTINATION of the transfer, which is not
+   *  `chainIdFrom` (that is a hashed field, the transfer's origin). */
+  executeOnChainId: number
 ): Promise<string> {
   return sendTx(
     req,
     from,
     router,
-    encodeFinalize(debridgeId, amount, BigInt(chainIdFrom), BigInt(nonce), receiverHex, autoParamsHex, nativeSenderHex)
+    encodeFinalize(debridgeId, amount, BigInt(chainIdFrom), BigInt(nonce), receiverHex, autoParamsHex, nativeSenderHex),
+    executeOnChainId
   );
 }
 
