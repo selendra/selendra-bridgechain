@@ -35,6 +35,20 @@ export default defineConfig({
       testMatch: /app\/.*\.spec\.ts/,
       use: { ...devices["Desktop Chrome"] },
     },
+    {
+      // Drives the REAL stack on real testnets — no mocks. Skips itself when
+      // the backend isn't reachable, so it is safe to leave in the default run.
+      // Not part of `test:unit`/`test:e2e`; run with `npm run test:live`.
+      //
+      // SERIAL on purpose. Every worker shares one hosted-RPC budget, and a
+      // parallel run makes the suite rate-limit itself — producing failures that
+      // look like product bugs but are pure self-contention.
+      name: "live",
+      testMatch: /live\/.*\.spec\.ts/,
+      fullyParallel: false,
+      workers: 1,
+      use: { ...devices["Desktop Chrome"] },
+    },
   ],
   // The dev server is enough: these tests exercise app behaviour, and the
   // production build is separately gated by `tsc -b && vite build` in CI.

@@ -69,6 +69,56 @@ for entry in "${CHAINS[@]}"; do
   CIDX[$cid]=${#CID[@]}
   CID+=("$cid"); CNAME+=("${cname:-chain $cid}"); CRPC+=("$crpc"); CGATE+=("$cgate")
 done
+
+# Per-chain finality buffer. A confirmation COUNT means a different wall-clock
+# delay on every chain — 6 blocks is 12s on a 2s chain and 1.5s on Arbitrum's
+# ~0.25s blocks — so a mesh of mixed-cadence chains cannot honestly share one
+# number. `CONFIRMATIONS[chain_id]` overrides `SOURCE_BLOCK_CONFIRMATION` for
+# that chain; unset chains keep the global value, so existing configs are
+# unaffected.
+declare -A CONFIRMATIONS 2>/dev/null || true
+conf_for() {
+  local cid="$1"
+  echo "${CONFIRMATIONS[$cid]:-$SOURCE_BLOCK_CONFIRMATION}"
+}
+
+# How far back scanners start. A fresh anvil begins at block 0, so 0 is right
+# locally — but on a live chain it means re-scanning the ENTIRE history before
+# reaching anything this deployment did. Sepolia is past 11.4M blocks; at any
+# sane range-per-poll that never finishes, and it burns the RPC quota trying.
+#
+#   START_BLOCKS[chain_id]  explicit height for one chain (e.g. its deploy block)
+#   START_BLOCK             "head" to begin at each chain's current tip, or a
+#                           literal height applied to every chain
+#
+# Default: 0 for local anvil, "head" for anything else — fail toward "sees new
+# events" rather than "silently busy for hours".
+declare -A START_BLOCKS 2>/dev/null || true
+: "${START_BLOCK:=$([[ "$LOCAL_ANVIL" == "true" ]] && echo 0 || echo head)}"
+start_block_for() {
+  local cid="$1" rpc="$2"
+  if [[ -n "${START_BLOCKS[$cid]:-}" ]]; then echo "${START_BLOCKS[$cid]}"; return; fi
+  if [[ "$START_BLOCK" == "head" ]]; then
+    cast block-number --rpc-url "$rpc" 2>/dev/null || echo 0
+  else
+    echo "$START_BLOCK"
+  fi
+}
+
+# Blocks per `eth_getLogs` call. Hosted RPCs cap this and REJECT anything wider
+# rather than truncating — Alchemy's free tier allows 10 — so an over-wide range
+# is a hard failure loop, not a slow scan. 1000 suits a local node.
+: "${MAX_BLOCK_RANGE:=1000}"
+
+# How often each scanner polls. 300ms suits an instant-mining anvil, and is
+# absurd on a real chain: with a 10-block window on 12s slots it re-requests the
+# same range ~40 times per new block, across every validator AND the indexer AND
+# every chain. On a shared hosted key that is what exhausts the per-second
+# compute budget and turns every scan into a 429.
+#
+# Rule of thumb: poll no faster than the chain produces the window you ask for.
+: "${POLL_INTERVAL_MS:=300}"
+: "${INDEXER_POLL_INTERVAL_MS:=$((POLL_INTERVAL_MS > 500 ? POLL_INTERVAL_MS : 500))}"
 N=${#CID[@]}
 (( N >= 2 )) || die "CHAINS needs at least 2 chains (got $N)"
 SWAP_CHAIN="${SWAP_CHAIN:-${CID[0]}}"
@@ -298,8 +348,20 @@ emit_sources() {  # $1 = keyword: "sources" (validator) / "targets"/"sources" (k
 if [[ "$PG_DOCKER" == "true" ]]; then
   say "starting Postgres ($PG_NAME on :$PG_PORT)"
   docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  # Named volume so bridge history OUTLIVES the container. `stop.sh` removes the
+  # container (it holds a port), and without a volume that erased everything:
+  # transfer records, refund state, signatures, indexer cursors. On a throwaway
+  # anvil that is harmless — the chain resets too. On a LIVE chain it is not: the
+  # chain remembers and the bridge forgets, and the signatures do not come back,
+  # because validators resume from file-based cursors and never re-sign blocks
+  # they already scanned. An in-flight refund is stranded by a restart.
+  #
+  # `bash scripts/stop.sh <config> --wipe` deletes the volume when a clean slate
+  # is actually what you want.
+  docker volume create "${PG_NAME}-data" >/dev/null 2>&1 || true
   docker run -d --name "$PG_NAME" \
     -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
+    -v "${PG_NAME}-data:/var/lib/postgresql/data" \
     -p "${PG_PORT}:5432" postgres:16-alpine >/dev/null || die "failed to start Postgres container"
   ok=false
   for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && { ok=true; break; }; sleep 0.5; done
@@ -309,7 +371,22 @@ fi
 
 # ---------------------------------------------------------------------------
 # 6. sig-store
+#
+# SCOPED AUTH (finding L-5). Without tokens the store starts UNAUTHENTICATED and
+# says so in its log: signatures, claim status and the allowlist all become
+# world-writable to anything that can reach the port. docker-compose has wired
+# these since the L-5 fix; this launcher did not, so the everyday path — and the
+# live testnet deployment — ran wide open.
+#
+# One random token per role per run, so a leak from one component cannot act as
+# another. Override any of them in the config to pin a value across restarts.
 # ---------------------------------------------------------------------------
+rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+export SIG_STORE_VALIDATOR_TOKEN="${SIG_STORE_VALIDATOR_TOKEN:-$(rand_token)}"
+export SIG_STORE_KEEPER_TOKEN="${SIG_STORE_KEEPER_TOKEN:-$(rand_token)}"
+export SIG_STORE_READER_TOKEN="${SIG_STORE_READER_TOKEN:-$(rand_token)}"
+export SIG_STORE_ADMIN_TOKEN="${SIG_STORE_ADMIN_TOKEN:-$(rand_token)}"
+
 say "starting sig-store ($STORE_URL)"
 SIG_STORE_BIND="$BIND_HOST:$STORE_PORT" DATABASE_URL="$DATABASE_URL" \
   spawn "$ROOT/target/debug/sig-store" sig-store.log
@@ -317,6 +394,13 @@ ok=false
 for _ in $(seq 1 60); do curl -s "$STORE_URL/health" | grep -q ok && { ok=true; break; }; sleep 0.25; done
 $ok || die "sig-store did not come up (see $RUN_DIR/sig-store.log)"
 info "sig-store healthy"
+info "auth: scoped tokens generated (admin token in $RUN_DIR/tokens.env)"
+umask 077; {
+  echo "SIG_STORE_VALIDATOR_TOKEN=$SIG_STORE_VALIDATOR_TOKEN"
+  echo "SIG_STORE_KEEPER_TOKEN=$SIG_STORE_KEEPER_TOKEN"
+  echo "SIG_STORE_READER_TOKEN=$SIG_STORE_READER_TOKEN"
+  echo "SIG_STORE_ADMIN_TOKEN=$SIG_STORE_ADMIN_TOKEN"
+} > "$RUN_DIR/tokens.env"
 
 # ---------------------------------------------------------------------------
 # 7. validators — watch ALL chains as sources; refund to ALL as destinations
@@ -332,11 +416,11 @@ for key in "${VALIDATOR_KEYS[@]}"; do
       echo "chain_id = ${CID[$i]}"
       echo "rpcs = [\"${CRPC[$i]}\"]"
       echo "gate = \"${CGATE[$i]}\""
-      echo "start_block = 0"
-      echo "block_confirmation = $SOURCE_BLOCK_CONFIRMATION"
+      echo "start_block = $(start_block_for "${CID[$i]}" "${CRPC[$i]}")"
+      echo "block_confirmation = $(conf_for "${CID[$i]}")"
       echo "allow_zero_confirmation = $SOURCE_ALLOW_ZERO_CONFIRMATION"
-      echo "poll_interval_ms = 300"
-      echo "max_block_range = 1000"
+      echo "poll_interval_ms = $POLL_INTERVAL_MS"
+      echo "max_block_range = $MAX_BLOCK_RANGE"
       echo "state_file = \"$RUN_DIR/validator-$vi-${CID[$i]}.json\""
       echo
     done
@@ -400,13 +484,13 @@ if [[ "$ENABLE_INDEXER" == "true" ]]; then
       echo "rpc = \"${CRPC[$i]}\""
       echo "gate = \"${CGATE[$i]}\""
       [[ "$ENABLE_SWAP" == "true" && $i == "$swap_idx" && -n "${SWAP_POOL:-}" ]] && echo "pool = \"$SWAP_POOL\""
-      echo "start_block = 0"
-      echo "block_confirmation = $SOURCE_BLOCK_CONFIRMATION"
+      echo "start_block = $(start_block_for "${CID[$i]}" "${CRPC[$i]}")"
+      echo "block_confirmation = $(conf_for "${CID[$i]}")"
       # M-7: the indexer fails closed on a 0 buffer, so carry the same
       # instant-finality opt-in the validator config already uses.
       echo "allow_zero_confirmation = $SOURCE_ALLOW_ZERO_CONFIRMATION"
-      echo "poll_interval_ms = 500"
-      echo "max_block_range = 1000"
+      echo "poll_interval_ms = $INDEXER_POLL_INTERVAL_MS"
+      echo "max_block_range = $MAX_BLOCK_RANGE"
     done
   } > "$icfg"
   spawn "$ROOT/target/debug/indexer $icfg" indexer.log
@@ -437,8 +521,18 @@ GQL_ARGS=(--bind "$GQL_BIND" --store-url "$STORE_URL" --threshold "$THRESHOLD"
           --chains-file "$REG_JSON" --allow-mutations)
 for i in "${!CID[@]}"; do GQL_ARGS+=(--gate "${CID[$i]}=${CRPC[$i]},${CGATE[$i]}"); done
 [[ "$ENABLE_INDEXER" == "true" ]] && GQL_ARGS+=(--db-url "$DATABASE_URL")
-[[ "$ENABLE_SWAP" == "true" && -n "${SWAP_POOL:-}" ]] && GQL_ARGS+=(--swap "$SWAP_CHAIN=${CRPC[$swap_idx]},$SWAP_POOL")
+# The pool's token list is discovered by replaying its TokenListed logs, so its
+# scan floor must be AT OR BEFORE the pool's deployment — always. That is a
+# different requirement from the scanners' floor, which is "this deployment's
+# history onward" and legitimately moves forward over time. Deriving one from the
+# other silently empties the token list the moment they diverge: the scan starts
+# after the listings, finds nothing, and the Swap view renders a pool with zero
+# tokens. Hence its own knob, defaulting to the chain's floor.
+: "${SWAP_FROM_BLOCK:=$(start_block_for "$SWAP_CHAIN" "${CRPC[$swap_idx]}")}"
+[[ "$ENABLE_SWAP" == "true" && -n "${SWAP_POOL:-}" ]] && \
+  GQL_ARGS+=(--swap "$SWAP_CHAIN=${CRPC[$swap_idx]},$SWAP_POOL,$SWAP_FROM_BLOCK")
 
+export GRAPHQL_MAX_BLOCK_RANGE="$MAX_BLOCK_RANGE"
 spawn "$ROOT/target/debug/graphql-api ${GQL_ARGS[*]}" graphql-api.log
 ok=false
 for _ in $(seq 1 60); do curl -s "http://$GQL_BIND/health" >/dev/null 2>&1 && { ok=true; break; }; sleep 0.25; done

@@ -134,3 +134,26 @@ CREATE TABLE IF NOT EXISTS indexer_cursors (
     last_block      BIGINT      NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Lifecycle events observed BEFORE the transfer's own row exists.
+--
+-- The indexer runs one loop per chain, concurrently, so the destination's
+-- `Claimed` can be read before the source's `Sent` has created the submissions
+-- row — routinely so during a backfill, where the two chains are scanned at
+-- unrelated speeds. `mark_claimed` is an UPDATE ... WHERE, which matches zero
+-- rows and returns success, so the claim was silently dropped: the transfer
+-- stayed `signed` forever and the refund sweep then flagged a DELIVERED
+-- transfer as refund-eligible.
+--
+-- Rows here are parked markers, applied by `apply_pending_lifecycle` as soon as
+-- the submission appears, then deleted. Not a queue — at most one row per
+-- submission, last write wins per column.
+CREATE TABLE IF NOT EXISTS pending_lifecycle (
+    submission_id   TEXT        PRIMARY KEY,
+    status          TEXT,
+    claim_tx        TEXT,
+    cancel_tx       TEXT,
+    refund_tx       TEXT,
+    refund_status   TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);

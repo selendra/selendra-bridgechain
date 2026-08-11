@@ -117,6 +117,11 @@ async fn main() -> anyhow::Result<()> {
     let chain_ids = chains.configured();
 
     let mut swaps = Swaps::new();
+    // Hosted RPCs cap eth_getLogs and reject anything wider (Alchemy free tier:
+    // 10 blocks), so the pool's token-list replay has to be chunked to fit.
+    if let Ok(r) = std::env::var("GRAPHQL_MAX_BLOCK_RANGE").unwrap_or_default().parse::<u64>() {
+        swaps.set_max_block_range(r);
+    }
     for spec in &args.swaps {
         swaps.add_spec(spec)?;
     }

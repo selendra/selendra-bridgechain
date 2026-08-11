@@ -14,6 +14,10 @@ STORE_PORT="${STORE_PORT:-8080}"
 GQL_PORT="${GQL_PORT:-8088}"
 WEB_PORT="${WEB_PORT:-5173}"
 PG_NAME="${PG_NAME:-bridge-run-pg}"
+
+# --wipe also deletes the Postgres data volume. Without it, history survives.
+WIPE=false
+for a in "$@"; do [[ "$a" == "--wipe" ]] && WIPE=true; done
 PG_DOCKER="${PG_DOCKER:-true}"
 
 echo "=== stopping bridge stack ==="
@@ -37,7 +41,18 @@ done
 
 # Remove the Postgres container.
 if [[ "$PG_DOCKER" == "true" ]] && command -v docker >/dev/null 2>&1; then
+  # Remove the CONTAINER (it holds the port) but keep its named volume, so
+  # transfer history, refund state and indexer cursors survive a restart. Pass
+  # --wipe to drop the data too.
   docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  if [[ "$WIPE" == "true" ]]; then
+    docker volume rm "${PG_NAME}-data" >/dev/null 2>&1 || true
+    echo "  wiped Postgres volume ${PG_NAME}-data"
+  fi
 fi
 
-echo "  stopped (ports ${ports[*]} freed; container $PG_NAME removed if present)"
+if [[ "$WIPE" == "true" ]]; then
+  echo "  stopped (ports ${ports[*]} freed; $PG_NAME and its data removed)"
+else
+  echo "  stopped (ports ${ports[*]} freed; $PG_NAME removed, data volume ${PG_NAME}-data KEPT)"
+fi

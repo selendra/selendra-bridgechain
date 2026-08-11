@@ -368,6 +368,9 @@ impl Db {
         }
 
         tx.commit().await?;
+        // Same ordering hazard as `observe_submission`: a validator's POST can
+        // create the row after the indexer already saw the destination event.
+        self.apply_pending_lifecycle(&id).await?;
         self.load(&id)
             .await?
             .ok_or(DbError::BadField("submission_id"))
@@ -499,7 +502,7 @@ impl Db {
             return Err(DbError::BadField("submission_id"));
         }
         let id = norm_id(submission_id);
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now(), \
                     refund_status = CASE WHEN refund_status = 'eligible' THEN 'none' \
                                          ELSE refund_status END \
@@ -509,6 +512,76 @@ impl Db {
         .bind(claim_tx)
         .execute(&self.pool)
         .await?;
+        // The indexer scans each chain in its own loop, so a destination
+        // `Claimed` can arrive before the source `Sent` has created the row —
+        // routinely during backfill. An UPDATE ... WHERE matches nothing and
+        // reports success, which silently loses the claim: the transfer stays
+        // `signed` and the refund sweep later flags a DELIVERED transfer as
+        // eligible. Park it instead; `observe_submission` applies it on arrival.
+        self.park_if_missing(&id, res.rows_affected(), "claimed", Some(claim_tx), None, None, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Stash a lifecycle marker whose submission row does not exist yet.
+    ///
+    /// Keyed on the row being ABSENT, not on `rows_affected == 0`. Those are not
+    /// the same thing: `mark_cancelled` carries `AND refund_status <> 'refunded'`,
+    /// so a row that is already refunded matches nothing — and parking a
+    /// `cancelled` marker there would later REGRESS a refunded transfer back to
+    /// cancelled, putting a settled transfer back on the refund-candidate list.
+    /// A guard that legitimately rejected the update must not be mistaken for a
+    /// missing row.
+    #[allow(clippy::too_many_arguments)]
+    async fn park_if_missing(
+        &self,
+        id: &str,
+        rows_affected: u64,
+        status: &str,
+        claim_tx: Option<&str>,
+        cancel_tx: Option<&str>,
+        refund_tx: Option<&str>,
+        refund_status: Option<&str>,
+    ) -> Result<(), DbError> {
+        if rows_affected > 0 {
+            return Ok(());
+        }
+        let exists: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM submissions WHERE submission_id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if exists.is_some() {
+            // The row is there; the UPDATE's own guard declined it. Nothing to
+            // replay later.
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO pending_lifecycle                (submission_id, status, claim_tx, cancel_tx, refund_tx, refund_status)              VALUES ($1,$2,$3,$4,$5,$6)              ON CONFLICT (submission_id) DO UPDATE SET                status        = COALESCE(EXCLUDED.status,        pending_lifecycle.status),                claim_tx      = COALESCE(EXCLUDED.claim_tx,      pending_lifecycle.claim_tx),                cancel_tx     = COALESCE(EXCLUDED.cancel_tx,     pending_lifecycle.cancel_tx),                refund_tx     = COALESCE(EXCLUDED.refund_tx,     pending_lifecycle.refund_tx),                refund_status = COALESCE(EXCLUDED.refund_status, pending_lifecycle.refund_status)",
+        )
+        .bind(id)
+        .bind(if status.is_empty() { None } else { Some(status) })
+        .bind(claim_tx)
+        .bind(cancel_tx)
+        .bind(refund_tx)
+        .bind(refund_status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Apply (and clear) any lifecycle marker parked before this row existed.
+    async fn apply_pending_lifecycle(&self, id: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE submissions s SET                status        = COALESCE(p.status,        s.status),                claim_tx      = COALESCE(p.claim_tx,      s.claim_tx),                cancel_tx     = COALESCE(p.cancel_tx,     s.cancel_tx),                refund_tx     = COALESCE(p.refund_tx,     s.refund_tx),                refund_status = COALESCE(p.refund_status, s.refund_status),                updated_at    = now()              FROM pending_lifecycle p              WHERE s.submission_id = $1 AND p.submission_id = s.submission_id",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM pending_lifecycle WHERE submission_id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -520,7 +593,7 @@ impl Db {
             return Err(DbError::BadField("submission_id"));
         }
         let id = norm_id(submission_id);
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE submissions SET refund_status = 'cancelled', cancel_tx = $2, updated_at = now() \
              WHERE submission_id = $1 AND refund_status <> 'refunded'",
         )
@@ -528,6 +601,8 @@ impl Db {
         .bind(cancel_tx)
         .execute(&self.pool)
         .await?;
+        self.park_if_missing(&id, res.rows_affected(), "", None, Some(cancel_tx), None, Some("cancelled"))
+            .await?;
         Ok(())
     }
 
@@ -537,7 +612,7 @@ impl Db {
             return Err(DbError::BadField("submission_id"));
         }
         let id = norm_id(submission_id);
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE submissions SET refund_status = 'refunded', refund_tx = $2, updated_at = now() \
              WHERE submission_id = $1",
         )
@@ -545,6 +620,8 @@ impl Db {
         .bind(refund_tx)
         .execute(&self.pool)
         .await?;
+        self.park_if_missing(&id, res.rows_affected(), "", None, None, Some(refund_tx), Some("refunded"))
+            .await?;
         Ok(())
     }
 
@@ -651,6 +728,9 @@ impl Db {
         .bind(token)
         .execute(&self.pool)
         .await?;
+        // A `Claimed`/`Cancelled`/`Refunded` may have been observed on the other
+        // chain before this row existed; fold it in now.
+        self.apply_pending_lifecycle(&id).await?;
         Ok(())
     }
 

@@ -57,9 +57,15 @@ sig-*
 /validator-state.json
 *.json.tmp
 *.log
-# scripts/run.sh — frontend env override (if written) and local config copies
+# scripts/run.sh — frontend env override (if written) and local config copies.
+# `*.config.local` covers the testnet configs too: those carry real private keys
+# for real (if valueless) chains, and must never be committed.
 frontend/.env.local
 scripts/run.config.local
+scripts/*.config.local
+
+# Solana keypair files for the devnet leg — real ed25519 private keys.
+.solana/
 
 # editors, tooling, OS
 .vs/
