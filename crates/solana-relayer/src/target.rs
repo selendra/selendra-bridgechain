@@ -68,6 +68,30 @@ mod wire {
         args.serialize(&mut out).expect("borsh serialize ClaimArgs");
         out
     }
+
+    /// Same field order as `ClaimArgs` but a different variant: `chain_id_from`
+    /// rather than a destination, because a cancel is executed ON the destination
+    /// for a transfer that came FROM somewhere else.
+    #[derive(BorshSerialize)]
+    pub struct CancelArgs {
+        pub debridge_id: [u8; 32],
+        pub amount: u64,
+        pub chain_id_from: u64,
+        pub nonce: u64,
+        pub receiver: Vec<u8>,
+        pub auto: Option<AutoParamsWire>,
+        pub native_sender: Vec<u8>,
+        pub signatures: Vec<Vec<u8>>,
+    }
+
+    /// `GateInstruction::Cancel` — discriminant 10. Pinned by
+    /// `cancel_encoding_matches_the_shared_enum`, because a wrong constant here
+    /// produces a well-formed transaction that runs the WRONG handler.
+    pub fn cancel_instruction_data(args: &CancelArgs) -> Vec<u8> {
+        let mut out = vec![10u8];
+        args.serialize(&mut out).expect("borsh serialize CancelArgs");
+        out
+    }
 }
 
 fn hex_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
@@ -150,7 +174,19 @@ fn ordered_signatures(
     raw: &[Vec<u8>],
     cfg: &GateConfig,
 ) -> Vec<Vec<u8>> {
-    let digest = bridge_solana::verify::eth_signed_digest(submission_id);
+    ordered_signatures_over(submission_id, raw, cfg)
+}
+
+/// As [`ordered_signatures`], but over an arbitrary pre-EIP-191 digest so the
+/// cancel and refund domains can reuse the same validator filtering. Passing the
+/// wrong domain here would silently drop every signature (none would recover to
+/// a validator), which is why the callers name the domain explicitly.
+fn ordered_signatures_over(
+    digest_input: &[u8; 32],
+    raw: &[Vec<u8>],
+    cfg: &GateConfig,
+) -> Vec<Vec<u8>> {
+    let digest = bridge_solana::verify::eth_signed_digest(digest_input);
     let mut with_addr: Vec<([u8; 20], Vec<u8>)> = raw
         .iter()
         .filter_map(|s| recovered_address(&digest, s).map(|a| (a, s.clone())))
@@ -196,6 +232,36 @@ impl Submitter {
 
     pub async fn run(self) -> anyhow::Result<()> {
         info!(payer = %self.payer.pubkey(), program = %self.program_id, "solana claim submitter started");
+        // Surface the quorum requirement once, up front. This process cannot know
+        // how many peers exist, but it CAN state what the gate demands — which is
+        // the fact an operator running a single relayer against a 2-of-N gate is
+        // missing.
+        let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
+        // Retry: a diagnostic that gives up on the first transient RPC blip is
+        // worse than none, because it reports "could not read" as though the gate
+        // were misconfigured.
+        let mut cfg_read = None;
+        for _ in 0..5 {
+            if let Some(c) =
+                self.rpc.get_account(&config).await.ok().and_then(|a| decode_gate_config(&a.data).ok())
+            {
+                cfg_read = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        match cfg_read {
+            Some(cfg) if cfg.threshold > 1 => info!(
+                threshold = cfg.threshold,
+                validators = cfg.validators.len(),
+                "gate requires {} signatures; THIS process contributes 1 — {} relayers must run, \
+                 each with a distinct validator key, or Solana-origin transfers never reach quorum",
+                cfg.threshold,
+                cfg.threshold
+            ),
+            Some(cfg) => info!(threshold = cfg.threshold, "gate threshold is 1"),
+            None => warn!("could not read the gate config to report its threshold"),
+        }
         loop {
             if let Err(e) = self.tick().await {
                 warn!(error = %e, "claim tick failed; retrying");
@@ -209,11 +275,100 @@ impl Submitter {
             if rec.chain_id_to != self.chain_id {
                 continue;
             }
+            // Cancel FIRST, deliberately: a burn is the opposite of a payout, so
+            // it must not queue behind the checks that protect payouts. If a
+            // cancel quorum exists the transfer is being unwound, and claiming it
+            // would be the wrong outcome.
+            match self.try_cancel_checked(&rec).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => warn!(submission_id = %rec.submission_id, error = %e, "cancel failed"),
+            }
             if let Err(e) = self.try_claim(&rec).await {
                 warn!(submission_id = %rec.submission_id, error = %e, "claim failed");
             }
         }
         Ok(())
+    }
+
+    /// Resolve the id + gate config, then attempt a burn. Returns true when one
+    /// was submitted (or the transfer is already spent), so the caller skips the
+    /// claim path.
+    async fn try_cancel_checked(&self, rec: &SubmissionRecord) -> anyhow::Result<bool> {
+        if rec.cancel_signatures.is_empty() {
+            return Ok(false);
+        }
+        let id = hex32(&rec.submission_id)?;
+        let (executed, _) = Pubkey::find_program_address(&[b"executed", &id], &self.program_id);
+        if let Some(acct) =
+            self.rpc.get_account_with_commitment(&executed, self.rpc.commitment()).await?.value
+        {
+            if acct.owner == self.program_id && !acct.data.is_empty() {
+                return Ok(true); // already claimed or already burned
+            }
+        }
+        let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
+        let cfg = decode_gate_config(&self.rpc.get_account(&config).await?.data)?;
+        self.try_cancel(rec, &id, &cfg).await
+    }
+
+    /// Burn a stuck transfer on this (destination) gate once validators have
+    /// attested it. Releases nothing — it only makes the transfer permanently
+    /// unclaimable, which is the precondition for the SOURCE chain to repay.
+    ///
+    /// Checked BEFORE `try_claim`, mirroring the EVM keeper: a cancel is the
+    /// opposite of a payout, so it must not sit behind the gates that exist to
+    /// protect payouts.
+    async fn try_cancel(
+        &self,
+        rec: &SubmissionRecord,
+        id: &[u8; 32],
+        gate_cfg: &GateConfig,
+    ) -> anyhow::Result<bool> {
+        let raw: Vec<Vec<u8>> =
+            rec.cancel_signatures.iter().filter_map(|s| hex_bytes(&s.signature).ok()).collect();
+        if raw.is_empty() {
+            return Ok(false);
+        }
+        let digest = crate::refund::domain_id(2, id); // CANCEL domain
+        let signatures = ordered_signatures_over(&digest, &raw, gate_cfg);
+        if (signatures.len() as u32) < gate_cfg.threshold {
+            return Ok(false);
+        }
+
+        let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
+        let (executed, _) = Pubkey::find_program_address(&[b"executed", id], &self.program_id);
+        let args = wire::CancelArgs {
+            debridge_id: hex32(&rec.debridge_id)?,
+            amount: rec.amount.parse().map_err(|_| anyhow::anyhow!("amount exceeds u64"))?,
+            chain_id_from: rec.chain_id_from,
+            nonce: rec.nonce,
+            receiver: hex_bytes(&rec.receiver)?,
+            auto: None,
+            native_sender: hex_bytes(&rec.native_sender)?,
+            signatures,
+        };
+        let instruction = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(config, false),
+                AccountMeta::new(executed, false),
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ],
+            data: wire::cancel_instruction_data(&args),
+        };
+        let units = compute_budget_for(gate_cfg.validators.len());
+        let blockhash = self.rpc.get_latest_blockhash().await?;
+        let tx = Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(units), instruction],
+            Some(&self.payer.pubkey()),
+            &[&self.payer],
+            blockhash,
+        );
+        let sig = self.rpc.send_and_confirm_transaction(&tx).await?;
+        info!(submission_id = %rec.submission_id, tx = %sig, "CANCELLED on Solana (burned)");
+        Ok(true)
     }
 
     async fn try_claim(&self, rec: &SubmissionRecord) -> anyhow::Result<()> {
@@ -255,7 +410,20 @@ impl Submitter {
         let signatures = ordered_signatures(&id, &raw_sigs, &gate_cfg);
         // Below quorum there is nothing to submit: the gate would reject it, and
         // sending anyway burns fees on a guaranteed revert every poll.
+        //
+        // Say so, though. Solana `Sent` events are signed ONLY by relayers — the
+        // EVM validators never scan Solana — so a deployment running fewer
+        // relayers than the threshold can never reach quorum, and the failure is
+        // otherwise completely silent: the transfer just sits there. Naming the
+        // shortfall is the difference between a five-minute fix and an afternoon.
         if (signatures.len() as u32) < gate_cfg.threshold {
+            warn!(
+                submission_id = %rec.submission_id,
+                have = signatures.len(),
+                need = gate_cfg.threshold,
+                validators = gate_cfg.validators.len(),
+                "below quorum — are enough relayers running, each with a DISTINCT validator key?"
+            );
             return Ok(());
         }
         if raw_sigs.len() > signatures.len() {
@@ -493,17 +661,63 @@ mod tests {
         assert!(decode_gate_config(&lying).is_err(), "declared length must be honoured");
     }
 
-    /// A budget that does not scale with the validator set is the failure the
-    /// remediation plan flagged as "unmeasured": 5-of-7 spends ~175k CU on
-    /// recovery alone, against a 200k default.
+    /// The remediation plan listed the compute cost as "unmeasured, flagged for
+    /// checking, not a finding". It has now been MEASURED against the deployed
+    /// program on devnet:
+    ///
+    ///   2-of-2 claim -> 91,303 and 91,316 CU (two independent transactions)
+    ///
+    /// `secp256k1_recover` is ~25k CU each, so that decomposes as ~42k fixed
+    /// (config + asset load, SPL account checks, keccak, marker creation, the
+    /// token CPI) plus ~25k per signature:
+    ///
+    ///   total(n) ~= 42_000 + 25_000 * n
+    ///
+    /// (41k was the first guess and this test rejected it — 41 + 2x25 = 91,000,
+    /// which is below the 91,316 actually charged. Pinning the measurement is
+    /// what caught it.)
+    ///
+    /// which makes the plan's worry real rather than hypothetical: a 7-validator
+    /// gate needs ~216k and the DEFAULT budget is 200k. Without an explicit
+    /// request, a realistic validator set silently exceeds it — and every claim,
+    /// cancel and refund for that submission fails until someone works out why.
+    ///
+    /// This test pins `compute_budget_for` against that model so the constants
+    /// cannot drift below what the chain actually charges.
     #[test]
-    fn the_compute_budget_scales_with_the_validator_set() {
+    fn the_compute_budget_covers_measured_cost() {
+        /// Measured on devnet, program 7doepJ3tM2tU7vBEj17UKV77uC3P4RJ89ewNyuk7cLtv.
+        const MEASURED_2_OF_2: u32 = 91_316;
+        /// Derived from the measurement above; secp256k1_recover is ~25k.
+        const FIXED: u32 = 42_000;
+        const PER_SIG: u32 = 25_000;
+        let model = |n: u32| FIXED + PER_SIG * n;
+
+        // The model must not undershoot what we actually observed.
         assert!(
-            compute_budget_for(7) > 200_000,
-            "a 7-validator gate needs more than the default budget"
+            model(2) >= MEASURED_2_OF_2,
+            "model {} is below the measured {MEASURED_2_OF_2}",
+            model(2)
         );
-        assert!(compute_budget_for(7) > compute_budget_for(3), "must scale with the set");
-        assert!(compute_budget_for(1000) <= 1_400_000, "must stay under Solana's per-tx maximum");
+
+        // The request must cover the model at every realistic set size, including
+        // the config's ~22-validator ceiling (finding L-3).
+        for n in [1u32, 2, 3, 5, 7, 12, 22] {
+            assert!(
+                compute_budget_for(n as usize) >= model(n),
+                "n={n}: requesting {} but the claim needs ~{}",
+                compute_budget_for(n as usize),
+                model(n)
+            );
+        }
+
+        // The specific case the plan called out: 7 validators exceeds the 200k
+        // default, so an explicit request is mandatory, not an optimisation.
+        assert!(model(7) > 200_000, "the default budget should be insufficient at n=7");
+        assert!(compute_budget_for(7) > 200_000);
+
+        // And never ask for more than Solana will grant.
+        assert!(compute_budget_for(1000) <= 1_400_000, "must stay under the per-tx maximum");
     }
 
     #[test]
@@ -522,6 +736,43 @@ mod wire_compat_tests {
     /// a DIFFERENT instruction — the transaction would still be well-formed and
     /// the program would execute the wrong handler. Pin it against the shared
     /// definition, which the on-chain program mirrors byte-for-byte.
+    /// The hand-rolled `cancel` encoder prepends discriminant 10. If anyone
+    /// reorders `GateInstruction`, that constant silently starts targeting a
+    /// DIFFERENT instruction — the transaction stays well-formed and the program
+    /// runs the wrong handler. For a burn that is the difference between
+    /// unwinding a transfer and, say, changing the guardian.
+    #[test]
+    fn cancel_encoding_matches_the_shared_enum() {
+        use bridge_solana::instruction::CancelArgs as SharedCancelArgs;
+        let debridge_id = [9u8; 32];
+        let receiver = vec![0xABu8; 32];
+        let native_sender = vec![0x11u8; 20];
+        let signatures = vec![vec![7u8; 65]];
+
+        let ours = wire::cancel_instruction_data(&wire::CancelArgs {
+            debridge_id,
+            amount: 1234,
+            chain_id_from: 1337,
+            nonce: 7,
+            receiver: receiver.clone(),
+            auto: None,
+            native_sender: native_sender.clone(),
+            signatures: signatures.clone(),
+        });
+        let theirs = GateInstruction::Cancel(SharedCancelArgs {
+            debridge_id,
+            amount: 1234,
+            chain_id_from: 1337,
+            nonce: 7,
+            receiver,
+            auto: None,
+            native_sender,
+            signatures,
+        })
+        .to_bytes();
+        assert_eq!(ours, theirs, "cancel instruction encoding diverged from the shared enum");
+    }
+
     #[test]
     fn our_claim_encoding_matches_the_shared_instruction_enum() {
         let debridge_id = [9u8; 32];

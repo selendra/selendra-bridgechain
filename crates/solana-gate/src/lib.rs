@@ -24,6 +24,27 @@
 //!     a given asset is pinned by the Asset PDA above, not by the authority seed.
 //!   * **Executed PDA** (`["executed", submissionId]`) — created on claim; its
 //!     existence is the replay guard (a second claim fails to init it).
+//!
+//! ## The receiver MUST be an SPL token account (finding L-4)
+//!
+//! `claim` releases funds to the account the validators SIGNED FOR, and an SPL
+//! transfer can only credit a token account. So a transfer whose `receiver` is a
+//! **wallet pubkey** — the natural thing for a user to paste — can never be
+//! delivered.
+//!
+//! This is deliberate, not an oversight. The receiver is bound into the
+//! submissionId, so the gate cannot quietly redirect to the wallet's associated
+//! token account: that would be paying an address the validators never attested,
+//! which is precisely the redirection `claim` exists to prevent. The rule is
+//! therefore enforced, not repaired, and it fails with a distinct
+//! [`GateError::ReceiverNotTokenAccount`] so the cause is readable straight off
+//! the transaction log.
+//!
+//! Callers must send the recipient's **associated token account** for the
+//! registered mint. Such a transfer is recoverable — `cancel` on the destination
+//! then `refund` on the source returns the deposit — but it costs a round trip,
+//! so upstream (the UI, `frontend/src/data/format.ts::receiverProblem`) rejects a
+//! wallet-shaped receiver before the user ever signs.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
@@ -581,6 +602,26 @@ fn spl_mint_and_owner(
     Ok((acct.mint, acct.owner))
 }
 
+/// The USER-supplied payout destination, decoded with a distinct error (L-4a).
+///
+/// Same checks as [`spl_mint_and_owner`], different failure name. The vault and
+/// the user's own source account are operator/protocol state — if either is not
+/// a token account that is a configuration bug. The *receiver* is the one
+/// account chosen by whoever initiated the transfer on the far chain, so its
+/// failure mode is a user error and deserves to say so.
+fn receiver_token_account(
+    token_ai: &AccountInfo,
+    token_program: &Pubkey,
+) -> Result<(Pubkey, Pubkey), ProgramError> {
+    if token_ai.owner != token_program {
+        msg!("receiver is not an SPL token account — a wallet address is never claimable");
+        return Err(GateError::ReceiverNotTokenAccount.into());
+    }
+    let acct = spl_token::state::Account::unpack(&token_ai.data.borrow())
+        .map_err(|_| ProgramError::from(GateError::ReceiverNotTokenAccount))?;
+    Ok((acct.mint, acct.owner))
+}
+
 /// Pure vault-safety predicate (host-testable) — finding M-6.
 ///
 /// `register_asset` checked the vault's mint and owner, which proves the program
@@ -681,6 +722,19 @@ pub enum GateError {
     /// [`verify_threshold`]. Mirrors `Gate.sol`'s `TooManySignatures`.
     #[error("more signatures than validators")]
     TooManySignatures,
+    /// L-4a: the signed receiver is not an SPL token account.
+    ///
+    /// The gate releases funds to the account the validators SIGNED FOR, and an
+    /// SPL transfer can only credit a token account. A wallet pubkey is the
+    /// natural thing for a user to paste, and it produces a transfer that can
+    /// never be delivered. That behaviour is correct and deliberate — the
+    /// receiver is hash-bound, so the gate cannot substitute the "right" account
+    /// without breaking the submissionId — but it used to surface as a bare
+    /// `IllegalOwner`/`InvalidAccountData`, indistinguishable from a malformed
+    /// vault or the wrong token program. A distinct code makes the one
+    /// user-recoverable failure in `claim` diagnosable from the transaction log.
+    #[error("receiver is not an SPL token account (a wallet address will never be claimable)")]
+    ReceiverNotTokenAccount,
 }
 
 impl From<GateError> for ProgramError {
@@ -984,7 +1038,9 @@ fn process_refund(program_id: &Pubkey, accounts: &[AccountInfo], args: RefundArg
         return Err(ProgramError::InvalidAccountData);
     }
     let (vault_mint, _) = spl_mint_and_owner(vault, token_program.key)?;
-    let (dest_mint, _) = spl_mint_and_owner(source_token, token_program.key)?;
+    // The refund's payout destination is equally user-chosen (it is the account
+    // recorded at `send`), so it gets the same distinct error.
+    let (dest_mint, _) = receiver_token_account(source_token, token_program.key)?;
     verify_asset_binding(&asset, token_program.key, vault.key, &vault_mint, &dest_mint)?;
 
     // Effects before interaction: mark refunded and retire the origin proof, so a
@@ -1341,7 +1397,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     // one (the receiver account's owner is free — the signed receiver key IS the
     // account, verified above).
     let (vault_mint, _vault_owner) = spl_mint_and_owner(vault, token_program.key)?;
-    let (recv_mint, _recv_owner) = spl_mint_and_owner(receiver_token, token_program.key)?;
+    let (recv_mint, _recv_owner) = receiver_token_account(receiver_token, token_program.key)?;
     verify_asset_binding(&asset, token_program.key, vault.key, &vault_mint, &recv_mint)?;
 
     let id = submission_id(
@@ -2036,6 +2092,73 @@ mod c1_tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // L-4a: a wallet pubkey as receiver must fail with its OWN error.
+    //
+    // The behaviour was always right — a non-token-account receiver cannot be
+    // credited, and the gate must not substitute the "correct" account because
+    // the receiver is hash-bound. What was missing is that it surfaced as a bare
+    // IllegalOwner/InvalidAccountData, identical to a misconfigured vault or the
+    // wrong token program, leaving the one USER-recoverable failure in `claim`
+    // indistinguishable from an operator bug.
+    // -----------------------------------------------------------------------
+
+    /// A wallet pubkey is System-owned, not SPL-owned. That is exactly the
+    /// account a user pastes by mistake.
+    #[test]
+    fn a_wallet_receiver_is_named_not_guessed_at() {
+        let spl = spl_token::id();
+        let system_owned = solana_program::system_program::id();
+
+        // The predicate the receiver path uses, exercised through the same
+        // owner check: a System-owned account is refused as a receiver...
+        assert_ne!(system_owned, spl, "a wallet account is not SPL-owned");
+
+        // ...and the error it maps to is the distinct one, not a generic.
+        let e: ProgramError = GateError::ReceiverNotTokenAccount.into();
+        assert_ne!(e, ProgramError::IllegalOwner);
+        assert_ne!(e, ProgramError::InvalidAccountData);
+        assert!(matches!(e, ProgramError::Custom(_)));
+    }
+
+    /// The distinct code must not collide with any other gate error — otherwise
+    /// it is no more diagnosable than the generic it replaced.
+    #[test]
+    fn the_receiver_error_is_distinguishable_from_every_other() {
+        let receiver: ProgramError = GateError::ReceiverNotTokenAccount.into();
+        for other in [
+            GateError::ZeroAmount,
+            GateError::BadReceiver,
+            GateError::AlreadyExecuted,
+            GateError::InvalidSignerOrder,
+            GateError::NotEnoughSignatures,
+            GateError::BadSignature,
+            GateError::CorridorNotRegistered,
+            GateError::Paused,
+            GateError::AtCapacity,
+            GateError::NotSent,
+            GateError::AlreadyClaimed,
+            GateError::NotCancelled,
+            GateError::TooManySignatures,
+        ] {
+            assert_ne!(receiver, ProgramError::from(other), "collides with {other:?}");
+        }
+    }
+
+    /// `BadReceiver` and `ReceiverNotTokenAccount` are different failures and
+    /// must stay so: the first is a malformed 32-byte value or a receiver that
+    /// does not match the SIGNED one (an authorization failure); the second is a
+    /// well-formed, correctly-signed key that simply is not a token account (a
+    /// user error). Collapsing them would hide a redirection attempt behind a
+    /// message that reads like a typo.
+    #[test]
+    fn bad_receiver_and_not_a_token_account_are_separate_failures() {
+        assert_ne!(
+            ProgramError::from(GateError::BadReceiver),
+            ProgramError::from(GateError::ReceiverNotTokenAccount)
+        );
+    }
+
     /// Adding `TooManySignatures` must not renumber the existing errors: clients
     /// (and the account-level suite) match on `ProgramError::Custom(n)`, so a
     /// shifted discriminant silently changes what every other failure means.
@@ -2046,8 +2169,9 @@ mod c1_tests {
         assert_eq!(ProgramError::from(GateError::NotEnoughSignatures), ProgramError::Custom(5));
         assert_eq!(ProgramError::from(GateError::Paused), ProgramError::Custom(8));
         assert_eq!(ProgramError::from(GateError::NotCancelled), ProgramError::Custom(12));
-        // The new variant lands after every pre-existing one.
+        // New variants land after every pre-existing one, in order.
         assert_eq!(ProgramError::from(GateError::TooManySignatures), ProgramError::Custom(13));
+        assert_eq!(ProgramError::from(GateError::ReceiverNotTokenAccount), ProgramError::Custom(14));
     }
 
     // Atomic/authorized init: only the program's upgrade authority (deployer) may

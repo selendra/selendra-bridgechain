@@ -77,6 +77,43 @@ impl Store {
 }
 
 impl Store {
+    /// Submissions the store has flagged as stuck. Candidates only — the caller
+    /// MUST still verify both ends on-chain before signing anything, which is
+    /// exactly what `refund::Attester` does.
+    pub async fn refund_candidates(&self) -> anyhow::Result<Vec<SubmissionRecord>> {
+        let res = self.client.get(format!("{}/refund-candidates", self.base)).send().await?;
+        if !res.status().is_success() {
+            anyhow::bail!("sig-store refund-candidates failed ({})", res.status());
+        }
+        Ok(res.json().await?)
+    }
+
+    /// Deposit one cancel/refund attestation. The server re-derives the digest
+    /// for `kind` specifically, so a transfer signature posted as a cancel
+    /// recovers to the wrong address and is refused — the three quorums stay
+    /// independent.
+    pub async fn post_attestation(
+        &self,
+        submission_id: &str,
+        kind: &str,
+        signer: &str,
+        signature: &str,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::json!({ "kind": kind, "signer": signer, "signature": signature });
+        let res = self
+            .client
+            .post(format!("{}/submissions/{submission_id}/attestations", self.base))
+            .json(&body)
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            anyhow::bail!("sig-store rejected the {kind} attestation ({status}): {text}");
+        }
+        Ok(())
+    }
+
     /// Every record the store holds. The keeper half filters these down to the
     /// ones bound for Solana.
     pub async fn list(&self) -> anyhow::Result<Vec<SubmissionRecord>> {

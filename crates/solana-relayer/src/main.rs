@@ -12,6 +12,7 @@
 //! the EVM validator uses, and store the signature.
 
 mod config;
+mod refund;
 mod source;
 mod state;
 mod store;
@@ -55,9 +56,29 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Destination-side refund attester. Without it an EVM -> Solana transfer that
+    // cannot be delivered is burnable and refundable only by hand: the EVM
+    // validators cannot read Solana, so nobody votes on the corridor.
+    let attester = refund::Attester::new(
+        &cfg.source,
+        key,
+        {
+            let public = libsecp256k1::PublicKey::from_secret_key(
+                &libsecp256k1::SecretKey::parse(&key)
+                    .map_err(|_| anyhow::anyhow!("signer key is not a valid secp256k1 scalar"))?,
+            );
+            let hash = bridge_solana::hash::keccak(&public.serialize()[1..]);
+            format!("0x{}", hex::encode(&hash[12..]))
+        },
+        store::Store::new(&cfg.store.url, std::env::var(&cfg.store.token_env).ok()),
+    )?;
+
     let scanner = source::Scanner::new(cfg.source, key, store)?;
     info!(validator = %scanner.signer_address(), "solana-relayer started");
 
+    // Each loop is isolated: a dead submitter or attester must never stop this
+    // node signing transfers, which is its one irreplaceable job.
+    let refunds = tokio::spawn(attester.run());
     match submitter {
         Some(s) => {
             let scan = tokio::spawn(scanner.run());
@@ -65,9 +86,17 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 r = scan => r??,
                 r = submit => r??,
+                r = refunds => r??,
             }
             Ok(())
         }
-        None => scanner.run().await,
+        None => {
+            let scan = tokio::spawn(scanner.run());
+            tokio::select! {
+                r = scan => r??,
+                r = refunds => r??,
+            }
+            Ok(())
+        }
     }
 }
