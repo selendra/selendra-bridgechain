@@ -165,11 +165,181 @@ pub fn parse_sent_event_line(line: &str) -> Option<anyhow::Result<SentEvent>> {
 /// Parse a Solana program-log line back into a `Sent`. Returns `None` for any
 /// line that isn't our tagged event (the validator skips those); `Some(Err(..))`
 /// if it is ours but won't decode.
+///
+/// **This says nothing about WHO emitted the line.** A transaction's log stream
+/// is the concatenation of every program that ran in it, so a caller that feeds
+/// arbitrary lines here is trusting any program in the transaction. Use
+/// [`gate_program_data_lines`] to select the lines the gate itself emitted
+/// before parsing — see the security note there.
 pub fn parse_sent_log_line(line: &str) -> Option<anyhow::Result<Sent>> {
     match parse_sent_event_line(line)? {
         Ok(ev) => Some(ev.to_sent()),
         Err(e) => Some(Err(e)),
     }
+}
+
+/// Select the `Program data:` lines that `program_id` itself emitted.
+///
+/// ## Why this exists (the log-forgery vector)
+///
+/// `getSignaturesForAddress(gate)` returns every transaction that *mentions* the
+/// gate in its `accountKeys` — merely listing it as a read-only account is
+/// enough, and so is a one-unit real `send`. The `log_messages` of such a
+/// transaction contain the output of EVERY program that ran, not just ours.
+///
+/// A scanner that parses all of them will accept a `BRIDGE_SENT` payload emitted
+/// by an ATTACKER'S program. Neither of the checks downstream catches that: the
+/// id recomputation only proves the attacker hashed their own chosen fields
+/// correctly, and `chain_id_from` is a field in the forged payload. The validator
+/// then signs a transfer that never happened, and a threshold of those signatures
+/// releases real liquidity on the destination gate.
+///
+/// So attribution is not a nicety — it is the difference between "the gate said
+/// this" and "somebody said this in a transaction the gate was mentioned in".
+///
+/// ## How
+///
+/// The runtime brackets each program's output with `Program <id> invoke [depth]`
+/// and a terminating `Program <id> success` / `Program <id> failed: …`, nesting
+/// on CPI. Tracking that stack tells us which program was executing when a given
+/// `Program data:` line was printed; we keep only the lines emitted while
+/// `program_id` is innermost.
+///
+/// Note this is *necessary but not sufficient*: logs can be truncated, and a
+/// hostile RPC can return whatever it likes. The scanner additionally verifies
+/// the event against the gate's own `["sent", submissionId]` PDA, which is the
+/// authoritative check. This one keeps obviously-foreign events out cheaply.
+pub fn gate_program_data_lines<'a>(logs: &'a [String], program_id: &str) -> Vec<&'a str> {
+    let mut stack: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+
+    for line in logs {
+        let line = line.trim();
+        if let Some(who) = parse_invoke(line) {
+            stack.push(who);
+            continue;
+        }
+        if parse_terminator(line).is_some() {
+            stack.pop();
+            continue;
+        }
+        // Attribute program data to whichever program is currently innermost.
+        if line.starts_with(PROGRAM_DATA_PREFIX) && stack.last() == Some(&program_id) {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// `Program <pubkey> invoke [<depth>]` -> the pubkey.
+fn parse_invoke(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("Program ")?;
+    let (who, tail) = rest.split_once(' ')?;
+    // `invoke [N]` — require the bracket so a program literally named "invoke"
+    // in some other message shape can't be mistaken for a frame.
+    if tail.starts_with("invoke [") {
+        Some(who)
+    } else {
+        None
+    }
+}
+
+/// `Program <pubkey> success` / `Program <pubkey> failed: …` -> the pubkey.
+///
+/// Deliberately does NOT match `Program <pubkey> consumed …`, which the runtime
+/// prints just before the terminator and would otherwise pop the frame early.
+fn parse_terminator(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("Program ")?;
+    let (who, tail) = rest.split_once(' ')?;
+    if tail == "success" || tail.starts_with("failed") {
+        Some(who)
+    } else {
+        None
+    }
+}
+
+/// The gate's source-side origin proof, written by `process_send` into the
+/// program-owned PDA `["sent", submissionId]`.
+///
+/// Layout MUST match `solana_gate::SentRecord` byte-for-byte. That program is
+/// excluded from the workspace (it builds for BPF), so the shape is mirrored here
+/// rather than imported; [`SENT_RECORD_LEN`] pins the size against drift.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SentRecord {
+    pub debridge_id: [u8; 32],
+    /// The signer that locked the funds.
+    pub sender: [u8; 32],
+    /// The SPL token account debited — where `refund` returns the funds.
+    pub source_token: [u8; 32],
+    pub mint: [u8; 32],
+    pub amount: u64,
+}
+
+/// Borsh size of a [`SentRecord`]: four pubkey-width fields plus a u64.
+pub const SENT_RECORD_LEN: usize = 32 + 32 + 32 + 32 + 8;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SentRecordError {
+    #[error("no [\"sent\", id] record: this gate never emitted that submissionId")]
+    Missing,
+    #[error("[\"sent\", id] account is not owned by the gate program")]
+    NotProgramOwned,
+    #[error("[\"sent\", id] record is {0} bytes, expected {SENT_RECORD_LEN}")]
+    BadLength(usize),
+    #[error("[\"sent\", id] record does not decode as a SentRecord")]
+    Malformed,
+    #[error("record was zeroed (already refunded), so it authorises nothing")]
+    Retired,
+    #[error("record disagrees with the event on {field}")]
+    Mismatch { field: &'static str },
+}
+
+/// Decode a `["sent", submissionId]` account and check it corroborates `event`.
+///
+/// This is the authoritative answer to "did the gate really emit this?". Logs are
+/// a rendering; this account is program state that only `process_send` can write.
+/// A forged `BRIDGE_SENT` — from a foreign program, a hostile RPC, or a replayed
+/// line — has no such record, and one that names different values fails here.
+///
+/// `owner_is_program` and `data` come from a plain `getAccountInfo` on the PDA the
+/// caller derived; keeping the I/O out makes the rule testable.
+pub fn verify_sent_record(
+    account: Option<(bool, &[u8])>,
+    event: &SentEvent,
+) -> Result<SentRecord, SentRecordError> {
+    let Some((owner_is_program, data)) = account else {
+        return Err(SentRecordError::Missing);
+    };
+    if !owner_is_program {
+        return Err(SentRecordError::NotProgramOwned);
+    }
+    if data.is_empty() {
+        return Err(SentRecordError::Missing);
+    }
+    if data.len() != SENT_RECORD_LEN {
+        return Err(SentRecordError::BadLength(data.len()));
+    }
+    let record =
+        SentRecord::try_from_slice(data).map_err(|_| SentRecordError::Malformed)?;
+
+    // `process_refund` zeroes the record on payout. An all-zero record proves the
+    // transfer was already repaid on the source, so it must not corroborate a
+    // fresh signature — and a zeroed record would otherwise "match" a forged
+    // event that also named zeros.
+    if record.amount == 0 && record.debridge_id == [0u8; 32] {
+        return Err(SentRecordError::Retired);
+    }
+
+    if record.debridge_id != event.debridge_id {
+        return Err(SentRecordError::Mismatch { field: "debridge_id" });
+    }
+    if record.amount != event.amount {
+        return Err(SentRecordError::Mismatch { field: "amount" });
+    }
+    if record.mint != event.mint {
+        return Err(SentRecordError::Mismatch { field: "mint" });
+    }
+    Ok(record)
 }
 
 /// Convert the hash-form auto-params into the Borsh instruction/event form.
@@ -313,6 +483,214 @@ mod tests {
         );
         let r = parse_sent_event_line(&line).expect("recognised as ours");
         assert!(r.is_err(), "malformed payload must error, not skip");
+    }
+
+    const GATE: &str = "GateProg11111111111111111111111111111111111";
+    const EVIL: &str = "EvilProg11111111111111111111111111111111111";
+
+    fn data_line(sent: &Sent) -> String {
+        sent_event_to_program_data_line(&SentEvent::from_sent(sent, [0x55; 32]))
+    }
+
+    /// THE C-1 attack, as a regression test.
+    ///
+    /// An attacker's program emits a perfectly well-formed `BRIDGE_SENT` payload
+    /// inside a transaction that merely mentions the gate. Every downstream check
+    /// passes on it — the id recomputes, the chain id is whatever the attacker
+    /// wrote — so attribution is the only thing standing between that log line
+    /// and a validator signature over a transfer that never happened.
+    #[test]
+    fn a_foreign_programs_bridge_sent_is_not_attributed_to_the_gate() {
+        let forged = sample_sent(None);
+        let logs: Vec<String> = vec![
+            format!("Program {EVIL} invoke [1]"),
+            "Program log: totally normal".into(),
+            data_line(&forged), // <- emitted by EVIL, not the gate
+            format!("Program {EVIL} consumed 1234 of 200000 compute units"),
+            format!("Program {EVIL} success"),
+        ];
+
+        // The line itself parses fine — that is exactly why this was exploitable.
+        assert!(parse_sent_log_line(&data_line(&forged)).is_some());
+
+        // But it is not the gate's, so the scanner must never see it.
+        assert!(
+            gate_program_data_lines(&logs, GATE).is_empty(),
+            "a foreign program's BRIDGE_SENT must not be attributed to the gate"
+        );
+    }
+
+    /// The gate's own event, in the same transaction as a foreign one, is kept —
+    /// and only that one. This is the mixed case an attacker would actually build
+    /// (a real 1-unit send, to make the tx unambiguously involve the gate,
+    /// alongside a forged event from their own program).
+    #[test]
+    fn only_the_gates_own_event_survives_a_mixed_transaction() {
+        let mut real = sample_sent(None);
+        real.amount = 1;
+        let mut forged = sample_sent(None);
+        forged.amount = 999_999_999;
+
+        let logs: Vec<String> = vec![
+            format!("Program {EVIL} invoke [1]"),
+            data_line(&forged),
+            format!("Program {GATE} invoke [2]"), // real CPI into the gate
+            data_line(&real),
+            format!("Program {GATE} consumed 500 of 190000 compute units"),
+            format!("Program {GATE} success"),
+            format!("Program {EVIL} success"),
+        ];
+
+        let kept = gate_program_data_lines(&logs, GATE);
+        assert_eq!(kept.len(), 1, "exactly the gate's own event");
+        let got = parse_sent_log_line(kept[0]).unwrap().unwrap();
+        assert_eq!(got.amount, 1, "the forged event must not be the one kept");
+    }
+
+    /// `consumed` lines sit between a program's output and its terminator. Popping
+    /// the frame on one would mis-attribute every later line in that frame.
+    #[test]
+    fn a_consumed_line_does_not_close_the_frame() {
+        let sent = sample_sent(None);
+        let logs: Vec<String> = vec![
+            format!("Program {GATE} invoke [1]"),
+            format!("Program {GATE} consumed 10 of 200000 compute units"),
+            data_line(&sent),
+            format!("Program {GATE} success"),
+        ];
+        assert_eq!(gate_program_data_lines(&logs, GATE).len(), 1);
+    }
+
+    /// A failed inner CPI pops its frame like a successful one, so output after it
+    /// belongs to the caller again — not to the program that failed.
+    #[test]
+    fn a_failed_frame_pops_and_does_not_swallow_later_lines() {
+        let sent = sample_sent(None);
+        let logs: Vec<String> = vec![
+            format!("Program {GATE} invoke [1]"),
+            format!("Program {EVIL} invoke [2]"),
+            format!("Program {EVIL} failed: custom program error: 0x1"),
+            data_line(&sent), // back in the gate's frame
+            format!("Program {GATE} success"),
+        ];
+        assert_eq!(gate_program_data_lines(&logs, GATE).len(), 1);
+    }
+
+    /// Nothing outside a frame is ever attributed (defensive: a truncated or
+    /// reordered log stream must not default to "ours").
+    #[test]
+    fn data_outside_any_frame_is_dropped() {
+        let sent = sample_sent(None);
+        let logs: Vec<String> = vec![data_line(&sent)];
+        assert!(gate_program_data_lines(&logs, GATE).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // The ["sent", id] origin proof — the authoritative anti-forgery check
+    // -----------------------------------------------------------------
+
+    fn event_and_record() -> (SentEvent, SentRecord) {
+        let mint = [0x55u8; 32];
+        let event = SentEvent::from_sent(&sample_sent(None), mint);
+        let record = SentRecord {
+            debridge_id: event.debridge_id,
+            sender: [0x77; 32],
+            source_token: [0x88; 32],
+            mint,
+            amount: event.amount,
+        };
+        (event, record)
+    }
+
+    #[test]
+    fn a_matching_record_corroborates_the_event() {
+        let (event, record) = event_and_record();
+        let data = borsh::to_vec(&record).unwrap();
+        assert_eq!(data.len(), SENT_RECORD_LEN, "layout must match the program's");
+        assert_eq!(verify_sent_record(Some((true, &data)), &event).unwrap(), record);
+    }
+
+    /// The forged-event case: an attacker's log names a real corridor and a huge
+    /// amount, but the gate never wrote a record for that id, so there is nothing
+    /// on-chain to corroborate it.
+    #[test]
+    fn a_forged_event_has_no_origin_proof() {
+        let (event, _) = event_and_record();
+        assert_eq!(verify_sent_record(None, &event), Err(SentRecordError::Missing));
+        assert_eq!(
+            verify_sent_record(Some((true, &[])), &event),
+            Err(SentRecordError::Missing)
+        );
+    }
+
+    /// An account squatted at the derived address proves nothing — only the
+    /// program can write program-owned state.
+    #[test]
+    fn a_foreign_owned_account_is_not_an_origin_proof() {
+        let (event, record) = event_and_record();
+        let data = borsh::to_vec(&record).unwrap();
+        assert_eq!(
+            verify_sent_record(Some((false, &data)), &event),
+            Err(SentRecordError::NotProgramOwned)
+        );
+    }
+
+    /// The inflation attack: a real 1-unit send exists, and the attacker replays
+    /// its id with a bigger amount. The record pins the amount.
+    #[test]
+    fn an_inflated_amount_is_refused() {
+        let (mut event, record) = event_and_record();
+        event.amount = record.amount + 1_000_000;
+        let data = borsh::to_vec(&record).unwrap();
+        assert_eq!(
+            verify_sent_record(Some((true, &data)), &event),
+            Err(SentRecordError::Mismatch { field: "amount" })
+        );
+    }
+
+    /// Swapping the asset for a more valuable one is pinned the same way.
+    #[test]
+    fn a_substituted_asset_is_refused() {
+        let (event, record) = event_and_record();
+        let data = borsh::to_vec(&record).unwrap();
+
+        let mut wrong_corridor = event.clone();
+        wrong_corridor.debridge_id = [0xAB; 32];
+        assert_eq!(
+            verify_sent_record(Some((true, &data)), &wrong_corridor),
+            Err(SentRecordError::Mismatch { field: "debridge_id" })
+        );
+
+        let mut wrong_mint = event.clone();
+        wrong_mint.mint = [0xCD; 32];
+        assert_eq!(
+            verify_sent_record(Some((true, &data)), &wrong_mint),
+            Err(SentRecordError::Mismatch { field: "mint" })
+        );
+    }
+
+    /// `process_refund` zeroes the record on payout. A zeroed record must not
+    /// corroborate anything — least of all a forged event that also names zeros.
+    #[test]
+    fn a_refunded_record_authorises_nothing() {
+        let (mut event, _) = event_and_record();
+        let zeroed = vec![0u8; SENT_RECORD_LEN];
+        event.debridge_id = [0u8; 32];
+        event.amount = 0;
+        assert_eq!(
+            verify_sent_record(Some((true, &zeroed)), &event),
+            Err(SentRecordError::Retired)
+        );
+    }
+
+    #[test]
+    fn a_wrong_sized_record_is_refused() {
+        let (event, _) = event_and_record();
+        let short = vec![0u8; SENT_RECORD_LEN - 1];
+        assert_eq!(
+            verify_sent_record(Some((true, &short)), &event),
+            Err(SentRecordError::BadLength(SENT_RECORD_LEN - 1))
+        );
     }
 
     // A future version the decoder wasn't built for is rejected rather than

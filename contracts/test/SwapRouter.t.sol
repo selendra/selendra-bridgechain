@@ -332,4 +332,88 @@ contract SwapRouterTest is Test {
         vm.expectRevert(SwapRouter.NotOwner.selector);
         routerA.setRemoteRouter(CHAIN_B, abi.encodePacked(address(0x1234)));
     }
+
+    // ------------------------------------------------------------------
+    // M-1: the try/catch fallback must not be reachable by gas starvation
+    // ------------------------------------------------------------------
+
+    /// `_deliver` wraps the destination swap in try/catch so an impossible swap
+    /// falls back to delivering the stable rather than stranding funds. But
+    /// `finalize` is permissionless and sets `finalized[id]` BEFORE attempting the
+    /// swap, so without a gas floor anyone could call it with just enough gas that
+    /// `pool.swap` runs out inside the call — the 63/64 rule leaves this frame
+    /// alive to catch it — and the user silently receives the carrier stable
+    /// instead of the token they asked for. There is no retry.
+    ///
+    /// The floor makes the catch mean "this swap is impossible", never "the caller
+    /// was stingy".
+    function test_Finalize_GasStarvation_IsRefused_NotSilentlyDowngraded() public {
+        uint256 amountIn = 1e18;
+        Leg memory leg = _sourceLeg(amountIn, address(tt), 0);
+
+        // Deliver the stable to routerB on chain B, exactly as a keeper would.
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+
+        uint256 ttBefore = tt.balanceOf(finalReceiver);
+        uint256 usdBefore = usdB.balanceOf(finalReceiver);
+
+        // THE ATTACK: a griefer calls finalize with barely any gas.
+        // `MIN_DELIVER_GAS` is checked with `gasleft()` INSIDE the call, so
+        // forwarding just under it is what a starving caller achieves.
+        // Assert the SPECIFIC guard fires — a bare expectRevert would also pass on
+        // a plain out-of-gas, which is not what we are proving. `have` is
+        // `gasleft()` and therefore not predictable, so match on the selector.
+        vm.prank(address(0xBAD));
+        vm.expectPartialRevert(SwapRouter.InsufficientGas.selector);
+        routerB.finalize{gas: 200_000}(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender
+        );
+
+        // Nothing was delivered and, crucially, the idempotency guard did NOT
+        // consume the transfer — a real relayer can still finalize it properly.
+        assertEq(tt.balanceOf(finalReceiver), ttBefore, "no TT should move");
+        assertEq(usdB.balanceOf(finalReceiver), usdBefore, "no stable downgrade");
+        assertFalse(routerB.finalized(leg.id), "a starved call must not consume the transfer");
+
+        // With adequate gas the honest path runs and the user gets their TOKEN.
+        uint256 expectedTt = poolB.quote(address(usdB), address(tt), leg.amount);
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertTrue(routerB.finalized(leg.id), "honest finalize must complete");
+        assertEq(tt.balanceOf(finalReceiver), ttBefore + expectedTt, "user must receive TT");
+        assertEq(usdB.balanceOf(finalReceiver), usdBefore, "must not fall back to stable");
+    }
+
+    /// The fallback must STILL work when the swap is genuinely impossible — the
+    /// gas floor must not have turned a recoverable case into a stranded one.
+    function test_Finalize_GenuinelyImpossibleSwap_StillFallsBackToStable() public {
+        uint256 amountIn = 1e18;
+        // An unlisted final token: pool.swap reverts TokenNotListed, for real.
+        MockToken unlisted = new MockToken("Nope", "NOPE", 18);
+        Leg memory leg = _sourceLeg(amountIn, address(unlisted), 0);
+
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+
+        uint256 usdBefore = usdB.balanceOf(finalReceiver);
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertEq(
+            usdB.balanceOf(finalReceiver),
+            usdBefore + leg.amount,
+            "an impossible swap must still deliver the stable rather than strand it"
+        );
+    }
 }

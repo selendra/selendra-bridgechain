@@ -376,6 +376,29 @@ contract SwapTest is Test {
         assertFalse(listed);
     }
 
+    /// L-2: the repricing clock belongs to the listing, so delisting must clear
+    /// it. `setPrice` exempts the FIRST update after a listing via `last == 0`; a
+    /// stale timestamp surviving into a re-listing would revoke that exemption and
+    /// freeze the new token's price behind a cooldown it never earned.
+    function test_Delist_ClearsThePriceClock_SoARelistCanPriceFreely() public {
+        // Reprice once so the clock is set, then fully unwind and delist.
+        vm.prank(oracle);
+        pool.setPrice(address(weth), 3200e18);
+        assertGt(pool.lastPriceUpdate(address(weth)), 0, "clock should be set");
+
+        pool.withdrawLiquidity(address(weth), 100e18, address(this));
+        pool.delistToken(address(weth));
+        assertEq(pool.lastPriceUpdate(address(weth)), 0, "delist must clear the clock");
+
+        // Re-list and immediately reprice: the first update after a listing is
+        // always allowed, and must stay allowed here.
+        pool.listToken(address(weth), 3000e18);
+        vm.prank(oracle);
+        pool.setPrice(address(weth), 3100e18);
+        (,, uint256 price,) = _info(address(weth));
+        assertEq(price, 3100e18, "a re-listed token must be freely pricable");
+    }
+
     function test_MaxSwapOut() public view {
         (uint256 reserve, uint256 usdValue) = pool.maxSwapOut(address(weth));
         assertEq(reserve, 100e18);

@@ -43,6 +43,26 @@ contract SwapRouter is ReentrancyGuard {
     /// @notice the cross-chain carrier asset (must be listed on both pools).
     address public immutable stable;
 
+    /// @notice Gas that must remain when the destination swap is attempted.
+    ///
+    /// @dev    GRIEFING GUARD. `_deliver` wraps `pool.swap` in try/catch so a
+    ///         genuinely impossible swap (output over the pool lock, token
+    ///         unlisted, slippage) falls back to delivering the stable instead of
+    ///         stranding the funds. But `finalize` is PERMISSIONLESS and
+    ///         `finalized[submissionId]` is set before the swap is attempted, so
+    ///         without a floor here anyone could call it with just enough gas that
+    ///         `pool.swap` runs out inside the call — the 63/64 rule leaves this
+    ///         frame alive to catch it — and the user receives the carrier stable
+    ///         instead of the token they asked for. The idempotency guard means
+    ///         there is no second attempt.
+    ///
+    ///         So the fallback must be reachable only when the swap genuinely
+    ///         cannot succeed, never merely because the caller was stingy. Sized
+    ///         well above a SwapPool swap (two SafeERC20 transfers, a mulDiv and
+    ///         two storage writes measure ~90k) with room for a cold-slot worst
+    ///         case; a real relayer forwards far more.
+    uint256 public constant MIN_DELIVER_GAS = 250_000;
+
     // --- governance (mirrors Gate.sol two-step ownership) ---
     address public owner;
     address public pendingOwner;
@@ -91,6 +111,9 @@ contract SwapRouter is ReentrancyGuard {
     error NotForThisRouter();
     error UnexpectedAsset();
     error BadReceiver();
+    /// @dev the caller did not forward enough gas for the destination swap to be
+    ///      attempted honestly. See {MIN_DELIVER_GAS}.
+    error InsufficientGas(uint256 have, uint256 need);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -308,6 +331,12 @@ contract SwapRouter is ReentrancyGuard {
             emit Finalized(submissionId, finalReceiver, finalToken, amount, amount, false);
             return;
         }
+
+        // Refuse to *attempt* the swap without enough gas to complete it, so the
+        // catch below can only ever mean "this swap is impossible", never "the
+        // caller starved it". Checked here rather than at function entry so it
+        // covers exactly the call it protects.
+        if (gasleft() < MIN_DELIVER_GAS) revert InsufficientGas(gasleft(), MIN_DELIVER_GAS);
 
         IERC20(stable).forceApprove(address(pool), amount);
         try pool.swap(stable, finalToken, amount, finalMinOut, finalReceiver) returns (uint256 out) {

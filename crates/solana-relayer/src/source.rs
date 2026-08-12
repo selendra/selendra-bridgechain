@@ -16,9 +16,12 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use bridge_solana::gate::Sent;
 use bridge_solana::hash::{amount_word, submission_id, submission_id_with_auto};
-use bridge_solana::relayer::parse_sent_log_line;
+use bridge_solana::relayer::{
+    gate_program_data_lines, parse_sent_event_line, verify_sent_record, SentEvent,
+};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -288,8 +291,14 @@ impl Scanner {
                 .and_then(|m| Option::<Vec<String>>::from(m.log_messages.clone()))
                 .unwrap_or_default();
 
-            for line in &logs {
-                match parse_sent_log_line(line) {
+            // ATTRIBUTION FIRST. A transaction's logs are the concatenation of
+            // every program that ran in it, and `getSignaturesForAddress` returns
+            // transactions that merely MENTION the gate. Parsing all of them would
+            // let any program in the transaction dictate what this validator
+            // signs. Keep only the lines the gate itself emitted.
+            let gate = self.program_id.to_string();
+            for line in gate_program_data_lines(&logs, &gate) {
+                match parse_sent_event_line(line) {
                     None => continue, // not our event
                     // A tagged-but-malformed payload is a fault, not noise: surface
                     // it and leave the cursor put rather than silently skipping a
@@ -297,9 +306,11 @@ impl Scanner {
                     Some(Err(e)) => {
                         anyhow::bail!("malformed BRIDGE_SENT in tx {}: {e}", entry.signature)
                     }
-                    Some(Ok(sent)) => {
-                        self.handle(&sent, &entry.signature).await?;
-                        handled += 1;
+                    Some(Ok(event)) => {
+                        let sent = event.to_sent()?;
+                        if self.handle(&event, &sent, &entry.signature).await? {
+                            handled += 1;
+                        }
                     }
                 }
             }
@@ -311,7 +322,9 @@ impl Scanner {
         Ok(handled)
     }
 
-    async fn handle(&self, sent: &Sent, tx: &str) -> anyhow::Result<()> {
+    /// Verify and sign one event. `Ok(false)` means the event was rejected as
+    /// unauthentic and skipped; `Ok(true)` means it was signed and stored.
+    async fn handle(&self, event: &SentEvent, sent: &Sent, tx: &str) -> anyhow::Result<bool> {
         // Never sign an id we cannot reproduce ourselves.
         let computed = recompute(sent);
         if computed != sent.submission_id {
@@ -329,6 +342,15 @@ impl Scanner {
                 sent.chain_id_from,
                 self.cfg.chain_id
             );
+        }
+
+        // THE origin proof. Recomputing the id proves only that whoever wrote the
+        // log hashed their own fields correctly — an attacker does that trivially.
+        // The gate's `["sent", submissionId]` PDA is program state only
+        // `process_send` can write, so it is the thing that actually distinguishes
+        // "the gate locked these funds" from "someone printed a convincing line".
+        if !self.origin_proof_holds(event, sent, tx).await? {
+            return Ok(false);
         }
 
         let record = SubmissionRecord {
@@ -363,7 +385,58 @@ impl Scanner {
             chain_to = sent.chain_id_to,
             "SIGNED and stored"
         );
-        Ok(())
+        Ok(true)
+    }
+
+    /// Read the gate's `["sent", submissionId]` record and check it corroborates
+    /// the event.
+    ///
+    /// The two failure modes are deliberately NOT treated alike:
+    ///
+    ///   * **unauthentic** (no record, foreign-owned, disagrees) — this is not our
+    ///     event. Warn loudly and skip. It must not abort the tick: a forged event
+    ///     is cheap to emit, so failing the batch would let anyone wedge the
+    ///     scanner permanently by spamming them — turning a foiled theft into a
+    ///     denial of service on every real transfer behind it.
+    ///   * **unreadable** (RPC error) — we do not KNOW. Propagate, so the cursor
+    ///     stays put and the tick retries. Never sign on a failed lookup.
+    async fn origin_proof_holds(
+        &self,
+        event: &SentEvent,
+        sent: &Sent,
+        tx: &str,
+    ) -> anyhow::Result<bool> {
+        let (pda, _bump) = Pubkey::find_program_address(
+            &[b"sent", &sent.submission_id],
+            &self.program_id,
+        );
+        let account = self
+            .rpc
+            .get_account_with_commitment(&pda, self.rpc.commitment())
+            .await
+            .with_context(|| format!("reading [\"sent\"] PDA {pda} for tx {tx}"))?
+            .value;
+
+        let view = account
+            .as_ref()
+            .map(|a| (a.owner == self.program_id, a.data.as_slice()));
+
+        match verify_sent_record(view, event) {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                warn!(
+                    tx,
+                    submission_id = %hex::encode(sent.submission_id),
+                    sent_pda = %pda,
+                    amount = sent.amount,
+                    chain_to = sent.chain_id_to,
+                    error = %e,
+                    "REJECTED unauthentic BRIDGE_SENT — no matching on-chain origin \
+                     proof; refusing to sign (possible forged event)"
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -394,8 +467,53 @@ mod tests {
     fn recompute_round_trips_through_the_real_log_framing() {
         let sent = sample();
         let line = sent_event_to_program_data_line(&SentEvent::from_sent(&sent, [0x55; 32]));
-        let parsed = parse_sent_log_line(&line).expect("our line").expect("decodes");
+        let parsed = parse_sent_event_line(&line)
+            .expect("our line")
+            .expect("decodes")
+            .to_sent()
+            .expect("converts");
         assert_eq!(recompute(&parsed), sent.submission_id, "id must survive the round trip");
+    }
+
+    /// C-1, at the layer the scanner actually reads.
+    ///
+    /// `getSignaturesForAddress(gate)` returns transactions that merely MENTION
+    /// the gate, and their logs carry every program's output. The scanner used to
+    /// parse all of them, so a forged `BRIDGE_SENT` from an attacker's program was
+    /// indistinguishable from a real one — it recomputes, its `chain_id_from` is
+    /// whatever the attacker wrote, and the validator signed it. That signature,
+    /// times threshold, releases real liquidity on the EVM destination.
+    ///
+    /// The scanner now selects lines by emitting program before parsing.
+    #[test]
+    fn a_forged_event_from_another_program_never_reaches_the_parser() {
+        const GATE: &str = "GateProg11111111111111111111111111111111111";
+        const EVIL: &str = "EvilProg11111111111111111111111111111111111";
+
+        // The attacker's payload: a real corridor, an enormous amount, their own
+        // receiver — and a correctly recomputed id, because they hash their own
+        // fields honestly. Nothing downstream can tell it apart.
+        let mut forged = sample();
+        forged.amount = 1_000_000_000_000;
+        forged.receiver = vec![0xAA; 20]; // the attacker's EVM address
+        forged.submission_id = recompute(&forged);
+
+        let line = sent_event_to_program_data_line(&SentEvent::from_sent(&forged, [0x55; 32]));
+        let logs: Vec<String> = vec![
+            format!("Program {EVIL} invoke [1]"),
+            line.clone(),
+            format!("Program {EVIL} success"),
+        ];
+
+        // Pre-fix behaviour: the line parses, and recompute agrees with it.
+        let decoded = parse_sent_event_line(&line).unwrap().unwrap().to_sent().unwrap();
+        assert_eq!(recompute(&decoded), decoded.submission_id, "the forgery is self-consistent");
+
+        // Post-fix: it is never attributed to the gate, so it is never parsed.
+        assert!(
+            gate_program_data_lines(&logs, GATE).is_empty(),
+            "a foreign program's forged Sent must never reach the signing path"
+        );
     }
 
     /// A tampered event must not reproduce its claimed id — this is the check that

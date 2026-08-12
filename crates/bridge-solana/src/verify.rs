@@ -76,20 +76,23 @@ pub fn verify_threshold(
     threshold: u32,
 ) -> Result<u32, VerifyError> {
     let digest = eth_signed_digest(submission_id);
+    // Seeded at the zero address and compared on EVERY signature, exactly as
+    // `Gate.sol` does (`address last = address(0)`). An earlier version skipped
+    // the comparison for the first signature, which let a recovery to the zero
+    // address through where Solidity rejects it — a divergence in two
+    // implementations whose whole contract is to be byte-for-byte equivalent.
     let mut last = [0u8; 20];
-    let mut have_last = false;
     let mut count: u32 = 0;
     for sig in signatures {
         let signer = recover_evm_address(&digest, sig)?;
         // strictly ascending => distinct signers, no duplicates
-        if have_last && signer <= last {
+        if signer <= last {
             return Err(VerifyError::InvalidSignerOrder);
         }
         if is_validator(&signer) {
             count += 1;
         }
         last = signer;
-        have_last = true;
     }
     if count < threshold {
         return Err(VerifyError::NotEnoughSignatures { got: count, want: threshold });
