@@ -360,9 +360,14 @@ contract SwapRouter is ReentrancyGuard {
         (finalToken, finalReceiver, finalMinOut) = abi.decode(ap.data, (address, address, uint256));
     }
 
-    /// @dev Read the first 20 bytes of `receiver` as an EVM address (as the Gate does).
+    /// @dev Decode `receiver` as an EVM address, exactly as the Gate does — and
+    ///      exactly as strictly: 20 bytes and no other width. `_settle` compares
+    ///      the result against `address(this)` to prove the transfer was routed
+    ///      here, so a looser decode here than in the Gate would let a padded
+    ///      receiver satisfy that check on a width the Gate itself refuses. Keep
+    ///      the two in lockstep.
     function _toAddress(bytes calldata receiver) internal pure returns (address addr) {
-        if (receiver.length < 20) revert BadReceiver();
+        if (receiver.length != 20) revert BadReceiver();
         addr = address(bytes20(receiver[0:20]));
     }
 }

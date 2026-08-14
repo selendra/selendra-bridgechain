@@ -622,9 +622,32 @@ contract Gate {
         if (count < threshold) revert NotEnoughSignatures(count, threshold);
     }
 
-    /// @dev Read the first 20 bytes of `receiver` as an EVM address.
+    /// @dev Decode `receiver` as an EVM address. EXACTLY 20 bytes — see below.
+    ///
+    ///      `send` accepts a 20- or 32-byte receiver because it cannot know the
+    ///      destination VM: 20 for an EVM address, 32 for a Solana account key.
+    ///      But on THIS chain a receiver is an address, so 20 is the only width
+    ///      that can be correct here, and anything else is malformed.
+    ///
+    ///      This used to accept `>= 20` and take the first 20 bytes, which turned
+    ///      a user's format mistake into permanent loss. Two ways in, both silent:
+    ///
+    ///        * a Solana pubkey pasted for an EVM destination — the leading 20
+    ///          bytes are effectively random, so `claim` pays an address nobody
+    ///          holds a key for;
+    ///        * `abi.encode(address)`, which is 32 bytes with the address in the
+    ///          LAST 20 — the leading 20 are zero, so `claim` pays `address(0)`.
+    ///
+    ///      Neither was recoverable: the refund path only rescues transfers that
+    ///      CANNOT be claimed, and both of these claim perfectly well.
+    ///
+    ///      Rejecting instead makes such a transfer unclaimable, which routes it
+    ///      into the existing cancel -> refund path and returns the funds to the
+    ///      sender. It also mirrors the Solana gate, which already requires
+    ///      exactly 32 bytes (`process_claim`'s `try_into::<[u8; 32]>`), so each
+    ///      VM now accepts exactly its own address width and nothing else.
     function _toAddress(bytes calldata receiver) internal pure returns (address addr) {
-        if (receiver.length < 20) revert BadReceiver();
+        if (receiver.length != 20) revert BadReceiver();
         addr = address(bytes20(receiver[0:20]));
     }
 }

@@ -33,7 +33,7 @@ use bridge_core::abi::Gate;
 use bridge_core::store::{SignerSig, SubmissionRecord};
 use config::{Config, TargetChain};
 use source::Source;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Upper bound on waiting for a submitted tx's receipt. A tx that never confirms
 /// within this window (stuck/underpriced/replaced) makes `get_receipt` return an
@@ -372,6 +372,30 @@ async fn try_claim<P: Provider>(
     sigs: &[SignerSig],
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
+
+    // An EVM `claim` decodes `receiver` as an address and now requires EXACTLY 20
+    // bytes (it used to truncate anything longer, silently paying an unowned
+    // address). A 32-byte receiver here means the transfer was addressed for a
+    // non-EVM VM but routed to an EVM chain, so the claim is certain to revert
+    // `BadReceiver`. Skip it rather than burn a tx and an RPC round trip every
+    // tick — this is exactly the stranded-transfer case the two-phase refund
+    // recovers, same posture as the `tokenOf == 0` guard below.
+    // DEBUG, not WARN: this runs on every sweep for as long as the transfer sits
+    // unclaimed, which is at minimum the whole refund timeout. Warning here put
+    // ~1.5 lines/second per stranded transfer into the log and buried everything
+    // else — the same reasoning the `tokenOf == 0` guard below documents. The
+    // operator still sees the transfer's fate, because the cancel and the refund
+    // that recover it are both logged at INFO.
+    let receiver_len = rec.receiver.strip_prefix("0x").unwrap_or(&rec.receiver).len() / 2;
+    if receiver_len != 20 {
+        debug!(
+            submission_id = %rec.submission_id,
+            receiver_len,
+            "receiver is not a 20-byte EVM address; this transfer can never be claimed \
+             here and must be recovered via cancel/refund"
+        );
+        return Ok(None);
+    }
 
     if gate.executed(submission_id).call().await? {
         return Ok(None); // already executed (by us or another keeper)
