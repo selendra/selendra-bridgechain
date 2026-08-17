@@ -16,6 +16,7 @@
 //!   gate-admin --rpc <url> --keypair <path> --program <pubkey> <command>
 //!
 //!     init --chain-id N --threshold N --validator 0x.. [--validator 0x..]
+//!          --bridge-domain <0x…32 bytes>
 //!          [--max-validators N] [--max-corridors N] [--guardian <pubkey>]
 //!     register-corridor --chain-id-to N
 //!     register-asset --debridge-id 0x.. --mint <pubkey> --vault <pubkey>
@@ -196,6 +197,9 @@ fn main() -> anyhow::Result<()> {
                 args.get("--max-validators").unwrap_or_else(|| "8".into()).parse()?;
             let max_corridors: u32 =
                 args.get("--max-corridors").unwrap_or_else(|| "8".into()).parse()?;
+            // Required, with no default: a defaulted domain shared by every
+            // deployment would be the same as having none.
+            let bridge_domain = parse_b32(&args.req("--bridge-domain")?)?;
             let guardian = match args.get("--guardian") {
                 Some(g) => Pubkey::from_str(&g)?.to_bytes(),
                 None => [0u8; 32],
@@ -207,6 +211,7 @@ fn main() -> anyhow::Result<()> {
 
             (
                 GateInstruction::Init(InitArgs {
+                    bridge_domain,
                     validators,
                     threshold,
                     chain_id,
@@ -287,8 +292,17 @@ fn main() -> anyhow::Result<()> {
             // program uses exactly these to build the id.
             let cfg_acct = rpc.get_account(&config_pda)?;
             let d = &cfg_acct.data;
-            let n = u32::from_le_bytes(d[64..68].try_into()?) as usize;
-            let after_validators = 68 + n * 20;
+            // Borsh Config layout, in declaration order and with no header:
+            //   owner(32) | bridge_domain(32) | guardian(32) | validators(4+20n) | …
+            // Adding a field ahead of these shifts every offset below, which is
+            // why the domain read and the length read are derived from the same
+            // running total rather than two independent magic numbers.
+            let bridge_domain: [u8; 32] = d[32..64].try_into()?;
+            let validators_off = 32 + 32 + 32;
+            let n = u32::from_le_bytes(
+                d[validators_off..validators_off + 4].try_into()?,
+            ) as usize;
+            let after_validators = validators_off + 4 + n * 20;
             let chain_id = u64::from_le_bytes(
                 d[after_validators + 4..after_validators + 12].try_into()?,
             );
@@ -312,6 +326,7 @@ fn main() -> anyhow::Result<()> {
             // as `BridgeHash.sol` defines it. Using the with-auto form here would
             // produce an id the gate never derives.
             let id = bridge_solana::hash::submission_id(
+                &bridge_domain,
                 &debridge_id,
                 &bridge_solana::hash::amount_word(amount as u128),
                 chain_id,

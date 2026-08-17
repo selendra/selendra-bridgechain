@@ -42,6 +42,18 @@ pub struct SignerSig {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmissionRecord {
     pub submission_id: String,
+    /// `0x`-prefixed bytes32 — the deployment generation this transfer belongs
+    /// to, read from the emitting gate's `bridgeDomain()`. Part of the
+    /// submissionId preimage, so [`canonical_submission_id`] needs it to
+    /// reproduce the id at all.
+    ///
+    /// `#[serde(default)]` for records written before the domain existed: those
+    /// deserialize to the empty string, which is not valid hex, so they fail the
+    /// id-binding check rather than being silently recomputed under a zero
+    /// domain. A pre-domain record belongs to a superseded generation and must
+    /// not be resurrected — that is precisely the replay this field prevents.
+    #[serde(default)]
+    pub bridge_domain: String,
     pub debridge_id: String,
     /// decimal string (uint256)
     pub amount: String,
@@ -200,6 +212,8 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
     use alloy_primitives::{B256, U256};
     use std::str::FromStr;
 
+    let bridge_domain =
+        B256::from_str(&rec.bridge_domain).map_err(|_| StoreError::BadField("bridge_domain"))?;
     let debridge_id = B256::from_str(&rec.debridge_id).map_err(|_| StoreError::BadField("debridge_id"))?;
     let amount = U256::from_str(&rec.amount).map_err(|_| StoreError::BadField("amount"))?;
     let receiver = hex_bytes("receiver", &rec.receiver)?;
@@ -210,7 +224,7 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
     let nonce = U256::from(rec.nonce);
 
     let id = if auto_params.is_empty() {
-        crate::submission_id(debridge_id, amount, chain_from, chain_to, nonce, &receiver)
+        crate::submission_id(bridge_domain, debridge_id, amount, chain_from, chain_to, nonce, &receiver)
     } else {
         let ap = crate::abi::AutoParamsTo::abi_decode(&auto_params)
             .map_err(|_| StoreError::BadField("auto_params"))?;
@@ -221,7 +235,16 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
             data: ap.data.to_vec(),
             native_sender,
         };
-        crate::submission_id_with_auto(debridge_id, amount, chain_from, chain_to, nonce, &receiver, &auto)
+        crate::submission_id_with_auto(
+            bridge_domain,
+            debridge_id,
+            amount,
+            chain_from,
+            chain_to,
+            nonce,
+            &receiver,
+            &auto,
+        )
     };
     Ok(id)
 }
@@ -473,9 +496,12 @@ mod tests {
         let chain_to = U256::from(1338u64);
         let nonce = U256::from(0u64);
         let receiver = Address::repeat_byte(0xAB).to_vec();
-        let id = crate::submission_id(debridge_id, amount, chain_from, chain_to, nonce, &receiver);
+        let domain = B256::repeat_byte(0xD0);
+        let id =
+            crate::submission_id(domain, debridge_id, amount, chain_from, chain_to, nonce, &receiver);
         SubmissionRecord {
             submission_id: format!("{id:#x}"),
+            bridge_domain: format!("{domain:#x}"),
             debridge_id: format!("{debridge_id:#x}"),
             amount: amount.to_string(),
             chain_id_from: 1337,

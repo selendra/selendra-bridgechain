@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
+import {deployTestGate, TEST_BRIDGE_DOMAIN} from "./helpers/TestGate.sol";
 import {TestToken} from "../src/TestToken.sol";
 import {BridgeHash} from "../src/BridgeHash.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
@@ -41,7 +42,7 @@ contract ClaimTest is Test {
         validators[0] = v1;
         validators[1] = v2;
         validators[2] = v3;
-        gate = new Gate(validators, 1); // threshold 1 by default
+        gate = deployTestGate(validators, 1); // threshold 1 by default
 
         token = new TestToken("Test", "TST");
         // pre-fund the gate with target-side liquidity
@@ -56,7 +57,7 @@ contract ClaimTest is Test {
 
     function _id() internal view returns (bytes32) {
         return BridgeHash.getSubmissionId(
-            debridgeId, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
+            TEST_BRIDGE_DOMAIN, debridgeId, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
         );
     }
 
@@ -175,7 +176,7 @@ contract ClaimTest is Test {
     function test_Claim_UnknownAsset_Reverts() public {
         bytes32 unknown = BridgeHash.getDebridgeId(CHAIN_FROM, address(0xDEAD));
         bytes32 id = BridgeHash.getSubmissionId(
-            unknown, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
+            TEST_BRIDGE_DOMAIN, unknown, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
         );
         bytes[] memory sigs = new bytes[](1);
         sigs[0] = _sign(v1pk, id);

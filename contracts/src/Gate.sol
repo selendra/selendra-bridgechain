@@ -5,6 +5,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {BridgeHash} from "./BridgeHash.sol";
 
 /// @title Gate
@@ -38,7 +40,26 @@ import {BridgeHash} from "./BridgeHash.sol";
 ///         the paired chain, debit on `claim`), or a per-corridor rate/volume cap.
 ///         Until then, treat shared-token corridors as one trust domain and size
 ///         liquidity for their combined worst case.
-contract Gate {
+///
+/// @dev    UPGRADEABILITY. This is a UUPS implementation and is meant to live
+///         behind an ERC1967 proxy — the proxy address is the gate, and it is
+///         what `CHAINS` and every validator/keeper config must point at.
+///
+///         Deploying it upgradeable is not a convenience. A gate accumulates
+///         liquidity, per-corridor registrations and, critically, `nonceTo`; a
+///         *replacement* gate starts all of that from scratch, and a submissionId
+///         binds to `bridgeDomain` + nonce rather than to a contract address, so
+///         a fresh deployment is the event that historically let old attestations
+///         replay. Upgrading in place keeps one address and one storage, which
+///         removes the need to ever redeploy for a fix.
+///
+///         The base classes are storage-safe to inherit: `UUPSUpgradeable` keeps
+///         only an `immutable` (bytecode, not storage) and `Initializable` uses
+///         ERC-7201 namespaced storage, so `owner` remains at slot 0 and the
+///         layout below is exactly what a non-proxied deploy would have. When
+///         adding state in a future version, APPEND to the end and shrink
+///         `__gap` by the same number of slots — never reorder or insert.
+contract Gate is Initializable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     /// @dev To-side execution payload, abi.encode'd into `send`/`claim` autoParams.
@@ -55,6 +76,21 @@ contract Gate {
     mapping(address => bool) public isValidator;
     uint256 public validatorCount;
     uint256 public threshold;
+
+    /// @notice Identifies this DEPLOYMENT GENERATION of the mesh, and is folded
+    ///         into every submissionId (see {BridgeHash.packedSubmission}).
+    ///
+    /// @dev    Every gate in one mesh — every EVM chain AND the Solana program —
+    ///         must be initialized with the SAME value, or no two of them ever
+    ///         compute the same submissionId and nothing bridges at all. That
+    ///         loud failure is deliberate; the alternative was the silent one.
+    ///
+    ///         Set once at {initialize} and never mutable afterwards: changing it
+    ///         on a live gate would strand every in-flight transfer, because the
+    ///         source has already emitted ids under the old domain while the
+    ///         destination would only accept ids under the new one. A new domain
+    ///         belongs to a new deployment generation, not to an upgrade.
+    bytes32 public bridgeDomain;
 
     // --- emergency circuit breaker ---
     /// @dev when true, `send` and `claim` are halted (incident response)
@@ -95,6 +131,30 @@ contract Gate {
     mapping(bytes32 submissionId => bool) public cancelled;
     /// @dev asset registry: which local ERC-20 backs a given debridgeId on THIS chain
     mapping(bytes32 debridgeId => address localToken) public tokenOf;
+
+    // --- upgrade timelock ---
+    /// @notice Earliest timestamp at which a scheduled implementation may be
+    ///         installed. Zero means "not scheduled" — and {_authorizeUpgrade}
+    ///         treats zero as a refusal, so an implementation can never be
+    ///         installed without first sitting out the delay in public view.
+    mapping(address implementation => uint256 readyAt) public upgradeReadyAt;
+
+    /// @notice How long a scheduled upgrade must wait before it can be executed.
+    /// @dev    A gate holds other people's funds and an upgrade can rewrite every
+    ///         rule below, so the delay exists to give users a window to exit
+    ///         before an implementation swap takes effect. It is a CONSTANT, not
+    ///         an owner-settable parameter: an owner who could shorten it could
+    ///         set it to zero and the timelock would be decorative.
+    ///
+    ///         This does not slow down incident response — that is what
+    ///         {pause} and the guardian are for, and pausing takes effect in one
+    ///         transaction. Upgrades are for fixes, not for emergencies.
+    uint256 public constant UPGRADE_DELAY = 48 hours;
+
+    /// @dev Reserved so a future version can append state without colliding with
+    ///      anything a child contract or a later gap-consuming field occupies.
+    ///      Adding N slots of new state means shrinking this by exactly N.
+    uint256[50] private __gap;
 
     /// @param token the ERC-20 locked on THIS chain. Not part of the submissionId
     ///        (which commits to `debridgeId`, a one-way hash of it), so it is
@@ -146,6 +206,10 @@ contract Gate {
     event GuardianSet(address indexed guardian);
     event Paused(address indexed account);
     event Unpaused(address indexed account);
+    /// @notice An implementation entered the upgrade queue. `readyAt` is when it
+    ///         becomes installable — the public warning users act on.
+    event UpgradeScheduled(address indexed implementation, uint256 readyAt);
+    event UpgradeCancelled(address indexed implementation);
 
     error NotOwner();
     error ZeroAmount();
@@ -177,6 +241,15 @@ contract Gate {
     ///      repointed at a different asset, because in-flight claims bind only the
     ///      `debridgeId` and would then release the new token.
     error LocalTokenAlreadySet(bytes32 debridgeId, address current);
+    /// @dev a zero domain is refused because it is what an uninitialized proxy
+    ///      would report, and a mesh that silently agreed on "unset" would be
+    ///      exactly as replayable as having no domain at all.
+    error ZeroBridgeDomain();
+    /// @dev {upgradeToAndCall} reached an implementation that was never put
+    ///      through {scheduleUpgrade}
+    error UpgradeNotScheduled(address implementation);
+    /// @dev the scheduled implementation is still inside its {UPGRADE_DELAY}
+    error UpgradeNotReady(address implementation, uint256 readyAt);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -188,7 +261,32 @@ contract Gate {
         _;
     }
 
-    constructor(address[] memory validators, uint256 threshold_) {
+    /// @dev The implementation contract is only ever delegatecall'd through the
+    ///      proxy, so its OWN storage must stay permanently uninitialized. Without
+    ///      this, anyone can call {initialize} directly on the implementation and
+    ///      become its `owner`; a UUPS implementation that has an owner can then
+    ///      be told to `upgradeToAndCall` arbitrary code in its own context. Cheap
+    ///      to prevent, unrecoverable if skipped.
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice Initialize the gate behind its proxy. Replaces the constructor —
+    ///         a proxy never runs one, so any state set there would live in the
+    ///         implementation's storage and be invisible to every user.
+    /// @param bridgeDomain_ the mesh-wide deployment domain; see {bridgeDomain}.
+    function initialize(address[] memory validators, uint256 threshold_, bytes32 bridgeDomain_)
+        external
+        initializer
+    {
+        // No `__UUPSUpgradeable_init()` here: that belongs to the separate
+        // openzeppelin-contracts-upgradeable package. The UUPSUpgradeable in
+        // openzeppelin-contracts holds no initializable state at all — only the
+        // `__self` immutable — so there is nothing to initialize.
+        if (bridgeDomain_ == bytes32(0)) revert ZeroBridgeDomain();
+        bridgeDomain = bridgeDomain_;
+
         owner = msg.sender;
         emit OwnershipTransferred(address(0), msg.sender);
 
@@ -209,6 +307,49 @@ contract Gate {
         }
         threshold = threshold_;
         emit ThresholdSet(threshold_);
+    }
+
+    // ---------------------------------------------------------------------
+    // Upgrades (UUPS, owner-gated, behind a fixed timelock)
+    // ---------------------------------------------------------------------
+
+    /// @notice Queue `implementation` for installation once {UPGRADE_DELAY} has
+    ///         elapsed. Emits {UpgradeScheduled} so holders can see the pending
+    ///         change and withdraw before it lands.
+    /// @dev    Re-scheduling an implementation RESTARTS its delay rather than
+    ///         keeping the earliest deadline. Otherwise an owner could schedule
+    ///         an address once, wait out the window, and hold an indefinitely
+    ///         re-usable instant-upgrade right against it.
+    function scheduleUpgrade(address implementation) external onlyOwner {
+        if (implementation == address(0)) revert ZeroAddress();
+        uint256 readyAt = block.timestamp + UPGRADE_DELAY;
+        upgradeReadyAt[implementation] = readyAt;
+        emit UpgradeScheduled(implementation, readyAt);
+    }
+
+    /// @notice Drop a queued implementation. The guardian may do this as well as
+    ///         the owner: spotting a bad pending upgrade is incident response,
+    ///         and the guardian exists precisely to act fast there. Neither can
+    ///         *install* anything this way, so the worst case is a delay.
+    function cancelScheduledUpgrade(address implementation) external {
+        if (msg.sender != owner && msg.sender != guardian) revert NotAuthorizedToPause();
+        delete upgradeReadyAt[implementation];
+        emit UpgradeCancelled(implementation);
+    }
+
+    /// @dev The UUPS hook. Enforces owner + scheduled + matured, then BURNS the
+    ///      schedule so one approval installs exactly one implementation; without
+    ///      the delete, a rolled-back upgrade could be re-installed instantly.
+    ///
+    ///      Deliberately does NOT have a pause/emergency bypass. An upgrade that
+    ///      is urgent enough to skip the delay is indistinguishable on-chain from
+    ///      an owner takeover, which is the exact thing the delay defends against;
+    ///      genuine emergencies are served by {pause}, which is immediate.
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        uint256 readyAt = upgradeReadyAt[newImplementation];
+        if (readyAt == 0) revert UpgradeNotScheduled(newImplementation);
+        if (block.timestamp < readyAt) revert UpgradeNotReady(newImplementation, readyAt);
+        delete upgradeReadyAt[newImplementation];
     }
 
     // ---------------------------------------------------------------------
@@ -543,7 +684,7 @@ contract Gate {
         bytes calldata receiver,
         bytes calldata autoParams,
         bytes calldata nativeSender
-    ) external pure returns (bytes32) {
+    ) external view returns (bytes32) {
         return _idFor(
             debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver, autoParams, nativeSender
         );
@@ -562,14 +703,17 @@ contract Gate {
         bytes memory receiver,
         bytes memory autoParams,
         bytes memory nativeSender
-    ) internal pure returns (bytes32) {
+    ) internal view returns (bytes32) {
+        // `view`, not `pure`, only because of `bridgeDomain` — every id this gate
+        // computes is scoped to this deployment generation.
         if (autoParams.length == 0) {
             return BridgeHash.getSubmissionId(
-                debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver
+                bridgeDomain, debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver
             );
         }
         AutoParamsTo memory ap = abi.decode(autoParams, (AutoParamsTo));
         return BridgeHash.getSubmissionIdWithAuto(
+            bridgeDomain,
             debridgeId,
             amount,
             chainIdFrom,

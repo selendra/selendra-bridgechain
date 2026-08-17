@@ -16,6 +16,11 @@ use bridge_solana::SOLANA_CHAIN_ID;
 
 const EVM_CHAIN_ID: u64 = 1337;
 const AMOUNT: u64 = 1000;
+/// Deployment generation for the localnet mesh. This same value initializes the
+/// gate below AND goes into the submissionId, so the two cannot drift. A real
+/// deployment must use a fresh value per generation, or a superseded
+/// generation's attestations stay valid against the new gates.
+const LOCALNET_BRIDGE_DOMAIN: [u8; 32] = [0xD0; 32];
 
 fn validator(seed: u8) -> PrivateKeySigner {
     let mut key = [0u8; 32];
@@ -50,6 +55,7 @@ async fn main() {
 
     // The id the EVM gate emitted (chainFrom=EVM, chainTo=Solana), recomputed on chain.
     let id = hash::submission_id(
+        &LOCALNET_BRIDGE_DOMAIN,
         &debridge_id,
         &amount_word(AMOUNT as u128),
         EVM_CHAIN_ID,
@@ -67,6 +73,7 @@ async fn main() {
     sigs.sort_by_key(|s| recover_evm_address(&digest, s).unwrap());
 
     let init_ix = GateInstruction::Init(InitArgs {
+        bridge_domain: LOCALNET_BRIDGE_DOMAIN,
         validators: validators.clone(),
         threshold: 2,
         chain_id: SOLANA_CHAIN_ID,

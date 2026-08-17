@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
+import {deployTestGate, TEST_BRIDGE_DOMAIN} from "./helpers/TestGate.sol";
 import {TestToken} from "../src/TestToken.sol";
 import {BridgeHash} from "../src/BridgeHash.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
@@ -61,7 +62,7 @@ contract RefundTest is Test {
 
         // --- source chain ---
         vm.chainId(CHAIN_SRC);
-        srcGate = new Gate(validators, 1);
+        srcGate = deployTestGate(validators, 1);
         token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
 
@@ -75,7 +76,7 @@ contract RefundTest is Test {
 
         // --- destination chain ---
         vm.chainId(CHAIN_DST);
-        dstGate = new Gate(validators, 1);
+        dstGate = deployTestGate(validators, 1);
         // give the destination real liquidity, so a successful claim is possible
         // and "no double spend" is a meaningful claim rather than a side effect
         // of an empty vault
@@ -217,7 +218,7 @@ contract RefundTest is Test {
         // must demonstrably have been locked HERE.
         uint256 ghostNonce = 99;
         bytes32 ghostId = BridgeHash.getSubmissionId(
-            debridgeId, AMOUNT, CHAIN_SRC, CHAIN_DST, ghostNonce, receiver
+            TEST_BRIDGE_DOMAIN, debridgeId, AMOUNT, CHAIN_SRC, CHAIN_DST, ghostNonce, receiver
         );
 
         vm.expectRevert(abi.encodeWithSelector(Gate.NotSent.selector, ghostId));

@@ -43,6 +43,9 @@ use solana_gate::{
 const PROGRAM_ID: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const CHAIN_ID: u64 = 7565164; // Solana
 const DEST_CHAIN: u64 = 1337;
+/// Deployment generation shared by every gate these tests stand up. Non-zero,
+/// because `init` refuses a zero domain.
+const TEST_BRIDGE_DOMAIN: [u8; 32] = [0xD0; 32];
 
 fn config_pda() -> Pubkey {
     Pubkey::find_program_address(&[b"config"], &PROGRAM_ID).0
@@ -50,8 +53,17 @@ fn config_pda() -> Pubkey {
 
 /// Mirrors `config_space` in the program: the account is sized for the DECLARED
 /// capacities, which is the H-3 fix.
+///
+/// Kept in sync BY HAND, so any field added to `Config` must be added here too —
+/// a stale copy shows up as `AccountDataTooSmall` from whichever instruction
+/// first reserializes the config, not as a compile error.
 fn config_space(validators: u32, corridors: u32) -> usize {
-    32 + 32 + (4 + 20 * validators as usize) + 4 + 8 + 1 + 4 + 4 + (4 + 16 * corridors as usize)
+    32                                  // owner
+    + 32                                // bridge_domain
+    + 32                                // guardian
+    + (4 + 20 * validators as usize)    // validators
+    + 4 + 8 + 1 + 4 + 4                 // threshold, chain_id, paused, caps
+    + (4 + 16 * corridors as usize)     // nonce_to
 }
 
 /// A bank with the gate registered and its config PDA already initialized —
@@ -87,6 +99,7 @@ async fn setup_with_validators(
     // Exactly what a successful `init` leaves behind.
     let cfg = Config {
         owner: owner.pubkey(),
+        bridge_domain: TEST_BRIDGE_DOMAIN,
         guardian,
         validators,
         threshold,
@@ -397,6 +410,7 @@ fn submission_id_for(args: &CancelArgs, chain_id_to: u64) -> [u8; 32] {
     }
     keccak::hashv(&[
         &be32(1), // SUBMISSION_PREFIX
+        &TEST_BRIDGE_DOMAIN,
         &args.debridge_id,
         &be32(args.chain_id_from),
         &be32(chain_id_to),
@@ -763,6 +777,7 @@ async fn setup_with_asset(
 
     let cfg = Config {
         owner: owner.pubkey(),
+        bridge_domain: TEST_BRIDGE_DOMAIN,
         guardian: Pubkey::default(),
         validators,
         threshold,
@@ -896,6 +911,7 @@ fn claim_submission_id(args: &solana_gate::ClaimArgs) -> [u8; 32] {
     }
     keccak::hashv(&[
         &be32(1),
+        &TEST_BRIDGE_DOMAIN,
         &args.debridge_id,
         &be32(args.chain_id_from),
         &be32(CHAIN_ID),
@@ -916,6 +932,7 @@ fn send_submission_id(debridge_id: &[u8; 32], amount: u64, receiver: &[u8], nonc
     }
     keccak::hashv(&[
         &be32(1),
+        &TEST_BRIDGE_DOMAIN,
         debridge_id,
         &be32(CHAIN_ID),
         &be32(DEST_CHAIN),
@@ -1124,6 +1141,7 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
         );
         let cfg = Config {
             owner: owner.pubkey(),
+            bridge_domain: TEST_BRIDGE_DOMAIN,
             guardian: Pubkey::default(),
             validators: vec![[1u8; 20]],
             threshold: 1,
@@ -1210,6 +1228,7 @@ async fn a_registered_asset_cannot_be_repointed() {
     );
     let cfg = Config {
         owner: owner.pubkey(),
+        bridge_domain: TEST_BRIDGE_DOMAIN,
         guardian: Pubkey::default(),
         validators: vec![[1u8; 20]],
         threshold: 1,

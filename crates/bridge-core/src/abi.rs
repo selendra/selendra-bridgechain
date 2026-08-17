@@ -94,6 +94,12 @@ sol! {
             bytes[] signatures
         ) external returns (bytes32 submissionId);
 
+        /// The deployment generation this gate belongs to. Folded into every
+        /// submissionId, so an off-chain component MUST read it from the gate
+        /// rather than assume one: recomputing an id under the wrong domain
+        /// yields a different id, which is exactly how a stale generation's
+        /// attestations are rejected.
+        function bridgeDomain() external view returns (bytes32);
         function executed(bytes32 submissionId) external view returns (bool);
         /// The local ERC-20 backing a debridgeId on this chain, or address(0) if
         /// the asset isn't registered (a claim would revert with UnknownAsset).

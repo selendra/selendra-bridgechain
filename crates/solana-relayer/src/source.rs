@@ -83,9 +83,10 @@ fn next_page_action(
 /// Recompute a submissionId from a decoded event, exactly as the program did.
 ///
 /// This is THE check: we sign the id we derived, never the one we were handed.
-fn recompute(sent: &Sent) -> [u8; 32] {
+fn recompute(sent: &Sent, bridge_domain: &[u8; 32]) -> [u8; 32] {
     match sent.auto.as_ref() {
         None => submission_id(
+            bridge_domain,
             &sent.debridge_id,
             &amount_word(sent.amount as u128),
             sent.chain_id_from,
@@ -94,6 +95,7 @@ fn recompute(sent: &Sent) -> [u8; 32] {
             &sent.receiver,
         ),
         Some(auto) => submission_id_with_auto(
+            bridge_domain,
             &sent.debridge_id,
             &amount_word(sent.amount as u128),
             sent.chain_id_from,
@@ -125,6 +127,10 @@ fn evm_address(secret: &libsecp256k1::SecretKey) -> String {
 pub struct Scanner {
     rpc: RpcClient,
     program_id: Pubkey,
+    /// Deployment generation, read from the gate's `["config"]` PDA at startup
+    /// rather than configured — same reasoning as the EVM validator. Signing
+    /// under a stale domain would produce ids the gate never derives.
+    bridge_domain: [u8; 32],
     cfg: SourceChain,
     secret: libsecp256k1::SecretKey,
     signer_address: String,
@@ -151,6 +157,7 @@ impl Scanner {
             rpc: RpcClient::new_with_commitment(cfg.rpc.clone(), commitment),
             program_id: Pubkey::from_str(&cfg.program_id)
                 .map_err(|_| anyhow::anyhow!("program_id is not a valid pubkey"))?,
+            bridge_domain: [0u8; 32],
             cfg,
             secret,
             signer_address,
@@ -163,14 +170,58 @@ impl Scanner {
         &self.signer_address
     }
 
+    /// Read `bridge_domain` out of the gate's `["config"]` PDA.
+    ///
+    /// Borsh lays `Config` out in declaration order with no header, so the field
+    /// sits at a fixed offset: `owner(32) | bridge_domain(32) | guardian(32) | …`.
+    /// Slicing rather than deserializing keeps this crate free of a dependency on
+    /// the program crate — at the cost that REORDERING `Config`'s first fields
+    /// silently changes what is read here. The owner check below is the guard
+    /// that at least proves we are reading the gate's own account.
+    async fn load_bridge_domain(&mut self) -> anyhow::Result<()> {
+        let (config_pda, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
+        let account = self
+            .rpc
+            .get_account(&config_pda)
+            .await
+            .with_context(|| format!("reading gate config PDA {config_pda}"))?;
+        anyhow::ensure!(
+            account.owner == self.program_id,
+            "config PDA {config_pda} is owned by {}, not the gate program",
+            account.owner
+        );
+        let domain: [u8; 32] = account
+            .data
+            .get(32..64)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("config account is too short to hold a bridge_domain"))?;
+        anyhow::ensure!(
+            domain != [0u8; 32],
+            "gate reports a zero bridge_domain — it predates the deployment-domain fix and \
+             its attestations would be replayable across deployments"
+        );
+        self.bridge_domain = domain;
+        Ok(())
+    }
+
     /// Poll forever. Transient RPC failures back off and retry rather than kill
     /// the loop; a batch that fails to store leaves the cursor put so the same
     /// range is re-scanned (the store's upsert is idempotent).
     pub async fn run(mut self) -> anyhow::Result<()> {
         let retry = Duration::from_millis(self.cfg.poll_interval_ms.max(500));
+
+        // Before signing anything, learn which deployment generation this gate
+        // belongs to. Retried rather than fatal so a cold RPC doesn't kill the
+        // process, but the loop below is never entered with a zero domain.
+        while let Err(e) = self.load_bridge_domain().await {
+            warn!(error = %e, program = %self.program_id, "reading the gate's bridge_domain failed; retrying");
+            tokio::time::sleep(retry).await;
+        }
+
         info!(
             validator = %self.signer_address,
             program = %self.program_id,
+            bridge_domain = %hex::encode(self.bridge_domain),
             commitment = %self.cfg.commitment,
             resume_after = ?self.cursor.last_signature,
             "solana source scanner started"
@@ -326,7 +377,7 @@ impl Scanner {
     /// unauthentic and skipped; `Ok(true)` means it was signed and stored.
     async fn handle(&self, event: &SentEvent, sent: &Sent, tx: &str) -> anyhow::Result<bool> {
         // Never sign an id we cannot reproduce ourselves.
-        let computed = recompute(sent);
+        let computed = recompute(sent, &self.bridge_domain);
         if computed != sent.submission_id {
             anyhow::bail!(
                 "submissionId MISMATCH in tx {tx}: emitted {} computed {} — refusing to sign",
@@ -442,6 +493,10 @@ impl Scanner {
 
 #[cfg(test)]
 mod tests {
+    /// Any non-zero domain: these tests assert recompute is SELF-consistent and
+    /// detects tampering, neither of which depends on the specific value.
+    const TEST_DOMAIN: [u8; 32] = [0xD0; 32];
+
     use super::*;
     use bridge_solana::relayer::{sent_event_to_program_data_line, SentEvent};
 
@@ -457,7 +512,7 @@ mod tests {
             native_sender: vec![0x33; 32],
             auto: None,
         };
-        s.submission_id = recompute(&s);
+        s.submission_id = recompute(&s, &TEST_DOMAIN);
         s
     }
 
@@ -472,7 +527,7 @@ mod tests {
             .expect("decodes")
             .to_sent()
             .expect("converts");
-        assert_eq!(recompute(&parsed), sent.submission_id, "id must survive the round trip");
+        assert_eq!(recompute(&parsed, &TEST_DOMAIN), sent.submission_id, "id must survive the round trip");
     }
 
     /// C-1, at the layer the scanner actually reads.
@@ -496,7 +551,7 @@ mod tests {
         let mut forged = sample();
         forged.amount = 1_000_000_000_000;
         forged.receiver = vec![0xAA; 20]; // the attacker's EVM address
-        forged.submission_id = recompute(&forged);
+        forged.submission_id = recompute(&forged, &TEST_DOMAIN);
 
         let line = sent_event_to_program_data_line(&SentEvent::from_sent(&forged, [0x55; 32]));
         let logs: Vec<String> = vec![
@@ -507,7 +562,7 @@ mod tests {
 
         // Pre-fix behaviour: the line parses, and recompute agrees with it.
         let decoded = parse_sent_event_line(&line).unwrap().unwrap().to_sent().unwrap();
-        assert_eq!(recompute(&decoded), decoded.submission_id, "the forgery is self-consistent");
+        assert_eq!(recompute(&decoded, &TEST_DOMAIN), decoded.submission_id, "the forgery is self-consistent");
 
         // Post-fix: it is never attributed to the gate, so it is never parsed.
         assert!(
@@ -522,7 +577,7 @@ mod tests {
     fn a_tampered_event_fails_recomputation() {
         let mut sent = sample();
         sent.amount += 1; // the classic: inflate the payout
-        assert_ne!(recompute(&sent), sent.submission_id, "tampering must be detectable");
+        assert_ne!(recompute(&sent, &TEST_DOMAIN), sent.submission_id, "tampering must be detectable");
     }
 
     /// THE cursor bug, stated as a rule.

@@ -55,6 +55,8 @@ impl DbError {
 #[derive(FromRow)]
 struct SubmissionRow {
     submission_id: String,
+    /// NULL for rows predating the deployment domain — see the schema comment.
+    bridge_domain: Option<String>,
     debridge_id: String,
     amount: String,
     chain_id_from: i64,
@@ -149,6 +151,7 @@ impl SubmissionRow {
     fn into_record(self, sigs: Attestations) -> SubmissionRecord {
         SubmissionRecord {
             submission_id: self.submission_id,
+            bridge_domain: self.bridge_domain.unwrap_or_default(),
             debridge_id: self.debridge_id,
             amount: self.amount,
             chain_id_from: self.chain_id_from as u64,
@@ -330,13 +333,14 @@ impl Db {
             // conflict path only ever backfills `token` (never other fields).
             sqlx::query(
                 "INSERT INTO submissions \
-                 (submission_id, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
+                 (submission_id, bridge_domain, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
                   receiver, auto_params, native_sender, token) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
                  ON CONFLICT (submission_id) DO UPDATE \
                    SET token = COALESCE(submissions.token, EXCLUDED.token)",
             )
             .bind(&id)
+            .bind(record.bridge_domain.to_ascii_lowercase())
             .bind(record.debridge_id.to_ascii_lowercase())
             .bind(&record.amount)
             .bind(record.chain_id_from as i64)
@@ -711,12 +715,13 @@ impl Db {
         let token = Some(record.token.to_ascii_lowercase()).filter(|t| !t.is_empty());
         sqlx::query(
             "INSERT INTO submissions \
-             (submission_id, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
+             (submission_id, bridge_domain, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
               receiver, auto_params, native_sender, token) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
              ON CONFLICT (submission_id) DO UPDATE SET token = COALESCE(submissions.token, EXCLUDED.token)",
         )
         .bind(&id)
+        .bind(record.bridge_domain.to_ascii_lowercase())
         .bind(record.debridge_id.to_ascii_lowercase())
         .bind(&record.amount)
         .bind(record.chain_id_from as i64)

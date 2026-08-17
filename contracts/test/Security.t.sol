@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
+import {deployTestGate, initTestGate, TEST_BRIDGE_DOMAIN} from "./helpers/TestGate.sol";
 import {TestToken} from "../src/TestToken.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
@@ -60,27 +61,30 @@ contract SecurityTest is Test {
     }
 
     function setUp() public {
-        gate = new Gate(_validators(3), 2);
+        gate = deployTestGate(_validators(3), 2);
         token = new TestToken("Test", "TST");
     }
 
     // ---- C1: threshold bounds ----
 
     function test_Constructor_RevertsZeroThreshold() public {
+        Gate impl = new Gate();
         vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 0, 3));
-        new Gate(_validators(3), 0);
+        initTestGate(impl, _validators(3), 0);
     }
 
     function test_Constructor_RevertsThresholdAboveValidatorCount() public {
+        Gate impl = new Gate();
         vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 4, 3));
-        new Gate(_validators(3), 4);
+        initTestGate(impl, _validators(3), 4);
     }
 
     function test_Constructor_RevertsZeroValidator() public {
         address[] memory vs = new address[](1);
         vs[0] = address(0);
+        Gate impl = new Gate();
         vm.expectRevert(Gate.ZeroValidator.selector);
-        new Gate(vs, 1);
+        initTestGate(impl, vs, 1);
     }
 
     function test_SetThreshold_RevertsZero() public {
@@ -109,8 +113,9 @@ contract SecurityTest is Test {
         // pass with an empty signature set. Both entry points revert:
         vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 0, 3));
         gate.setThreshold(0);
+        Gate impl = new Gate();
         vm.expectRevert(abi.encodeWithSelector(Gate.InvalidThreshold.selector, 0, 1));
-        new Gate(_validators(1), 0);
+        initTestGate(impl, _validators(1), 0);
     }
 
     // ---- C2 / M8: a token that reenters send() is rejected ----

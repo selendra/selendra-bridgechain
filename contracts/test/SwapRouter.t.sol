@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
+import {deployTestGate, TEST_BRIDGE_DOMAIN} from "./helpers/TestGate.sol";
 import {SwapPool} from "../src/SwapPool.sol";
 import {SwapRouter} from "../src/SwapRouter.sol";
 import {BridgeHash} from "../src/BridgeHash.sol";
@@ -69,7 +70,7 @@ contract SwapRouterTest is Test {
 
         // --- chain A ---
         vm.chainId(CHAIN_A);
-        gateA = new Gate(vals, 1);
+        gateA = deployTestGate(vals, 1);
         usdA = new MockToken("USD A", "USDa", 6);
         weth = new MockToken("Wrapped Ether", "WETH", 18);
         poolA = new SwapPool(address(usdA), DEVIATION_BPS);
@@ -80,7 +81,7 @@ contract SwapRouterTest is Test {
 
         // --- chain B ---
         vm.chainId(CHAIN_B);
-        gateB = new Gate(vals, 1);
+        gateB = deployTestGate(vals, 1);
         usdB = new MockToken("USD B", "USDb", 6);
         tt = new MockToken("Test Token", "TT", 18);
         poolB = new SwapPool(address(usdB), DEVIATION_BPS);

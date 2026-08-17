@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {Gate} from "../src/Gate.sol";
+import {GateDeployer} from "../src/GateDeployer.sol";
 
 /// @notice Production Gate deployment with enforced safety parameters.
 ///
@@ -36,6 +37,11 @@ contract DeployProd is Script {
         uint256 threshold;
         address guardian;
         address owner;
+        /// @dev The mesh-wide deployment domain. EVERY gate in this generation —
+        ///      every EVM chain and the Solana program — must be given the same
+        ///      value, and a NEW generation must be given a new one, or the old
+        ///      generation's validator attestations replay against these gates.
+        bytes32 bridgeDomain;
     }
 
     error WrongChain(uint256 got, uint256 want);
@@ -49,6 +55,9 @@ contract DeployProd is Script {
     ///      still passed against the (longer) supplied array.
     error DuplicateValidator(address validator);
     error ZeroValidatorAddress();
+    /// @dev BRIDGE_DOMAIN was unset. Refused rather than defaulted: a default
+    ///      shared by every deployment is the same as having no domain at all.
+    error ZeroBridgeDomain();
 
     function run() external {
         Params memory p = Params({
@@ -56,7 +65,8 @@ contract DeployProd is Script {
             validators: vm.envAddress("VALIDATORS", ","),
             threshold: vm.envUint("THRESHOLD"),
             guardian: vm.envAddress("GUARDIAN"),
-            owner: vm.envAddress("OWNER")
+            owner: vm.envAddress("OWNER"),
+            bridgeDomain: vm.envBytes32("BRIDGE_DOMAIN")
         });
 
         vm.startBroadcast();
@@ -97,12 +107,15 @@ contract DeployProd is Script {
             revert WeakThreshold(p.threshold, p.validators.length);
         }
 
-        gate = new Gate(p.validators, p.threshold);
+        if (p.bridgeDomain == bytes32(0)) revert ZeroBridgeDomain();
+
+        gate = GateDeployer.deploy(p.validators, p.threshold, p.bridgeDomain);
         gate.setGuardian(p.guardian);
         gate.transferOwnership(p.owner); // two-step: p.owner must acceptOwnership()
 
         // --- post-deploy assertions (revert the deployment if any fails) ---
         require(gate.threshold() == p.threshold, "post: threshold mismatch");
+        require(gate.bridgeDomain() == p.bridgeDomain, "post: bridgeDomain mismatch");
         require(gate.guardian() == p.guardian, "post: guardian mismatch");
         require(gate.pendingOwner() == p.owner, "post: pendingOwner mismatch");
         require(gate.validatorCount() >= p.threshold, "post: validatorCount < threshold");

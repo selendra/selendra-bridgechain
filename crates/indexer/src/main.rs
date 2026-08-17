@@ -23,7 +23,7 @@ mod config;
 use std::str::FromStr;
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use alloy_sol_types::SolEvent;
@@ -104,6 +104,28 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
         }
     }
 
+    // Deployment generation of this chain's gate, read from the contract. The
+    // indexer recomputes submissionIds through `observe_submission`, so a wrong
+    // domain would make every observed transfer fail its id check. Zero when no
+    // gate is configured, which is fine: `handle_gate_log` never runs then.
+    let gate_domain: B256 = match gate {
+        None => B256::ZERO,
+        Some(addr) => loop {
+            match Gate::new(addr, &provider).bridgeDomain().call().await {
+                Ok(d) => break d,
+                Err(e) => {
+                    warn!(
+                        chain_id = chain.chain_id,
+                        gate = %addr,
+                        error = %e,
+                        "reading Gate.bridgeDomain() failed; retrying"
+                    );
+                    tokio::time::sleep(retry).await;
+                }
+            }
+        },
+    };
+
     let mut from_block = match db.get_cursor(chain.chain_id).await {
         Ok(Some(b)) => b + 1,
         Ok(None) => chain.start_block,
@@ -142,7 +164,11 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
             // whatever events it held (history, a Claimed/Cancelled transition).
             let mut all_ok = true;
             if let Some(addr) = gate {
-                if let Err(e) = scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handle_gate_log).await {
+                let handler =
+                    |db, cid, log| handle_gate_log(db, cid, log, gate_domain);
+                if let Err(e) =
+                    scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handler).await
+                {
                     warn!(chain_id = chain.chain_id, error = %e, "gate scan failed; will retry same range next tick");
                     all_ok = false;
                 }
@@ -207,7 +233,12 @@ where
     Ok(())
 }
 
-async fn handle_gate_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()> {
+async fn handle_gate_log(
+    db: Db,
+    chain_id: u64,
+    log: Log,
+    bridge_domain: B256,
+) -> anyhow::Result<()> {
     if let Ok(decoded) = Gate::Sent::decode_log(&log.inner) {
         let ev = &decoded.data;
         // Reject (skip) an event whose chainId/nonce overflows u64 rather than
@@ -227,6 +258,7 @@ async fn handle_gate_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()> 
             };
         let record = SubmissionRecord {
             submission_id: format!("{:#x}", ev.submissionId),
+            bridge_domain: format!("{bridge_domain:#x}"),
             debridge_id: format!("{:#x}", ev.debridgeId),
             amount: ev.amount.to_string(),
             chain_id_from,

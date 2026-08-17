@@ -150,10 +150,34 @@ async fn scan_source(
         }
     };
 
+    // The deployment generation, read FROM THE GATE rather than from config.
+    //
+    // Every submissionId is recomputed under this value, so a wrong one means
+    // every recomputed id mismatches the emitted one and this validator signs
+    // nothing — safe, but silent. Sourcing it from the contract removes the
+    // possibility of that misconfiguration entirely, and costs one call at
+    // startup. Retry rather than exit: a momentarily flaky RPC must not kill the
+    // scan loop for this chain (and, per main's isolation, never its siblings).
+    let bridge_domain: B256 = loop {
+        match Gate::new(gate, failover.active_provider()).bridgeDomain().call().await {
+            Ok(d) => break d,
+            Err(e) => {
+                warn!(
+                    chain_id = source.chain_id,
+                    gate = %gate,
+                    error = %e,
+                    "reading Gate.bridgeDomain() failed; retrying (is this gate pre-domain?)"
+                );
+                tokio::time::sleep(retry).await;
+            }
+        }
+    };
+
     let resume_from = runtime.lock().await.next_block();
     info!(
         validator = %signer_addr,
         gate = %gate,
+        bridge_domain = %bridge_domain,
         chain_id = source.chain_id,
         rpc = %failover.active_url(),
         endpoints = endpoints.len(),
@@ -224,7 +248,9 @@ async fn scan_source(
             let mut paused = false;
             let mut batch_failed = false;
             for log in &logs {
-                match handle_log(&signer, signer_addr, &sink, &runtime, log, allowlist.as_ref()).await {
+                match handle_log(&signer, signer_addr, &sink, &runtime, log, allowlist.as_ref(), bridge_domain)
+                    .await
+                {
                     Ok(true) => {} // processed
                     Ok(false) => {
                         // a nonce anomaly paused the scanner; stop this batch
@@ -269,6 +295,7 @@ async fn handle_log(
     runtime: &Arc<Mutex<Runtime>>,
     log: &alloy::rpc::types::Log,
     allowlist: Option<&Allowlist>,
+    bridge_domain: B256,
 ) -> anyhow::Result<bool> {
     let decoded = Gate::Sent::decode_log(&log.inner).context("decode Sent")?;
     let ev = &decoded.data;
@@ -321,7 +348,7 @@ async fn handle_log(
     }
 
     // Independently recompute the submissionId; never sign one we can't reproduce.
-    let submission = submission_from_event(ev);
+    let submission = submission_from_event(ev, bridge_domain);
     let computed_id = submission.compute_id();
     if computed_id != emitted_id {
         warn!(
@@ -360,6 +387,7 @@ async fn handle_log(
 
     let record = SubmissionRecord {
         submission_id: format!("{emitted_id:#x}"),
+        bridge_domain: format!("{bridge_domain:#x}"),
         debridge_id: format!("{:#x}", ev.debridgeId),
         amount: ev.amount.to_string(),
         chain_id_from: chain_from,
@@ -392,7 +420,7 @@ async fn handle_log(
 }
 
 /// Build our independent `Submission` from a decoded `Sent` event.
-fn submission_from_event(ev: &Gate::Sent) -> Submission {
+fn submission_from_event(ev: &Gate::Sent, bridge_domain: B256) -> Submission {
     let auto = if ev.autoParams.is_empty() {
         None
     } else {
@@ -409,6 +437,7 @@ fn submission_from_event(ev: &Gate::Sent) -> Submission {
     };
 
     Submission {
+        bridge_domain,
         debridge_id: ev.debridgeId,
         amount: ev.amount,
         chain_id_from: ev.chainIdFrom,

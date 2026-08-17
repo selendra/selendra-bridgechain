@@ -25,6 +25,8 @@ struct Fixtures {
 #[derive(Debug, Deserialize)]
 struct Fixture {
     name: String,
+    #[serde(rename = "bridgeDomain")]
+    bridge_domain: String,
     #[serde(rename = "debridgeId")]
     debridge_id: String,
     amount: String,
@@ -77,6 +79,7 @@ fn solana_hash_matches_solidity_fixtures_and_bridge_core() {
     assert!(parsed.fixtures.len() >= 3, "expected >= 3 fixtures");
 
     for f in &parsed.fixtures {
+        let bridge_domain = arr32(&f.bridge_domain);
         let debridge_id = arr32(&f.debridge_id);
         let amount = word(&f.amount);
         let receiver = bytes(&f.receiver);
@@ -91,17 +94,31 @@ fn solana_hash_matches_solidity_fixtures_and_bridge_core() {
                 native_sender: bytes(&f.native_sender),
             };
             hash::submission_id_with_auto(
-                &debridge_id, &amount, f.chain_id_from, f.chain_id_to, f.nonce, &receiver, &auto,
+                &bridge_domain,
+                &debridge_id,
+                &amount,
+                f.chain_id_from,
+                f.chain_id_to,
+                f.nonce,
+                &receiver,
+                &auto,
             )
         } else {
             hash::submission_id(
-                &debridge_id, &amount, f.chain_id_from, f.chain_id_to, f.nonce, &receiver,
+                &bridge_domain,
+                &debridge_id,
+                &amount,
+                f.chain_id_from,
+                f.chain_id_to,
+                f.nonce,
+                &receiver,
             )
         };
 
         // EVM-side reference (bridge-core, alloy U256).
         let core_id = if f.has_auto {
             bridge_core::submission_id_with_auto(
+                bridge_domain.into(),
                 debridge_id.into(),
                 U256::from_str_radix(&f.amount, 10).unwrap(),
                 U256::from(f.chain_id_from),
@@ -118,6 +135,7 @@ fn solana_hash_matches_solidity_fixtures_and_bridge_core() {
             )
         } else {
             bridge_core::submission_id(
+                bridge_domain.into(),
                 debridge_id.into(),
                 U256::from_str_radix(&f.amount, 10).unwrap(),
                 U256::from(f.chain_id_from),

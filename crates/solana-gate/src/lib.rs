@@ -90,6 +90,8 @@ pub struct AutoParamsWire {
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct InitArgs {
+    /// See [`Config::bridge_domain`]. Must match the EVM gates of this mesh.
+    pub bridge_domain: [u8; 32],
     pub validators: Vec<[u8; 20]>,
     pub threshold: u32,
     pub chain_id: u64,
@@ -199,6 +201,12 @@ pub struct RefundArgs {
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default)]
 pub struct Config {
     pub owner: Pubkey,
+    /// Deployment generation, folded into every submissionId. MUST equal the
+    /// `bridgeDomain()` the EVM gates of this mesh were initialized with, or no
+    /// id ever agrees across chains and nothing bridges. Set once at init and
+    /// never mutated: rotating it belongs to a new deployment, not to a running
+    /// one, and changing it would strand every in-flight transfer.
+    pub bridge_domain: [u8; 32],
     /// May pause but not unpause. `Pubkey::default()` == none appointed.
     pub guardian: Pubkey,
     pub validators: Vec<[u8; 20]>,
@@ -226,6 +234,7 @@ pub struct Config {
 /// vectors are capped.
 fn config_space(validators: u32, corridors: u32) -> usize {
     32                              // owner
+    + 32                            // bridge_domain
     + 32                            // guardian
     + 4 + 20 * validators as usize  // validators: Vec<[u8; 20]>
     + 4                             // threshold
@@ -770,6 +779,12 @@ pub enum GateError {
     /// Mirrors `Gate.sol`'s `LocalTokenAlreadySet`.
     #[error("asset already registered for this debridgeId (bindings are write-once)")]
     AssetAlreadyRegistered,
+    /// H-3: `init` was given a zero `bridge_domain`. Appended LAST on purpose —
+    /// the discriminant IS the on-chain `Custom` code, so inserting anywhere else
+    /// silently renumbers every error above it and breaks clients that match on
+    /// the numeric code.
+    #[error("bridge_domain must be non-zero")]
+    ZeroBridgeDomain,
 }
 
 impl From<GateError> for ProgramError {
@@ -796,6 +811,7 @@ fn amount_word(v: u64) -> [u8; 32] {
 
 #[allow(clippy::too_many_arguments)]
 fn submission_id(
+    bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
     amount: u64,
     chain_id_from: u64,
@@ -810,8 +826,8 @@ fn submission_id(
     let ct = be32(chain_id_to);
     let amt = amount_word(amount);
     let nz = be32(nonce);
-    // packedSubmission = prefix|debridgeId|chainIdFrom|chainIdTo|amount|receiver|nonce
-    let base: &[&[u8]] = &[&prefix, debridge_id, &cf, &ct, &amt, receiver, &nz];
+    // packedSubmission = prefix|bridgeDomain|debridgeId|chainIdFrom|chainIdTo|amount|receiver|nonce
+    let base: &[&[u8]] = &[&prefix, bridge_domain, debridge_id, &cf, &ct, &amt, receiver, &nz];
     match auto {
         None => keccak::hashv(base).to_bytes(),
         Some(a) => {
@@ -823,7 +839,8 @@ fn submission_id(
             let ns = keccak::hashv(&[native_sender]).to_bytes();
             // keccak(packedSubmission || fee || flags || keccak(fallback) || keccak(data) || keccak(nativeSender))
             keccak::hashv(&[
-                &prefix, debridge_id, &cf, &ct, &amt, receiver, &nz, &fee, &flags, &fb, &data, &ns,
+                &prefix, bridge_domain, debridge_id, &cf, &ct, &amt, receiver, &nz, &fee, &flags,
+                &fb, &data, &ns,
             ])
             .to_bytes()
         }
@@ -965,6 +982,7 @@ fn process_cancel(program_id: &Pubkey, accounts: &[AccountInfo], args: CancelArg
     }
 
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         args.chain_id_from,
@@ -1039,6 +1057,7 @@ fn process_refund(program_id: &Pubkey, accounts: &[AccountInfo], args: RefundArg
     // exactly the users an incident stranded.
 
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         cfg.chain_id,
@@ -1164,8 +1183,17 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
         &[&[b"config", &[bump]]],
     )?;
 
+    // A zero domain is refused for the same reason the EVM gate refuses it: it is
+    // what an unset field looks like, so accepting it would let a whole mesh
+    // silently agree on "no generation" and stay replayable across redeploys.
+    if args.bridge_domain == [0u8; 32] {
+        msg!("bridge_domain must be non-zero");
+        return Err(GateError::ZeroBridgeDomain.into());
+    }
+
     let cfg = Config {
         owner: *payer.key,
+        bridge_domain: args.bridge_domain,
         guardian: args.guardian,
         validators: args.validators,
         threshold: args.threshold,
@@ -1334,6 +1362,7 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     let nonce = cfg.nonce(args.chain_id_to);
     let native_sender = payer.key.to_bytes();
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         cfg.chain_id,
@@ -1438,6 +1467,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     verify_asset_binding(&asset, token_program.key, vault.key, &vault_mint, &recv_mint)?;
 
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         args.chain_id_from,
@@ -1995,6 +2025,7 @@ mod c1_tests {
         for (v, c) in [(3u32, 8u32), (7, 32), (22, 4), (1, 1)] {
             let cfg = Config {
                 owner: Pubkey::new_unique(),
+                bridge_domain: [0xD0; 32],
                 guardian: Pubkey::new_unique(),
                 validators: (0..v).map(|i| [i as u8; 20]).collect(),
                 threshold: 1,
@@ -2141,6 +2172,7 @@ mod c1_tests {
     fn cfg_with_validators(n: usize) -> Config {
         Config {
             owner: Pubkey::new_unique(),
+            bridge_domain: [0xD0; 32],
             guardian: Pubkey::default(),
             validators: (0..n).map(|i| [i as u8; 20]).collect(),
             threshold: 2,

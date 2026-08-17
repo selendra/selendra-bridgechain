@@ -60,7 +60,7 @@ DEPLOY_TOKENS="${DEPLOY_TOKENS:-true}"; DEPLOY_BRIDGE="${DEPLOY_BRIDGE:-true}"; 
 # ---------------------------------------------------------------------------
 # parse CHAINS -> CID CNAME CRPC CGATE   (gate optional 4th field)
 # ---------------------------------------------------------------------------
-CID=() CNAME=() CRPC=() CGATE=()
+CID=() CNAME=() CRPC=() CGATE=() CIMPL=()
 declare -A CIDX                                   # chain_id -> array index
 for entry in "${CHAINS[@]}"; do
   IFS='|' read -r cid cname crpc cgate <<<"$entry"
@@ -240,12 +240,37 @@ for sym in "${ASYMS[@]}"; do
 done
 
 # --- 4b. bridge: deploy Gates, then register + fund every asset's mesh ---
+#
+# The Gate is UUPS, so "deploying a gate" is two contracts: an implementation
+# (never initialized, holds no state) and an ERC1967 proxy that IS the gate. The
+# proxy address is what every config, validator and keeper must point at; the
+# implementation address is an internal detail that changes on every upgrade.
+#
+# `initialize` runs INSIDE the proxy's constructor via the initdata below, so
+# there is no window in which an uninitialized proxy exists on-chain for someone
+# else to claim ownership of.
 if [[ "$DEPLOY_BRIDGE" == "true" ]]; then
-  say "deploying Gates (validators=${#VALIDATOR_ADDRS[@]}, threshold=$THRESHOLD)"
+  # Every gate in one mesh shares one domain, and a NEW deployment needs a NEW
+  # one — that is the whole mechanism that stops the previous deployment's
+  # validator signatures from being replayed against these fresh gates. Derived
+  # from the validator set + threshold + a per-run salt so two runs never collide.
+  if [[ -z "${BRIDGE_DOMAIN:-}" ]]; then
+    BRIDGE_DOMAIN=$(cast keccak "$(printf 'selendra-bridge|%s|%s|%s' \
+      "$vlist" "$THRESHOLD" "$(date +%s)-$$")")
+    info "generated BRIDGE_DOMAIN=$BRIDGE_DOMAIN (set it in the config to pin one)"
+  fi
+  [[ "$BRIDGE_DOMAIN" =~ ^0x[0-9a-fA-F]{64}$ ]] || die "BRIDGE_DOMAIN must be 0x + 64 hex chars"
+  [[ "$BRIDGE_DOMAIN" =~ ^0x0{64}$ ]] && die "BRIDGE_DOMAIN must not be zero"
+
+  say "deploying Gates (validators=${#VALIDATOR_ADDRS[@]}, threshold=$THRESHOLD, domain=${BRIDGE_DOMAIN:0:12}…)"
+  initdata=$(cast calldata "initialize(address[],uint256,bytes32)" "$vlist" "$THRESHOLD" "$BRIDGE_DOMAIN")
   for i in "${!CID[@]}"; do
-    CGATE[$i]=$(fc src/Gate.sol:Gate "${CRPC[$i]}" --constructor-args "$vlist" "$THRESHOLD")
-    [[ "${CGATE[$i]}" =~ ^0x ]] || die "gate deploy failed on chain ${CID[$i]}"
-    info "${CNAME[$i]} gate=${CGATE[$i]}"
+    impl=$(fc src/Gate.sol:Gate "${CRPC[$i]}")
+    [[ "$impl" =~ ^0x ]] || die "gate implementation deploy failed on chain ${CID[$i]}"
+    CGATE[$i]=$(fc src/GateProxy.sol:GateProxy "${CRPC[$i]}" --constructor-args "$impl" "$initdata")
+    [[ "${CGATE[$i]}" =~ ^0x ]] || die "gate proxy deploy failed on chain ${CID[$i]}"
+    CIMPL[$i]="$impl"
+    info "${CNAME[$i]} gate=${CGATE[$i]} (implementation $impl)"
   done
 else
   for i in "${!CID[@]}"; do
@@ -324,7 +349,11 @@ done
 
 # persist addresses for the summary / debugging
 : > "$ADDR_ENV"
-for i in "${!CID[@]}"; do echo "CHAIN_${CID[$i]}_GATE=${CGATE[$i]}" >> "$ADDR_ENV"; done
+for i in "${!CID[@]}"; do
+  echo "CHAIN_${CID[$i]}_GATE=${CGATE[$i]}" >> "$ADDR_ENV"
+  [[ -n "${CIMPL[$i]:-}" ]] && echo "CHAIN_${CID[$i]}_GATE_IMPL=${CIMPL[$i]}" >> "$ADDR_ENV"
+done
+echo "BRIDGE_DOMAIN=${BRIDGE_DOMAIN:-}" >> "$ADDR_ENV"
 for sym in "${ASYMS[@]}"; do
   for cid in ${ACHAINS[$sym]}; do echo "TOKEN_${sym}_${cid}=${ATOKEN[$sym|$cid]}" >> "$ADDR_ENV"; done
 done
