@@ -108,6 +108,14 @@ impl Failover {
         ))
     }
 
+    /// A clone of the currently-active provider, for one-off contract reads that
+    /// do not warrant a dedicated failover wrapper (e.g. the startup read of
+    /// `Gate.bridgeDomain()`). Callers own the retry: this hands back whichever
+    /// endpoint is active right now and does not rotate on failure.
+    pub fn active_provider(&self) -> DynProvider {
+        self.endpoints[self.active].provider.clone()
+    }
+
     pub async fn get_block_number(&mut self) -> anyhow::Result<u64> {
         self.with_failover("get_block_number", |p| async move { p.get_block_number().await })
             .await

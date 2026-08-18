@@ -30,12 +30,23 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RefundConfig {
-    /// Advisory only, surfaced in the startup log. The unclaimed-timeout that
-    /// actually gates cancel attestations is enforced upstream by the indexer's
-    /// eligibility sweep (`indexer.refund_timeout_secs`), which flips a transfer
-    /// to `refund_status = 'eligible'`; this loop only ever sees candidates the
-    /// store has already nominated. Kept so the intended window is visible in one
-    /// place; set it to match the indexer's value.
+    /// **ENFORCED HERE — finding H-2.** How long a transfer must sit unclaimed
+    /// before this validator will attest a cancel.
+    ///
+    /// This used to be advisory, with the real gate being the indexer's
+    /// eligibility sweep flipping `refund_status = 'eligible'` in Postgres. That
+    /// put the entire unclaimed-timeout on a database column no validator
+    /// verified: a wrong `created_at`, clock skew, or DB write access nominated
+    /// healthy in-flight transfers, and the validators attested cancels for them
+    /// within one poll interval — irreversibly foreclosing payouts the keeper was
+    /// still about to deliver.
+    ///
+    /// The loop now establishes the age itself, from the source chain, by reading
+    /// `sentBy(id)` at a block whose own timestamp is at least this many seconds
+    /// behind the chain head. The store still nominates candidates; it no longer
+    /// decides when one is old enough. Set it to match the indexer's
+    /// `refund_timeout_secs` so the two agree on the intended window — but the
+    /// value here is the one that binds.
     #[serde(default = "default_refund_timeout")]
     pub timeout_secs: i64,
     #[serde(default = "default_refund_interval")]

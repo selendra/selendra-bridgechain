@@ -24,6 +24,10 @@ use bridge_solana::verify::{eth_signed_digest, recover_evm_address, verify_thres
 use bridge_solana::SOLANA_CHAIN_ID;
 use common::Validator;
 
+/// One deployment generation shared by the modelled EVM gate and Solana gate —
+/// which is the point: an id only agrees across the two when the domain does.
+const MESH_DOMAIN: [u8; 32] = [0xD0; 32];
+
 const EVM_CHAIN_ID: u64 = 1337;
 
 /// Sort signatures by recovered signer, strictly ascending — the order the gate
@@ -47,7 +51,7 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
     let addrs: Vec<[u8; 20]> = vs.iter().map(|v| v.address()).collect();
     let set = addrs.clone();
 
-    let mut gate = SolanaGate::new(SOLANA_CHAIN_ID, &addrs, 2);
+    let mut gate = SolanaGate::new(SOLANA_CHAIN_ID, MESH_DOMAIN, &addrs, 2);
 
     // Register the bridged asset and pre-fund the Solana vault (target-side liquidity).
     let token = [0xAB; 20];
@@ -63,6 +67,7 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
 
     // The id the EVM Gate.sol would emit (bridge-core == Solidity, proven by fixtures).
     let id = bridge_core::submission_id(
+        MESH_DOMAIN.into(),
         debridge_id.into(),
         U256::from(amount),
         U256::from(EVM_CHAIN_ID),
@@ -170,7 +175,7 @@ async fn solana_to_evm_send_scan_and_evm_verification() {
     let threshold = 2u32;
 
     // A Solana gate that also lets users send SPL out to EVM.
-    let mut gate = SolanaGate::new(SOLANA_CHAIN_ID, &addrs, threshold);
+    let mut gate = SolanaGate::new(SOLANA_CHAIN_ID, MESH_DOMAIN, &addrs, threshold);
     let token = [0xAB; 20];
     let debridge_id = evm_token_debridge_id(token);
     gate.register_asset(debridge_id, [0x55; 32], 0);
@@ -206,6 +211,7 @@ async fn solana_to_evm_send_scan_and_evm_verification() {
     // Independent recompute (validator never trusts the emitted id): matches the
     // EVM formula for chainFrom=Solana, chainTo=EVM.
     let recomputed = bridge_core::submission_id(
+        MESH_DOMAIN.into(),
         debridge_id.into(),
         U256::from(amount),
         U256::from(SOLANA_CHAIN_ID),

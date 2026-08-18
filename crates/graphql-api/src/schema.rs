@@ -640,6 +640,11 @@ impl Query {
 #[derive(InputObject)]
 pub struct SubmissionInput {
     pub submission_id: String,
+    /// Deployment generation of the gate that emitted this transfer,
+    /// `0x`-prefixed bytes32. Part of the submissionId preimage, so an absent or
+    /// wrong value simply fails the server-side id check — it is not a way to
+    /// smuggle a record in, only a way to be rejected.
+    pub bridge_domain: String,
     pub debridge_id: String,
     pub amount: String,
     pub chain_id_from: u64,
@@ -675,6 +680,7 @@ impl Mutation {
         let sig = SignerSig { signer: input.signer, signature: input.signature };
         let record = SubmissionRecord {
             submission_id: input.submission_id,
+            bridge_domain: input.bridge_domain,
             debridge_id: input.debridge_id,
             amount: input.amount,
             chain_id_from: input.chain_id_from,

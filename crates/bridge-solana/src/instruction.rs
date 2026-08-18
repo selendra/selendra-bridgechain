@@ -44,6 +44,12 @@ pub struct ClaimArgs {
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct InitArgs {
+    /// Deployment generation, folded into every submissionId. MUST match the
+    /// `bridgeDomain()` of the EVM gates in this mesh, and MUST be rotated for a
+    /// new deployment generation. Field order mirrors `solana_gate::InitArgs`
+    /// exactly — this struct is Borsh-serialized into the instruction the
+    /// program deserializes, so a mismatch in order silently misparses.
+    pub bridge_domain: [u8; 32],
     /// EVM validator addresses (the same set the EVM gate trusts).
     pub validators: Vec<[u8; 20]>,
     pub threshold: u32,

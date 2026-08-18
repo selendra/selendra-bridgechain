@@ -280,6 +280,11 @@ contract SwapPool is ReentrancyGuard {
         if (!t.listed) revert TokenNotListed(token);
         if (t.reserve != 0) revert ReserveNonZero();
         delete tokens[token];
+        // Clear the repricing clock with the listing it belonged to. `setPrice`
+        // exempts the FIRST update after listing via `last == 0`; leaving a stale
+        // timestamp here would carry into a future re-listing and block that
+        // exemption, freezing the new price behind a cooldown it never earned.
+        delete lastPriceUpdate[token];
         emit TokenDelisted(token);
     }
 

@@ -39,9 +39,25 @@ library BridgeHash {
         return keccak256(abi.encodePacked(nativeChainId, nativeToken));
     }
 
-    /// @dev The 7-field base of every submissionId, returned unhashed so the
+    /// @dev The 8-field base of every submissionId, returned unhashed so the
     ///      auto-variant can append to it (exactly as deBridge does).
+    ///
+    /// @param bridgeDomain the DEPLOYMENT binding, and the whole reason this
+    ///        differs from deBridge's layout. Without it a submissionId commits
+    ///        only to (asset, chain pair, amount, receiver, nonce) — never to the
+    ///        gates themselves — so every quorum signature from a previous
+    ///        deployment stays valid against a freshly deployed gate on the same
+    ///        chain pair, which also restarts `nonceTo` at 0. That was observed
+    ///        draining a live redeployment: 3 stale attestations paid out against
+    ///        deposits still locked in the superseded gate.
+    ///
+    ///        Every gate in ONE mesh generation shares ONE domain value, so ids
+    ///        agree across chains; a new generation picks a new value, which
+    ///        makes every historical attestation hash to something the new gates
+    ///        never accept. A mismatched domain fails loudly (no id ever agrees)
+    ///        rather than silently paying out, which is the failure mode you want.
     function packedSubmission(
+        bytes32 bridgeDomain,
         bytes32 debridgeId,
         uint256 amount,
         uint256 chainIdFrom,
@@ -50,12 +66,13 @@ library BridgeHash {
         bytes memory receiver
     ) internal pure returns (bytes memory) {
         return abi.encodePacked(
-            SUBMISSION_PREFIX, debridgeId, chainIdFrom, chainIdTo, amount, receiver, nonce
+            SUBMISSION_PREFIX, bridgeDomain, debridgeId, chainIdFrom, chainIdTo, amount, receiver, nonce
         );
     }
 
     /// @notice submissionId for a transfer WITHOUT an execution payload.
     function getSubmissionId(
+        bytes32 bridgeDomain,
         bytes32 debridgeId,
         uint256 amount,
         uint256 chainIdFrom,
@@ -64,12 +81,13 @@ library BridgeHash {
         bytes memory receiver
     ) internal pure returns (bytes32) {
         return keccak256(
-            packedSubmission(debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver)
+            packedSubmission(bridgeDomain, debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver)
         );
     }
 
     /// @notice submissionId for a transfer WITH an execution payload.
     function getSubmissionIdWithAuto(
+        bytes32 bridgeDomain,
         bytes32 debridgeId,
         uint256 amount,
         uint256 chainIdFrom,
@@ -80,7 +98,7 @@ library BridgeHash {
     ) internal pure returns (bytes32) {
         return keccak256(
             abi.encodePacked(
-                packedSubmission(debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver),
+                packedSubmission(bridgeDomain, debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver),
                 autoParams.executionFee,
                 autoParams.flags,
                 keccak256(autoParams.fallbackAddress),

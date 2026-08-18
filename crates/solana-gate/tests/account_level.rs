@@ -36,11 +36,16 @@ use solana_sdk::account::Account;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 
-use solana_gate::{process_instruction, CancelArgs, Config, GateInstruction, SendArgs};
+use solana_gate::{
+    process_instruction, AssetConfig, CancelArgs, Config, GateInstruction, SendArgs,
+};
 
 const PROGRAM_ID: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const CHAIN_ID: u64 = 7565164; // Solana
 const DEST_CHAIN: u64 = 1337;
+/// Deployment generation shared by every gate these tests stand up. Non-zero,
+/// because `init` refuses a zero domain.
+const TEST_BRIDGE_DOMAIN: [u8; 32] = [0xD0; 32];
 
 fn config_pda() -> Pubkey {
     Pubkey::find_program_address(&[b"config"], &PROGRAM_ID).0
@@ -48,8 +53,17 @@ fn config_pda() -> Pubkey {
 
 /// Mirrors `config_space` in the program: the account is sized for the DECLARED
 /// capacities, which is the H-3 fix.
+///
+/// Kept in sync BY HAND, so any field added to `Config` must be added here too —
+/// a stale copy shows up as `AccountDataTooSmall` from whichever instruction
+/// first reserializes the config, not as a compile error.
 fn config_space(validators: u32, corridors: u32) -> usize {
-    32 + 32 + (4 + 20 * validators as usize) + 4 + 8 + 1 + 4 + 4 + (4 + 16 * corridors as usize)
+    32                                  // owner
+    + 32                                // bridge_domain
+    + 32                                // guardian
+    + (4 + 20 * validators as usize)    // validators
+    + 4 + 8 + 1 + 4 + 4                 // threshold, chain_id, paused, caps
+    + (4 + 16 * corridors as usize)     // nonce_to
 }
 
 /// A bank with the gate registered and its config PDA already initialized —
@@ -85,6 +99,7 @@ async fn setup_with_validators(
     // Exactly what a successful `init` leaves behind.
     let cfg = Config {
         owner: owner.pubkey(),
+        bridge_domain: TEST_BRIDGE_DOMAIN,
         guardian,
         validators,
         threshold,
@@ -395,6 +410,7 @@ fn submission_id_for(args: &CancelArgs, chain_id_to: u64) -> [u8; 32] {
     }
     keccak::hashv(&[
         &be32(1), // SUBMISSION_PREFIX
+        &TEST_BRIDGE_DOMAIN,
         &args.debridge_id,
         &be32(args.chain_id_from),
         &be32(chain_id_to),
@@ -761,6 +777,7 @@ async fn setup_with_asset(
 
     let cfg = Config {
         owner: owner.pubkey(),
+        bridge_domain: TEST_BRIDGE_DOMAIN,
         guardian: Pubkey::default(),
         validators,
         threshold,
@@ -894,6 +911,7 @@ fn claim_submission_id(args: &solana_gate::ClaimArgs) -> [u8; 32] {
     }
     keccak::hashv(&[
         &be32(1),
+        &TEST_BRIDGE_DOMAIN,
         &args.debridge_id,
         &be32(args.chain_id_from),
         &be32(CHAIN_ID),
@@ -914,6 +932,7 @@ fn send_submission_id(debridge_id: &[u8; 32], amount: u64, receiver: &[u8], nonc
     }
     keccak::hashv(&[
         &be32(1),
+        &TEST_BRIDGE_DOMAIN,
         debridge_id,
         &be32(CHAIN_ID),
         &be32(DEST_CHAIN),
@@ -1122,6 +1141,7 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
         );
         let cfg = Config {
             owner: owner.pubkey(),
+            bridge_domain: TEST_BRIDGE_DOMAIN,
             guardian: Pubkey::default(),
             validators: vec![[1u8; 20]],
             threshold: 1,
@@ -1177,6 +1197,124 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
     }
 }
 
+/// H-1, through the real handler: a registered corridor cannot be repointed.
+///
+/// `Gate.sol::setLocalToken` is write-once and documents why — a claim commits to
+/// `debridgeId`, never to the local asset, so whoever can repoint the binding can
+/// make the validators' EXISTING signatures release a different asset from a
+/// different vault. The Solana registry re-serialized unconditionally, so an
+/// owner (or a compromised owner key) had exactly that power.
+#[tokio::test]
+async fn a_registered_asset_cannot_be_repointed() {
+    let owner = Keypair::new();
+    let debridge_id = [42u8; 32];
+
+    // The genuine binding, and the attacker's replacement.
+    let real_mint = Pubkey::new_unique();
+    let real_vault = Pubkey::new_unique();
+    let evil_mint = Pubkey::new_unique();
+    let evil_vault = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new("solana_gate", PROGRAM_ID, processor!(process_instruction));
+    pt.add_account(
+        owner.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let cfg = Config {
+        owner: owner.pubkey(),
+        bridge_domain: TEST_BRIDGE_DOMAIN,
+        guardian: Pubkey::default(),
+        validators: vec![[1u8; 20]],
+        threshold: 1,
+        chain_id: CHAIN_ID,
+        paused: false,
+        max_validators: 8,
+        max_corridors: 4,
+        nonce_to: vec![],
+    };
+    let mut cfg_data = vec![0u8; config_space(8, 4)];
+    cfg.serialize(&mut &mut cfg_data[..]).unwrap();
+    pt.add_account(
+        config_pda(),
+        Account {
+            lamports: 10_000_000_000,
+            data: cfg_data,
+            owner: PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    for m in [real_mint, evil_mint] {
+        pt.add_account(m, mint_account());
+    }
+    // Both vaults are individually well-formed: right authority, no delegate, no
+    // close authority. The ONLY thing wrong with the second is that the corridor
+    // is already bound — which is the whole point.
+    pt.add_account(
+        real_vault,
+        token_account(real_mint, vault_authority(), 0, COption::None, COption::None),
+    );
+    pt.add_account(
+        evil_vault,
+        token_account(evil_mint, vault_authority(), 0, COption::None, COption::None),
+    );
+
+    let mut ctx = pt.start_with_context().await;
+
+    let register = |mint: Pubkey, vault: Pubkey| {
+        ix(
+            GateInstruction::RegisterAsset { debridge_id },
+            vec![
+                AccountMeta::new_readonly(config_pda(), false),
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(asset_pda(&debridge_id), false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new_readonly(vault, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ],
+        )
+    };
+
+    // 1. The genuine first registration succeeds.
+    exec(&mut ctx, register(real_mint, real_vault), &[&owner])
+        .await
+        .expect("first registration must succeed");
+
+    let stored = ctx.banks_client.get_account(asset_pda(&debridge_id)).await.unwrap().unwrap();
+    let before = AssetConfig::deserialize(&mut &stored.data[..]).unwrap();
+    assert_eq!(before.mint, real_mint);
+    assert_eq!(before.vault, real_vault);
+
+    // 2. THE ATTACK: repoint the same debridgeId at a different mint + vault.
+    let err = exec(&mut ctx, register(evil_mint, evil_vault), &[&owner])
+        .await
+        .expect_err("a live binding must not be repointable");
+    assert!(
+        is_custom(&err, ASSET_ALREADY_REGISTERED),
+        "expected AssetAlreadyRegistered, got {err:?}"
+    );
+
+    // 3. The original binding is untouched — in-flight signed claims still
+    //    release the asset the validators actually attested.
+    let stored = ctx.banks_client.get_account(asset_pda(&debridge_id)).await.unwrap().unwrap();
+    let after = AssetConfig::deserialize(&mut &stored.data[..]).unwrap();
+    assert_eq!(after.mint, real_mint, "the registered mint must survive the attempt");
+    assert_eq!(after.vault, real_vault, "the registered vault must survive the attempt");
+
+    // 4. Re-registering the IDENTICAL binding stays a no-op, so a deploy script
+    //    that runs twice does not fail.
+    exec(&mut ctx, register(real_mint, real_vault), &[&owner])
+        .await
+        .expect("idempotent re-registration must succeed");
+}
+
 // ---------------------------------------------------------------------------
 // Signature-array length cap, executed.
 //
@@ -1198,8 +1336,10 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
 // ---------------------------------------------------------------------------
 
 /// `ProgramError::Custom(n)` for a `GateError` — the discriminant is
-/// `index + 1`. `TooManySignatures` is the last variant.
+/// `index + 1`. `TooManySignatures` is the 13th variant.
 const TOO_MANY_SIGNATURES: u32 = 13;
+/// H-1's error, appended last so every code above it stays stable.
+const ASSET_ALREADY_REGISTERED: u32 = 15;
 
 fn is_custom(err: &solana_sdk::transaction::TransactionError, code: u32) -> bool {
     matches!(

@@ -57,7 +57,7 @@ services:
     <<: *restart
     environment:
       POSTGRES_USER: bridge
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-bridge}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random secret}"
       POSTGRES_DB: bridge
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -82,11 +82,11 @@ services:
     command: ["sig-store"]
     environment:
       SIG_STORE_BIND: "0.0.0.0:8080"
-      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
-      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
-      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:-dev-keeper-token}"
-      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:-dev-reader-token}"
-      SIG_STORE_ADMIN_TOKEN: "${SIG_STORE_ADMIN_TOKEN:-dev-admin-token}"
+      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random secret}@postgres:5432/bridge"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN, e.g. $(openssl rand -hex 32)}"
+      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN, e.g. $(openssl rand -hex 32)}"
+      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN, e.g. $(openssl rand -hex 32)}"
+      SIG_STORE_ADMIN_TOKEN: "${SIG_STORE_ADMIN_TOKEN:?set SIG_STORE_ADMIN_TOKEN, e.g. $(openssl rand -hex 32)}"
       RUST_LOG: "sig_store=info,bridge_db=info"
     depends_on:
       postgres:
@@ -103,7 +103,7 @@ services:
     <<: *restart
     command: ["validator", "/configs/val1.toml"]
     environment:
-      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
       - ./docker/configs:/configs:ro
       - val1-state:/data
@@ -118,7 +118,7 @@ services:
     <<: *restart
     command: ["validator", "/configs/val2.toml"]
     environment:
-      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
       - ./docker/configs:/configs:ro
       - val2-state:/data
@@ -133,7 +133,7 @@ services:
     <<: *restart
     command: ["validator", "/configs/val3.toml"]
     environment:
-      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:-dev-validator-token}"
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
       - ./docker/configs:/configs:ro
       - val3-state:/data
@@ -148,7 +148,7 @@ services:
     <<: *restart
     command: ["keeper", "/configs/keeper.toml"]
     environment:
-      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:-dev-keeper-token}"
+      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
       - ./docker/configs:/configs:ro
     depends_on:
@@ -165,7 +165,7 @@ services:
     <<: *restart
     command: ["indexer", "/configs/indexer.toml"]
     environment:
-      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
+      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random secret}@postgres:5432/bridge"
       RUST_LOG: "indexer=info,bridge_db=info"
     volumes:
       - ./docker/configs:/configs:ro
@@ -203,8 +203,8 @@ services:
     environment:
       # READ-ONLY: this service can query the store but cannot write signatures,
       # mark transfers claimed, or edit the allowlist.
-      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:-dev-reader-token}"
-      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/bridge"
+      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN, e.g. $(openssl rand -hex 32)}"
+      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random secret}@postgres:5432/bridge"
       RUST_LOG: "graphql_api=info,bridge_db=info"
     volumes:
       - ./docker/configs:/configs:ro

@@ -157,3 +157,9 @@ CREATE TABLE IF NOT EXISTS pending_lifecycle (
     refund_status   TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Deployment generation of the emitting gate. Part of the submissionId preimage,
+-- so `canonical_submission_id` cannot re-derive an id without it. Nullable
+-- because rows written before the domain existed have none: those belong to a
+-- superseded generation and MUST fail the id check rather than be recomputed
+-- under a zero domain, which is exactly the cross-deployment replay this closes.
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS bridge_domain TEXT;

@@ -67,6 +67,9 @@ pub struct Claimed {
 pub struct SolanaGate {
     /// This gate's chain id (Solana). `chainIdTo` for incoming, `chainIdFrom` for outgoing.
     pub chain_id: u64,
+    /// Deployment generation, folded into every submissionId. Must match the EVM
+    /// gates of the same mesh or no id agrees across chains.
+    pub bridge_domain: Bytes32,
     /// Active validator set — the same EVM addresses the EVM gate trusts.
     validators: BTreeSet<Address>,
     /// Signatures required to release funds.
@@ -86,7 +89,12 @@ pub struct SolanaGate {
 }
 
 impl SolanaGate {
-    pub fn new(chain_id: u64, validators: &[Address], threshold: u32) -> Self {
+    pub fn new(
+        chain_id: u64,
+        bridge_domain: Bytes32,
+        validators: &[Address],
+        threshold: u32,
+    ) -> Self {
         assert!(threshold > 0, "threshold must be > 0");
         assert!(
             threshold as usize <= validators.len(),
@@ -94,6 +102,7 @@ impl SolanaGate {
         );
         Self {
             chain_id,
+            bridge_domain,
             validators: validators.iter().copied().collect(),
             threshold,
             nonce_to: BTreeMap::new(),
@@ -249,6 +258,7 @@ impl SolanaGate {
         let amt = amount_word(amount as u128);
         match auto {
             None => hash::submission_id(
+                &self.bridge_domain,
                 debridge_id,
                 &amt,
                 chain_id_from,
@@ -257,6 +267,7 @@ impl SolanaGate {
                 receiver,
             ),
             Some(a) => hash::submission_id_with_auto(
+                &self.bridge_domain,
                 debridge_id,
                 &amt,
                 chain_id_from,

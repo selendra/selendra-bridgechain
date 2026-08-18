@@ -8,6 +8,10 @@ use crate::{submission_id, submission_id_with_auto, AutoParams};
 /// All parameters of a single cross-chain transfer, as read from a `Sent` event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submission {
+    /// Deployment generation this transfer belongs to — the `bridgeDomain()` of
+    /// the gate that emitted it. Read from the gate rather than configured, so a
+    /// stale config can never make a validator sign for the wrong generation.
+    pub bridge_domain: B256,
     pub debridge_id: B256,
     pub amount: U256,
     pub chain_id_from: U256,
@@ -23,6 +27,7 @@ impl Submission {
     pub fn compute_id(&self) -> B256 {
         match &self.auto {
             None => submission_id(
+                self.bridge_domain,
                 self.debridge_id,
                 self.amount,
                 self.chain_id_from,
@@ -31,6 +36,7 @@ impl Submission {
                 &self.receiver,
             ),
             Some(auto) => submission_id_with_auto(
+                self.bridge_domain,
                 self.debridge_id,
                 self.amount,
                 self.chain_id_from,

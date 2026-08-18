@@ -11,6 +11,7 @@ import {BridgeHash} from "../src/BridgeHash.sol";
 contract GenFixturesTest is Test {
     struct F {
         string name;
+        bytes32 bridgeDomain;
         bytes32 debridgeId;
         uint256 amount;
         uint256 chainIdFrom;
@@ -28,10 +29,11 @@ contract GenFixturesTest is Test {
     function _id(F memory f) internal pure returns (bytes32) {
         if (!f.hasAuto) {
             return BridgeHash.getSubmissionId(
-                f.debridgeId, f.amount, f.chainIdFrom, f.chainIdTo, f.nonce, f.receiver
+                f.bridgeDomain, f.debridgeId, f.amount, f.chainIdFrom, f.chainIdTo, f.nonce, f.receiver
             );
         }
         return BridgeHash.getSubmissionIdWithAuto(
+            f.bridgeDomain,
             f.debridgeId,
             f.amount,
             f.chainIdFrom,
@@ -52,6 +54,7 @@ contract GenFixturesTest is Test {
         return string.concat(
             "{",
             '"name":"', f.name, '",',
+            '"bridgeDomain":"', vm.toString(f.bridgeDomain), '",',
             '"debridgeId":"', vm.toString(f.debridgeId), '",',
             '"amount":"', vm.toString(f.amount), '",',
             '"chainIdFrom":', vm.toString(f.chainIdFrom), ",",
@@ -73,12 +76,19 @@ contract GenFixturesTest is Test {
         );
     }
 
+    /// @dev Two distinct deployment generations. Fixtures 1-3 use A; fixture 4
+    ///      repeats fixture 1 verbatim under B, so any implementation that
+    ///      ignores the domain produces two identical ids and fails parity.
+    bytes32 constant DOMAIN_A = keccak256("selendra.bridge.mesh.v1");
+    bytes32 constant DOMAIN_B = keccak256("selendra.bridge.mesh.v2");
+
     function test_WriteFixtures() public {
-        F[] memory fs = new F[](3);
+        F[] memory fs = new F[](4);
 
         // 1) plain transfer, no execution payload, EVM 20-byte receiver
         fs[0] = F({
             name: "no-auto",
+            bridgeDomain: DOMAIN_A,
             debridgeId: BridgeHash.getDebridgeId(1337, address(0x1234)),
             amount: 100 ether,
             chainIdFrom: 1337,
@@ -96,6 +106,7 @@ contract GenFixturesTest is Test {
         // 2) transfer WITH an execution payload
         fs[1] = F({
             name: "with-auto",
+            bridgeDomain: DOMAIN_A,
             debridgeId: BridgeHash.getDebridgeId(1337, address(0xABCD)),
             amount: 5_000_000,
             chainIdFrom: 1337,
@@ -113,6 +124,7 @@ contract GenFixturesTest is Test {
         // 3) non-EVM-shaped 32-byte receiver, large nonce/amount, no auto
         fs[2] = F({
             name: "long-receiver",
+            bridgeDomain: DOMAIN_A,
             debridgeId: BridgeHash.getDebridgeId(10, address(0x9999)),
             amount: type(uint256).max,
             chainIdFrom: 10,
@@ -126,6 +138,34 @@ contract GenFixturesTest is Test {
             data: "",
             nativeSender: ""
         });
+
+        // 4) every field of fixture 1, under a DIFFERENT deployment domain. This is
+        //    the H-3 regression at the hash layer: the ids must diverge, which is
+        //    exactly what stops a previous deployment's attestations verifying
+        //    against a redeployed mesh.
+        //
+        //    Spelled out rather than copied from fs[0]: memory struct assignment
+        //    in Solidity aliases instead of copying, so `fs[3] = fs[0]` followed by
+        //    a field write would silently rewrite fixture 1 and make both fixtures
+        //    agree — the test would pass by destroying what it compares against.
+        fs[3] = F({
+            name: "domain-separated",
+            bridgeDomain: DOMAIN_B,
+            debridgeId: BridgeHash.getDebridgeId(1337, address(0x1234)),
+            amount: 100 ether,
+            chainIdFrom: 1337,
+            chainIdTo: 1338,
+            nonce: 0,
+            receiver: abi.encodePacked(address(0xCAFE)),
+            hasAuto: false,
+            executionFee: 0,
+            flags: 0,
+            fallbackAddress: "",
+            data: "",
+            nativeSender: ""
+        });
+
+        assertTrue(_id(fs[0]) != _id(fs[3]), "bridgeDomain must change the submissionId");
 
         string memory json = "{\"fixtures\":[";
         for (uint256 i = 0; i < fs.length; i++) {

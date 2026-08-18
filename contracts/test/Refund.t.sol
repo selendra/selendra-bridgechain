@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
+import {deployTestGate, TEST_BRIDGE_DOMAIN} from "./helpers/TestGate.sol";
 import {TestToken} from "../src/TestToken.sol";
 import {BridgeHash} from "../src/BridgeHash.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
@@ -61,7 +62,7 @@ contract RefundTest is Test {
 
         // --- source chain ---
         vm.chainId(CHAIN_SRC);
-        srcGate = new Gate(validators, 1);
+        srcGate = deployTestGate(validators, 1);
         token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
 
@@ -75,7 +76,7 @@ contract RefundTest is Test {
 
         // --- destination chain ---
         vm.chainId(CHAIN_DST);
-        dstGate = new Gate(validators, 1);
+        dstGate = deployTestGate(validators, 1);
         // give the destination real liquidity, so a successful claim is possible
         // and "no double spend" is a meaningful claim rather than a side effect
         // of an empty vault
@@ -217,7 +218,7 @@ contract RefundTest is Test {
         // must demonstrably have been locked HERE.
         uint256 ghostNonce = 99;
         bytes32 ghostId = BridgeHash.getSubmissionId(
-            debridgeId, AMOUNT, CHAIN_SRC, CHAIN_DST, ghostNonce, receiver
+            TEST_BRIDGE_DOMAIN, debridgeId, AMOUNT, CHAIN_SRC, CHAIN_DST, ghostNonce, receiver
         );
 
         vm.expectRevert(abi.encodeWithSelector(Gate.NotSent.selector, ghostId));
@@ -449,5 +450,116 @@ contract RefundTest is Test {
         // load-bearing part of the design, not a convenience.
         _refund(_one(v1pk, _refundId()));
         assertEq(token.balanceOf(user), 1_000 ether);
+    }
+
+    // -----------------------------------------------------------------
+    // L-1: a wrong-width receiver must be unclaimable, hence refundable
+    // -----------------------------------------------------------------
+
+    /// Lock funds bound for this chain pair with a 32-byte `receiver`, and return
+    /// the resulting submissionId. `send` accepts the width because it cannot know
+    /// the destination VM — 32 bytes is correct for a Solana destination.
+    function _sendWithWideReceiver(bytes memory wide) internal returns (bytes32 id) {
+        vm.chainId(CHAIN_SRC);
+        vm.startPrank(user);
+        token.approve(address(srcGate), AMOUNT);
+        id = srcGate.send(address(token), AMOUNT, CHAIN_DST, wide, EMPTY_AUTO);
+        vm.stopPrank();
+    }
+
+    /// THE L-1 defect, in both shapes it takes.
+    ///
+    /// `claim` used to read the FIRST 20 bytes of any receiver >= 20 bytes long,
+    /// so a 32-byte receiver aimed at an EVM chain paid a live, unowned address:
+    ///
+    ///   * a Solana pubkey  -> leading 20 bytes are effectively random, funds gone
+    ///   * abi.encode(addr) -> leading 20 bytes are ZERO, funds to address(0)
+    ///
+    /// Neither was rescuable, because the refund path only reaches transfers that
+    /// cannot be claimed — and both of these claimed perfectly well.
+    function test_Claim_WrongWidthReceiver_IsRefusedNotMisdelivered() public {
+        bytes[2] memory malformed = [
+            // a Solana account key pasted for an EVM destination
+            abi.encodePacked(bytes32(uint256(0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef))),
+            // abi.encode(address): 32 bytes, address in the LAST 20, leading 20 zero
+            abi.encode(receiverAddr)
+        ];
+
+        for (uint256 i = 0; i < malformed.length; i++) {
+            bytes memory wide = malformed[i];
+            assertEq(wide.length, 32, "premise: a 32-byte receiver");
+
+            bytes32 id = _sendWithWideReceiver(wide);
+            // Read every argument BEFORE arming expectRevert — it binds to the
+            // next call, and an argument expression that makes one would consume it.
+            uint256 nonce = srcGate.nonceTo(CHAIN_DST) - 1;
+            bytes[] memory sigs = _one(v1pk, id);
+
+            vm.chainId(CHAIN_DST);
+            address wouldHaveBeenPaid = address(bytes20(wide));
+            TestToken dstToken = TestToken(dstGate.tokenOf(debridgeId));
+            uint256 before = dstToken.balanceOf(wouldHaveBeenPaid);
+
+            vm.expectRevert(Gate.BadReceiver.selector);
+            dstGate.claim(
+                debridgeId, AMOUNT, CHAIN_SRC, nonce,
+                wide, EMPTY_AUTO, EMPTY_SENDER, sigs
+            );
+
+            assertEq(
+                dstToken.balanceOf(wouldHaveBeenPaid),
+                before,
+                "not a single token may reach the truncated address"
+            );
+            assertFalse(dstGate.executed(id), "a refused claim must not burn the transfer");
+            vm.chainId(CHAIN_SRC);
+        }
+    }
+
+    /// ...and because it is now unclaimable, the existing two-phase refund gets the
+    /// money back. That is the whole point of refusing rather than truncating: the
+    /// failure moves from "silently paid to nobody" to "recoverable".
+    function test_WrongWidthReceiver_IsRecoveredByTheRefundPath() public {
+        bytes memory wide = abi.encodePacked(bytes32(uint256(0xDEADBEEF)));
+        bytes32 id = _sendWithWideReceiver(wide);
+        uint256 nonce = srcGate.nonceTo(CHAIN_DST) - 1;
+        uint256 balanceAfterLock = token.balanceOf(user);
+
+        // Destination burns it (the transfer can never be delivered).
+        vm.chainId(CHAIN_DST);
+        dstGate.cancel(
+            debridgeId, AMOUNT, CHAIN_SRC, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
+            _one(v1pk, BridgeHash.getCancelId(id))
+        );
+        assertTrue(dstGate.cancelled(id), "destination must be burned");
+
+        // Source returns the funds to whoever locked them.
+        vm.chainId(CHAIN_SRC);
+        srcGate.refund(
+            address(token), debridgeId, AMOUNT, CHAIN_DST, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
+            _one(v1pk, BridgeHash.getRefundId(id))
+        );
+
+        assertEq(
+            token.balanceOf(user),
+            balanceAfterLock + AMOUNT,
+            "a malformed-receiver transfer must be fully recoverable"
+        );
+    }
+
+    /// The correct 20-byte width still claims normally — the guard must not have
+    /// broken the ordinary path.
+    function test_Claim_ExactWidthReceiver_StillWorks() public {
+        vm.chainId(CHAIN_DST);
+        dstGate.claim(
+            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            _one(v1pk, submissionId)
+        );
+        assertEq(
+            TestToken(dstGate.tokenOf(debridgeId)).balanceOf(receiverAddr),
+            AMOUNT,
+            "a well-formed 20-byte receiver must still be paid"
+        );
+        vm.chainId(CHAIN_SRC);
     }
 }

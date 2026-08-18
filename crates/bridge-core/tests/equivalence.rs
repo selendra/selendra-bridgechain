@@ -18,6 +18,8 @@ struct Fixtures {
 #[derive(Debug, Deserialize)]
 struct Fixture {
     name: String,
+    #[serde(rename = "bridgeDomain")]
+    bridge_domain: String,
     #[serde(rename = "debridgeId")]
     debridge_id: String,
     amount: String,
@@ -74,10 +76,23 @@ fn rust_matches_solidity_for_all_fixtures() {
     });
     let parsed: Fixtures = serde_json::from_str(&raw).expect("invalid fixtures json");
 
-    assert!(parsed.fixtures.len() >= 3, "expected at least 3 fixtures");
+    assert!(parsed.fixtures.len() >= 4, "expected at least 4 fixtures");
+
+    // The fixture set deliberately contains two entries identical in every field
+    // except `bridgeDomain`. If Rust ever stopped folding the domain into the
+    // preimage, both would hash the same and the per-fixture assertions below
+    // would still pass against a Solidity side that also (wrongly) agreed.
+    // Pinning the divergence here makes that regression impossible to miss.
+    let mut by_id = std::collections::HashMap::new();
+    for f in &parsed.fixtures {
+        if let Some(prev) = by_id.insert(&f.submission_id, &f.name) {
+            panic!("fixtures '{prev}' and '{}' share a submissionId", f.name);
+        }
+    }
 
     for f in &parsed.fixtures {
         let sub = Submission {
+            bridge_domain: f.bridge_domain.parse::<B256>().expect("bad bridgeDomain"),
             debridge_id: f.debridge_id.parse::<B256>().expect("bad debridgeId"),
             amount: dec(&f.amount),
             chain_id_from: U256::from(f.chain_id_from),

@@ -31,7 +31,8 @@ contract DeployProdTest is Test {
             validators: _validators(),
             threshold: 2, // strict majority of 3
             guardian: guardian,
-            owner: multisig
+            owner: multisig,
+            bridgeDomain: keccak256("selendra.bridge.deployprod.test")
         });
     }
 

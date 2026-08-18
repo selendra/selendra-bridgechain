@@ -90,6 +90,8 @@ pub struct AutoParamsWire {
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct InitArgs {
+    /// See [`Config::bridge_domain`]. Must match the EVM gates of this mesh.
+    pub bridge_domain: [u8; 32],
     pub validators: Vec<[u8; 20]>,
     pub threshold: u32,
     pub chain_id: u64,
@@ -199,6 +201,12 @@ pub struct RefundArgs {
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default)]
 pub struct Config {
     pub owner: Pubkey,
+    /// Deployment generation, folded into every submissionId. MUST equal the
+    /// `bridgeDomain()` the EVM gates of this mesh were initialized with, or no
+    /// id ever agrees across chains and nothing bridges. Set once at init and
+    /// never mutated: rotating it belongs to a new deployment, not to a running
+    /// one, and changing it would strand every in-flight transfer.
+    pub bridge_domain: [u8; 32],
     /// May pause but not unpause. `Pubkey::default()` == none appointed.
     pub guardian: Pubkey,
     pub validators: Vec<[u8; 20]>,
@@ -226,6 +234,7 @@ pub struct Config {
 /// vectors are capped.
 fn config_space(validators: u32, corridors: u32) -> usize {
     32                              // owner
+    + 32                            // bridge_domain
     + 32                            // guardian
     + 4 + 20 * validators as usize  // validators: Vec<[u8; 20]>
     + 4                             // threshold
@@ -411,6 +420,35 @@ fn verify_asset_account(
         return Err(ProgramError::IllegalOwner);
     }
     Ok(())
+}
+
+/// Pure H-1 write-once rule (host-testable): may `register_asset` write over an
+/// account that already exists?
+///
+/// `Ok(true)`  — the account exists but is unwritten (all-zero); write it.
+/// `Ok(false)` — the identical binding is already there; no-op, so deploy scripts
+///               stay re-runnable.
+/// `Err`       — a LIVE binding would be repointed. Refused, because a claim
+///               commits to `debridge_id` alone: repointing lets the validators'
+///               existing signatures release a mint they never attested, from a
+///               vault they never saw. `Gate.sol::setLocalToken` refuses the same
+///               thing for the same reason.
+fn asset_write_allowed(
+    existing: &AssetConfig,
+    incoming: &AssetConfig,
+) -> Result<bool, ProgramError> {
+    let unwritten =
+        existing.mint == Pubkey::default() && existing.vault == Pubkey::default();
+    if unwritten {
+        return Ok(true);
+    }
+    if existing.mint == incoming.mint
+        && existing.vault == incoming.vault
+        && existing.debridge_id == incoming.debridge_id
+    {
+        return Ok(false);
+    }
+    Err(GateError::AssetAlreadyRegistered.into())
 }
 
 /// Pure C1 asset-binding gate (host-testable): the vault a send/claim touches and
@@ -735,6 +773,18 @@ pub enum GateError {
     /// user-recoverable failure in `claim` diagnosable from the transaction log.
     #[error("receiver is not an SPL token account (a wallet address will never be claimable)")]
     ReceiverNotTokenAccount,
+    /// H-1: `register_asset` is write-once. A claim binds only `debridge_id`, so
+    /// repointing a registered corridor at a different mint/vault would let the
+    /// validators' existing signatures release an asset they never attested.
+    /// Mirrors `Gate.sol`'s `LocalTokenAlreadySet`.
+    #[error("asset already registered for this debridgeId (bindings are write-once)")]
+    AssetAlreadyRegistered,
+    /// H-3: `init` was given a zero `bridge_domain`. Appended LAST on purpose —
+    /// the discriminant IS the on-chain `Custom` code, so inserting anywhere else
+    /// silently renumbers every error above it and breaks clients that match on
+    /// the numeric code.
+    #[error("bridge_domain must be non-zero")]
+    ZeroBridgeDomain,
 }
 
 impl From<GateError> for ProgramError {
@@ -761,6 +811,7 @@ fn amount_word(v: u64) -> [u8; 32] {
 
 #[allow(clippy::too_many_arguments)]
 fn submission_id(
+    bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
     amount: u64,
     chain_id_from: u64,
@@ -775,8 +826,8 @@ fn submission_id(
     let ct = be32(chain_id_to);
     let amt = amount_word(amount);
     let nz = be32(nonce);
-    // packedSubmission = prefix|debridgeId|chainIdFrom|chainIdTo|amount|receiver|nonce
-    let base: &[&[u8]] = &[&prefix, debridge_id, &cf, &ct, &amt, receiver, &nz];
+    // packedSubmission = prefix|bridgeDomain|debridgeId|chainIdFrom|chainIdTo|amount|receiver|nonce
+    let base: &[&[u8]] = &[&prefix, bridge_domain, debridge_id, &cf, &ct, &amt, receiver, &nz];
     match auto {
         None => keccak::hashv(base).to_bytes(),
         Some(a) => {
@@ -788,7 +839,8 @@ fn submission_id(
             let ns = keccak::hashv(&[native_sender]).to_bytes();
             // keccak(packedSubmission || fee || flags || keccak(fallback) || keccak(data) || keccak(nativeSender))
             keccak::hashv(&[
-                &prefix, debridge_id, &cf, &ct, &amt, receiver, &nz, &fee, &flags, &fb, &data, &ns,
+                &prefix, bridge_domain, debridge_id, &cf, &ct, &amt, receiver, &nz, &fee, &flags,
+                &fb, &data, &ns,
             ])
             .to_bytes()
         }
@@ -841,19 +893,21 @@ fn verify_threshold(cfg: &Config, id: &[u8; 32], signatures: &[Vec<u8>]) -> Resu
         return Err(GateError::TooManySignatures);
     }
     let digest = eth_signed_digest(id);
+    // Seeded at the zero address and compared on EVERY signature, matching
+    // `Gate.sol`'s `address last = address(0)`. Skipping the check for the first
+    // signature (as this once did) admits a zero-address recovery that the EVM
+    // gate refuses — and these two verifiers are supposed to be equivalent.
     let mut last = [0u8; 20];
-    let mut have_last = false;
     let mut count: u32 = 0;
     for sig in signatures {
         let signer = recover_evm_address(&digest, sig)?;
-        if have_last && signer <= last {
+        if signer <= last {
             return Err(GateError::InvalidSignerOrder);
         }
         if cfg.is_validator(&signer) {
             count += 1;
         }
         last = signer;
-        have_last = true;
     }
     if count < cfg.threshold {
         return Err(GateError::NotEnoughSignatures);
@@ -928,6 +982,7 @@ fn process_cancel(program_id: &Pubkey, accounts: &[AccountInfo], args: CancelArg
     }
 
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         args.chain_id_from,
@@ -1002,6 +1057,7 @@ fn process_refund(program_id: &Pubkey, accounts: &[AccountInfo], args: RefundArg
     // exactly the users an incident stranded.
 
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         cfg.chain_id,
@@ -1127,8 +1183,17 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
         &[&[b"config", &[bump]]],
     )?;
 
+    // A zero domain is refused for the same reason the EVM gate refuses it: it is
+    // what an unset field looks like, so accepting it would let a whole mesh
+    // silently agree on "no generation" and stay replayable across redeploys.
+    if args.bridge_domain == [0u8; 32] {
+        msg!("bridge_domain must be non-zero");
+        return Err(GateError::ZeroBridgeDomain.into());
+    }
+
     let cfg = Config {
         owner: *payer.key,
+        bridge_domain: args.bridge_domain,
         guardian: args.guardian,
         validators: args.validators,
         threshold: args.threshold,
@@ -1297,6 +1362,7 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     let nonce = cfg.nonce(args.chain_id_to);
     let native_sender = payer.key.to_bytes();
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         cfg.chain_id,
@@ -1401,6 +1467,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     verify_asset_binding(&asset, token_program.key, vault.key, &vault_mint, &recv_mint)?;
 
     let id = submission_id(
+        &cfg.bridge_domain,
         &args.debridge_id,
         args.amount,
         args.chain_id_from,
@@ -1597,6 +1664,25 @@ fn process_register_asset(
         )?;
     } else if asset_ai.owner != program_id {
         return Err(ProgramError::IllegalOwner);
+    } else {
+        // H-1: WRITE-ONCE, exactly as `Gate.sol::setLocalToken` is.
+        //
+        // A claim commits to `debridge_id` — never to the mint or the vault — so
+        // the binding read at claim time decides what is actually paid out. If it
+        // could be repointed, an owner (or a compromised owner key) could let
+        // validators sign a transfer of asset X and then have those very same
+        // signatures release asset Y from a different vault, with no change to
+        // anything the validators attested.
+        //
+        // Registering a NEW corridor stays an ordinary owner action; changing a
+        // live one must not exist. Route a different asset through a fresh
+        // debridge_id instead.
+        let existing = AssetConfig::deserialize(&mut &asset_ai.data.borrow()[..])
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if !asset_write_allowed(&existing, &record)? {
+            msg!("asset already registered with these exact values; no-op");
+            return Ok(());
+        }
     }
     record.serialize(&mut &mut asset_ai.data.borrow_mut()[..])?;
     msg!("asset registered for debridge_id");
@@ -1813,6 +1899,77 @@ mod c1_tests {
     }
 
     // ---------------------------------------------------------------
+    // H-1 — the asset registry is write-once
+    // ---------------------------------------------------------------
+
+    /// THE H-1 rule. `Gate.sol` makes `setLocalToken` write-once and says why: a
+    /// claim commits to `debridge_id`, never to the local asset, so whoever can
+    /// repoint the binding can redirect a signed transfer to a different asset
+    /// without the validators attesting anything new. The Solana registry used to
+    /// re-serialize unconditionally, so it had exactly that hole.
+    #[test]
+    fn a_live_asset_binding_cannot_be_repointed() {
+        let debridge_id = [0x11u8; 32];
+        let live = AssetConfig {
+            debridge_id,
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+        };
+
+        // The attack: same debridge_id, attacker's mint + vault.
+        let repoint = AssetConfig {
+            debridge_id,
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+        };
+        assert_eq!(
+            asset_write_allowed(&live, &repoint),
+            Err(GateError::AssetAlreadyRegistered.into()),
+            "a registered corridor must not be repointable"
+        );
+
+        // Swapping only the vault is the same attack with a smaller diff.
+        let revault = AssetConfig { vault: Pubkey::new_unique(), ..live.clone() };
+        assert_eq!(
+            asset_write_allowed(&live, &revault),
+            Err(GateError::AssetAlreadyRegistered.into()),
+            "repointing just the vault is still a repoint"
+        );
+
+        // And only the mint.
+        let remint = AssetConfig { mint: Pubkey::new_unique(), ..live.clone() };
+        assert_eq!(
+            asset_write_allowed(&live, &remint),
+            Err(GateError::AssetAlreadyRegistered.into())
+        );
+    }
+
+    /// A freshly created (all-zero) account is written normally — that is the
+    /// ordinary first registration.
+    #[test]
+    fn a_fresh_asset_account_is_written() {
+        let incoming = AssetConfig {
+            debridge_id: [0x11; 32],
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+        };
+        assert_eq!(asset_write_allowed(&AssetConfig::default(), &incoming), Ok(true));
+    }
+
+    /// Re-registering the IDENTICAL binding is a no-op rather than an error, so a
+    /// deploy script that runs twice does not fail. This is the one case where
+    /// write-once must not mean "explode".
+    #[test]
+    fn re_registering_the_same_binding_is_an_idempotent_no_op() {
+        let a = AssetConfig {
+            debridge_id: [0x11; 32],
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+        };
+        assert_eq!(asset_write_allowed(&a, &a.clone()), Ok(false));
+    }
+
+    // ---------------------------------------------------------------
     // H-2 — the executed marker
     // ---------------------------------------------------------------
 
@@ -1868,6 +2025,7 @@ mod c1_tests {
         for (v, c) in [(3u32, 8u32), (7, 32), (22, 4), (1, 1)] {
             let cfg = Config {
                 owner: Pubkey::new_unique(),
+                bridge_domain: [0xD0; 32],
                 guardian: Pubkey::new_unique(),
                 validators: (0..v).map(|i| [i as u8; 20]).collect(),
                 threshold: 1,
@@ -2014,6 +2172,7 @@ mod c1_tests {
     fn cfg_with_validators(n: usize) -> Config {
         Config {
             owner: Pubkey::new_unique(),
+            bridge_domain: [0xD0; 32],
             guardian: Pubkey::default(),
             validators: (0..n).map(|i| [i as u8; 20]).collect(),
             threshold: 2,

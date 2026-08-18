@@ -5,6 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {SwapPool} from "../src/SwapPool.sol";
 import {Gate} from "../src/Gate.sol";
+import {GateDeployer} from "../src/GateDeployer.sol";
 import {SwapRouter} from "../src/SwapRouter.sol";
 
 /// @dev Mintable ERC-20 with configurable decimals.
@@ -51,7 +52,9 @@ contract DeployXSwap is Script {
 
         address[] memory vals = new address[](1);
         vals[0] = validator;
-        Gate gate = new Gate(vals, 1);
+        // Local bring-up script: a fixed demo domain is fine here because
+        // nothing it deploys shares a validator set with a real mesh.
+        Gate gate = GateDeployer.deploy(vals, 1, keccak256("selendra.bridge.xswap.demo"));
 
         SwapRouter router = new SwapRouter(gate, pool);
 

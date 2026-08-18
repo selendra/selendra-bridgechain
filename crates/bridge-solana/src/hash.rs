@@ -52,9 +52,14 @@ pub fn debridge_id(native_chain_id: u64, native_token: &[u8; 20]) -> [u8; 32] {
     keccak(&p)
 }
 
-/// The 7-field packed base of every submissionId, unhashed (matches
+/// The 8-field packed base of every submissionId, unhashed (matches
 /// `BridgeHash.packedSubmission`).
+///
+/// `bridge_domain` is the deployment generation, and must equal the domain the
+/// EVM gates were initialized with. Without it an attestation from a superseded
+/// deployment stays valid against a redeployed one.
 fn packed_submission(
+    bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
     amount: &[u8; 32],
     chain_id_from: u64,
@@ -62,8 +67,9 @@ fn packed_submission(
     nonce: u64,
     receiver: &[u8],
 ) -> Vec<u8> {
-    let mut p = Vec::with_capacity(32 * 6 + receiver.len());
+    let mut p = Vec::with_capacity(32 * 7 + receiver.len());
     p.extend_from_slice(&be32(SUBMISSION_PREFIX));
+    p.extend_from_slice(bridge_domain);
     p.extend_from_slice(debridge_id);
     p.extend_from_slice(&be32(chain_id_from));
     p.extend_from_slice(&be32(chain_id_to));
@@ -75,6 +81,7 @@ fn packed_submission(
 
 /// submissionId for a transfer WITHOUT an execution payload.
 pub fn submission_id(
+    bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
     amount: &[u8; 32],
     chain_id_from: u64,
@@ -82,11 +89,20 @@ pub fn submission_id(
     nonce: u64,
     receiver: &[u8],
 ) -> [u8; 32] {
-    keccak(&packed_submission(debridge_id, amount, chain_id_from, chain_id_to, nonce, receiver))
+    keccak(&packed_submission(
+        bridge_domain,
+        debridge_id,
+        amount,
+        chain_id_from,
+        chain_id_to,
+        nonce,
+        receiver,
+    ))
 }
 
 /// submissionId for a transfer WITH an execution payload.
 pub fn submission_id_with_auto(
+    bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
     amount: &[u8; 32],
     chain_id_from: u64,
@@ -95,7 +111,15 @@ pub fn submission_id_with_auto(
     receiver: &[u8],
     auto: &AutoParams,
 ) -> [u8; 32] {
-    let mut p = packed_submission(debridge_id, amount, chain_id_from, chain_id_to, nonce, receiver);
+    let mut p = packed_submission(
+        bridge_domain,
+        debridge_id,
+        amount,
+        chain_id_from,
+        chain_id_to,
+        nonce,
+        receiver,
+    );
     p.extend_from_slice(&auto.execution_fee);
     p.extend_from_slice(&auto.flags);
     p.extend_from_slice(&keccak(&auto.fallback_address));

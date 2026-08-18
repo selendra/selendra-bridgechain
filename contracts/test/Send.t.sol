@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
+import {deployTestGate, TEST_BRIDGE_DOMAIN} from "./helpers/TestGate.sol";
 import {TestToken} from "../src/TestToken.sol";
 import {BridgeHash} from "../src/BridgeHash.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -55,7 +56,7 @@ contract SendTest is Test {
     function setUp() public {
         address[] memory validators = new address[](1);
         validators[0] = address(0xA11CE);
-        gate = new Gate(validators, 1);
+        gate = deployTestGate(validators, 1);
 
         token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
@@ -72,7 +73,7 @@ contract SendTest is Test {
 
         bytes32 debridgeId = BridgeHash.getDebridgeId(block.chainid, address(token));
         bytes32 expectedId = BridgeHash.getSubmissionId(
-            debridgeId, amount, block.chainid, CHAIN_TO, 0, receiver
+            TEST_BRIDGE_DOMAIN, debridgeId, amount, block.chainid, CHAIN_TO, 0, receiver
         );
 
         vm.expectEmit(true, true, true, true);

@@ -16,6 +16,7 @@
 //!   gate-admin --rpc <url> --keypair <path> --program <pubkey> <command>
 //!
 //!     init --chain-id N --threshold N --validator 0x.. [--validator 0x..]
+//!          --bridge-domain <0x…32 bytes>
 //!          [--max-validators N] [--max-corridors N] [--guardian <pubkey>]
 //!     register-corridor --chain-id-to N
 //!     register-asset --debridge-id 0x.. --mint <pubkey> --vault <pubkey>
@@ -40,12 +41,34 @@
 use std::str::FromStr;
 
 use bridge_solana::instruction::{GateInstruction, InitArgs};
+use borsh::BorshDeserialize;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Signer};
 use solana_sdk::transaction::Transaction;
+
+/// A read-only Borsh mirror of `solana_gate::Config`, for `show`.
+///
+/// gate-admin cannot depend on `solana-gate` directly (it pins an older
+/// `solana-program` than `solana-client` resolves), so the layout is duplicated
+/// here. Field ORDER is the wire format — keep it identical to the program's
+/// struct, and append new fields in the same position the program appends them.
+/// `try_from_slice` then fails loudly on drift instead of printing zeros.
+#[derive(borsh::BorshDeserialize)]
+struct ConfigView {
+    owner: Pubkey,
+    bridge_domain: [u8; 32],
+    guardian: Pubkey,
+    validators: Vec<[u8; 20]>,
+    threshold: u32,
+    chain_id: u64,
+    paused: bool,
+    max_validators: u32,
+    max_corridors: u32,
+    nonce_to: Vec<(u64, u64)>,
+}
 
 /// The BPF upgradeable loader — `init` proves the caller is the program's
 /// upgrade authority, which means reading the loader's ProgramData account.
@@ -163,21 +186,41 @@ fn main() -> anyhow::Result<()> {
         match rpc.get_account(&config_pda) {
             Ok(acct) => {
                 println!("config account : {} bytes, owner {}", acct.data.len(), acct.owner);
-                // owner(32) guardian(32) len(4) validators(20n) threshold(4) chain_id(8) paused(1)
-                let d = &acct.data;
-                if d.len() >= 68 {
-                    let n = u32::from_le_bytes(d[64..68].try_into()?) as usize;
-                    let end = 68 + n * 20;
-                    println!("  owner        : {}", Pubkey::new_from_array(d[0..32].try_into()?));
-                    println!("  validators   : {n}");
-                    for i in 0..n {
-                        println!("    0x{}", hex::encode(&d[68 + i * 20..88 + i * 20]));
+                // Deserialized, NOT sliced at hardcoded offsets. The previous
+                // version read `validators` from byte 64 and silently reported
+                // zeros for everything once `bridge_domain` was inserted ahead
+                // of `guardian` — a diagnostic that lies is worse than none, and
+                // every future field would repeat the bug.
+                // `deserialize`, not `try_from_slice`: the account is SIZED for its
+                // max_validators/max_corridors capacity, so a freshly-initialized
+                // config is followed by unused padding. try_from_slice rejects
+                // that as "Not all bytes read".
+                match ConfigView::deserialize(&mut &acct.data[..]) {
+                    Ok(c) => {
+                        println!("  owner        : {}", c.owner);
+                        println!("  bridge domain: 0x{}", hex::encode(c.bridge_domain));
+                        println!(
+                            "  guardian     : {}",
+                            if c.guardian == Pubkey::default() {
+                                "none".to_string()
+                            } else {
+                                c.guardian.to_string()
+                            }
+                        );
+                        println!("  validators   : {}", c.validators.len());
+                        for v in &c.validators {
+                            println!("    0x{}", hex::encode(v));
+                        }
+                        println!("  threshold    : {}", c.threshold);
+                        println!("  chain_id     : {}", c.chain_id);
+                        println!("  paused       : {}", c.paused);
+                        println!("  capacity     : {} validators, {} corridors", c.max_validators, c.max_corridors);
+                        println!("  corridors    : {}", c.nonce_to.len());
+                        for (chain, nonce) in &c.nonce_to {
+                            println!("    -> chain {chain}  next nonce {nonce}");
+                        }
                     }
-                    if d.len() >= end + 13 {
-                        println!("  threshold    : {}", u32::from_le_bytes(d[end..end + 4].try_into()?));
-                        println!("  chain_id     : {}", u64::from_le_bytes(d[end + 4..end + 12].try_into()?));
-                        println!("  paused       : {}", d[end + 12] != 0);
-                    }
+                    Err(e) => println!("  UNREADABLE: {e} (layout drift between program and gate-admin?)"),
                 }
             }
             Err(_) => println!("config account : NOT INITIALIZED (run `init`)"),
@@ -196,6 +239,9 @@ fn main() -> anyhow::Result<()> {
                 args.get("--max-validators").unwrap_or_else(|| "8".into()).parse()?;
             let max_corridors: u32 =
                 args.get("--max-corridors").unwrap_or_else(|| "8".into()).parse()?;
+            // Required, with no default: a defaulted domain shared by every
+            // deployment would be the same as having none.
+            let bridge_domain = parse_b32(&args.req("--bridge-domain")?)?;
             let guardian = match args.get("--guardian") {
                 Some(g) => Pubkey::from_str(&g)?.to_bytes(),
                 None => [0u8; 32],
@@ -207,6 +253,7 @@ fn main() -> anyhow::Result<()> {
 
             (
                 GateInstruction::Init(InitArgs {
+                    bridge_domain,
                     validators,
                     threshold,
                     chain_id,
@@ -287,8 +334,17 @@ fn main() -> anyhow::Result<()> {
             // program uses exactly these to build the id.
             let cfg_acct = rpc.get_account(&config_pda)?;
             let d = &cfg_acct.data;
-            let n = u32::from_le_bytes(d[64..68].try_into()?) as usize;
-            let after_validators = 68 + n * 20;
+            // Borsh Config layout, in declaration order and with no header:
+            //   owner(32) | bridge_domain(32) | guardian(32) | validators(4+20n) | …
+            // Adding a field ahead of these shifts every offset below, which is
+            // why the domain read and the length read are derived from the same
+            // running total rather than two independent magic numbers.
+            let bridge_domain: [u8; 32] = d[32..64].try_into()?;
+            let validators_off = 32 + 32 + 32;
+            let n = u32::from_le_bytes(
+                d[validators_off..validators_off + 4].try_into()?,
+            ) as usize;
+            let after_validators = validators_off + 4 + n * 20;
             let chain_id = u64::from_le_bytes(
                 d[after_validators + 4..after_validators + 12].try_into()?,
             );
@@ -312,6 +368,7 @@ fn main() -> anyhow::Result<()> {
             // as `BridgeHash.sol` defines it. Using the with-auto form here would
             // produce an id the gate never derives.
             let id = bridge_solana::hash::submission_id(
+                &bridge_domain,
                 &debridge_id,
                 &bridge_solana::hash::amount_word(amount as u128),
                 chain_id,

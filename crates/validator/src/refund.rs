@@ -99,6 +99,59 @@ impl GateReader {
             refunded: gate.refunded(id).block(at).call().await?,
         })
     }
+
+    /// A block that is provably at least `timeout_secs` old, measured against the
+    /// chain's OWN head timestamp rather than our wall clock (a validator with a
+    /// skewed clock must not be able to attest early, and block timestamps are
+    /// what the chain actually agrees on).
+    ///
+    /// Conservative by construction: any block old enough will do, so we step back
+    /// exponentially until the timestamp condition holds rather than binary-
+    /// searching for the newest such block. Overshooting only makes the effective
+    /// timeout longer, which is the safe direction. Typically one or two calls,
+    /// because block times are stable.
+    ///
+    /// `Ok(None)` means the chain has no block that old yet (a fresh dev chain),
+    /// in which case nothing may be attested.
+    async fn aged_block(&self, timeout_secs: i64) -> anyhow::Result<Option<u64>> {
+        let head_num = self.confirmed_block().await?;
+        let head = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(head_num))
+            .await?
+            .context("confirmed head block vanished")?;
+        let target = (head.header.timestamp as i64).saturating_sub(timeout_secs);
+
+        // Start from a 12s/block estimate, then double until we are far enough
+        // back. Bounded so a pathological chain cannot spin here.
+        let mut step: u64 = ((timeout_secs.max(1) as u64) / 12).max(1);
+        for _ in 0..24 {
+            let Some(candidate) = head_num.checked_sub(step) else { return Ok(None) };
+            let block = self
+                .provider
+                .get_block_by_number(BlockNumberOrTag::Number(candidate))
+                .await?
+                .context("candidate block vanished")?;
+            if (block.header.timestamp as i64) <= target {
+                return Ok(Some(candidate));
+            }
+            step = step.saturating_mul(2);
+        }
+        Ok(None)
+    }
+
+    /// Was `id` already locked on this gate as of `block`?
+    ///
+    /// `sentBy` is written by `send` in the same transaction that locks the funds,
+    /// so a non-zero value at a historical height is the chain's own statement
+    /// that the deposit existed by then. Reading it at an aged block is therefore
+    /// an *authenticated* age check — no timestamp from the store, no schema
+    /// change, one `eth_call`.
+    async fn was_sent_by_block(&self, id: B256, block: u64) -> anyhow::Result<bool> {
+        let at = BlockNumberOrTag::Number(block).into();
+        let gate = Gate::new(self.gate, &self.provider);
+        Ok(gate.sentBy(id).block(at).call().await? != Address::ZERO)
+    }
 }
 
 struct DestinationState {
@@ -125,9 +178,33 @@ enum Decision {
 
 /// Decide from on-chain facts alone. Split out from the I/O so the safety rules
 /// are unit-testable.
+///
+/// `aged_out` is this validator's OWN answer to "has the unclaimed timeout
+/// elapsed?", derived from `sentBy` at a historical block (see
+/// [`GateReader::was_sent_by_block`]) — never from the store's `refund_status`.
+///
+/// ## Why the timeout has to be checked here (finding H-2)
+///
+/// The store only nominates candidates: `sweep_refund_eligible` flips
+/// `refund_status` to `'eligible'` after `refund_timeout_secs`. This loop used to
+/// treat "it is on the candidate list" as "the timeout has elapsed", so the
+/// entire unclaimed-timeout rested on a database column — a value no validator
+/// verified, and one the module docs wrongly described as unable to authorise
+/// anything.
+///
+/// It authorised plenty: a wrong `created_at`, clock skew, a misconfigured sweep
+/// interval, or write access to the DB nominates healthy in-flight transfers, and
+/// within one poll interval the validators attest cancels for all of them.
+/// `cancel` is irreversible and permanently forecloses the payout, so that turns
+/// a DB fault into a fleet-wide forced-refund of everything in flight.
+///
+/// The destination check (`executed == false`) never stopped it, because a
+/// transfer that is merely *in flight* has not been claimed yet either — that is
+/// precisely the window an early cancel steals.
 fn decide(
     src: &SourceState,
     dst: &DestinationState,
+    aged_out: bool,
     already_attested_cancel: bool,
     already_attested_refund: bool,
 ) -> Decision {
@@ -140,6 +217,8 @@ fn decide(
     if src.refunded || src.sent_by == Address::ZERO {
         return Decision::Skip("already refunded, or not sent from this gate");
     }
+    // A burn that is already on-chain is a settled fact — the refund leg does not
+    // re-litigate the timeout, it only follows the destination.
     if dst.cancelled {
         return if already_attested_refund {
             Decision::Skip("refund already attested by us")
@@ -149,6 +228,11 @@ fn decide(
     }
     if already_attested_cancel {
         return Decision::Skip("cancel already attested by us");
+    }
+    // Burning a transfer the keeper may still be about to deliver is not ours to
+    // do until the window we independently verified has actually passed.
+    if !aged_out {
+        return Decision::Skip("unclaimed timeout has not elapsed (verified on-chain)");
     }
     Decision::AttestCancel
 }
@@ -210,8 +294,16 @@ pub async fn run(
         };
 
         for rec in candidates {
-            if let Err(e) =
-                handle_candidate(&rec, &source_readers, &dest_readers, &signer, signer_addr, &sink).await
+            if let Err(e) = handle_candidate(
+                &rec,
+                &source_readers,
+                &dest_readers,
+                &signer,
+                signer_addr,
+                &sink,
+                cfg.timeout_secs,
+            )
+            .await
             {
                 warn!(submission_id = %rec.submission_id, error = %e, "refund attestation failed");
             }
@@ -221,6 +313,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_candidate(
     rec: &SubmissionRecord,
     source_readers: &BTreeMap<u64, GateReader>,
@@ -228,6 +321,7 @@ async fn handle_candidate(
     signer: &PrivateKeySigner,
     signer_addr: Address,
     sink: &Sink,
+    timeout_secs: i64,
 ) -> anyhow::Result<()> {
     // Only vote on corridors we can verify BOTH ends of. Attesting on a chain we
     // cannot read would mean trusting the store's word for whether a transfer was
@@ -240,10 +334,28 @@ async fn handle_candidate(
     let src_state = src.source_state(id).await.context("reading source gate")?;
     let dst_state = dst.destination_state(id).await.context("reading destination gate")?;
 
+    // H-2: establish the unclaimed timeout OURSELVES, from the source chain, and
+    // never from the store's nomination. Only needed on the cancel leg — once the
+    // destination is burned the refund follows an on-chain fact, not a timer — so
+    // skip the reads when they cannot change the outcome.
+    let aged_out = if dst_state.cancelled {
+        true
+    } else {
+        match src.aged_block(timeout_secs).await.context("locating an aged source block")? {
+            Some(block) => src
+                .was_sent_by_block(id, block)
+                .await
+                .context("reading historical sentBy")?,
+            // The chain has no block old enough yet: nothing can have aged out.
+            None => false,
+        }
+    };
+
     let mine = |sigs: &[SignerSig]| sigs.iter().any(|s| s.signer.eq_ignore_ascii_case(&format!("{signer_addr:#x}")));
     let decision = decide(
         &src_state,
         &dst_state,
+        aged_out,
         mine(&rec.cancel_signatures),
         mine(&rec.refund_signatures),
     );
@@ -299,33 +411,83 @@ mod tests {
         SourceState { sent_by: sender(), refunded }
     }
 
+    /// This validator verified, on-chain, that the unclaimed timeout has elapsed.
+    const AGED: bool = true;
+
     #[test]
     fn never_attests_a_delivered_transfer() {
         // THE safety rule. A claimed transfer must never earn a cancel or refund
         // attestation, whatever the store says about timeouts.
         let dst = DestinationState { executed: true, cancelled: false };
-        assert!(matches!(decide(&src(false), &dst, false, false), Decision::Skip(_)));
+        assert!(matches!(decide(&src(false), &dst, AGED, false, false), Decision::Skip(_)));
     }
 
     #[test]
-    fn attests_cancel_when_destination_is_untouched() {
+    fn attests_cancel_when_destination_is_untouched_and_aged_out() {
         let dst = DestinationState { executed: false, cancelled: false };
-        assert_eq!(decide(&src(false), &dst, false, false), Decision::AttestCancel);
+        assert_eq!(decide(&src(false), &dst, AGED, false, false), Decision::AttestCancel);
+    }
+
+    /// THE H-2 rule. Appearing on the store's candidate list is not evidence of
+    /// anything: the validator establishes the age itself against the source
+    /// chain, and until that passes it will not burn a transfer the keeper may
+    /// still be about to deliver.
+    #[test]
+    fn never_attests_a_cancel_before_the_timeout_it_verified_itself() {
+        let untouched = DestinationState { executed: false, cancelled: false };
+        assert_eq!(
+            decide(&src(false), &untouched, false, false, false),
+            Decision::Skip("unclaimed timeout has not elapsed (verified on-chain)"),
+            "a store nomination alone must not authorise a burn"
+        );
+        // The same candidate becomes attestable once it has genuinely aged.
+        assert_eq!(
+            decide(&src(false), &untouched, AGED, false, false),
+            Decision::AttestCancel
+        );
+    }
+
+    /// The finding's actual attack: a DB that flags everything eligible the moment
+    /// it is created must not be able to force a fleet-wide cancel of healthy
+    /// in-flight transfers. Note the destination check never caught this — an
+    /// in-flight transfer is unclaimed too, which is exactly the window a
+    /// premature cancel steals.
+    #[test]
+    fn a_compromised_store_cannot_shorten_the_window() {
+        let in_flight = DestinationState { executed: false, cancelled: false };
+        for already_cancel in [false, true] {
+            let d = decide(&src(false), &in_flight, false, already_cancel, false);
+            assert!(
+                matches!(d, Decision::Skip(_)),
+                "a not-yet-aged transfer must never be cancelled, got {d:?}"
+            );
+        }
+    }
+
+    /// The refund leg follows an on-chain burn rather than a timer, so it does not
+    /// re-check the age: by then the destination is provably foreclosed.
+    #[test]
+    fn a_burned_destination_still_earns_a_refund_without_an_age_check() {
+        let burned = DestinationState { executed: true, cancelled: true };
+        assert_eq!(decide(&src(false), &burned, false, true, false), Decision::AttestRefund);
     }
 
     #[test]
     fn attests_refund_only_after_the_burn_is_on_chain() {
         let untouched = DestinationState { executed: false, cancelled: false };
-        assert_eq!(decide(&src(false), &untouched, true, false), Decision::Skip("cancel already attested by us"));
+        assert_eq!(
+            decide(&src(false), &untouched, AGED, true, false),
+            Decision::Skip("cancel already attested by us")
+        );
 
         let burned = DestinationState { executed: true, cancelled: true };
-        assert_eq!(decide(&src(false), &burned, true, false), Decision::AttestRefund);
+        assert_eq!(decide(&src(false), &burned, AGED, true, false), Decision::AttestRefund);
     }
 
     #[test]
     fn stops_once_the_source_has_paid_out() {
         let burned = DestinationState { executed: true, cancelled: true };
-        assert!(matches!(decide(&src(true), &burned, true, true), Decision::Skip(_)));
+        assert!(matches!(decide(&src(true), &burned, AGED, true, true), Decision::Skip(_)));
     }
 
     #[test]
@@ -333,14 +495,14 @@ mod tests {
         // A quorum must not form for a transfer that was never locked here.
         let burned = DestinationState { executed: true, cancelled: true };
         let ghost = SourceState { sent_by: Address::ZERO, refunded: false };
-        assert!(matches!(decide(&ghost, &burned, false, false), Decision::Skip(_)));
+        assert!(matches!(decide(&ghost, &burned, AGED, false, false), Decision::Skip(_)));
     }
 
     #[test]
     fn does_not_re_attest() {
         let burned = DestinationState { executed: true, cancelled: true };
         assert_eq!(
-            decide(&src(false), &burned, true, true),
+            decide(&src(false), &burned, AGED, true, true),
             Decision::Skip("refund already attested by us")
         );
     }
