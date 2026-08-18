@@ -21,6 +21,14 @@ pub struct SignerSig {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmissionRecord {
     pub submission_id: String,
+    /// `0x`-prefixed 32-byte deployment domain, read from the gate's `["config"]`
+    /// PDA. NOT optional and NOT defaultable here: the store parses it strictly
+    /// and rejects the whole submission if it is empty, which is the point — a
+    /// record with no domain belongs to no generation and must never be signed
+    /// for. Omitting it from this struct is what silently killed the entire
+    /// Solana -> EVM direction, since the store's own field IS `#[serde(default)]`
+    /// and so accepted the missing key, then failed on the empty value.
+    pub bridge_domain: String,
     pub debridge_id: String,
     /// decimal string (uint256 on the EVM side)
     pub amount: String,
@@ -122,5 +130,78 @@ impl Store {
             anyhow::bail!("sig-store list failed ({})", res.status());
         }
         Ok(res.json().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_record() -> SubmissionRecord {
+        SubmissionRecord {
+            submission_id: format!("0x{}", "11".repeat(32)),
+            bridge_domain: format!("0x{}", "22".repeat(32)),
+            debridge_id: format!("0x{}", "33".repeat(32)),
+            amount: "1000000".into(),
+            chain_id_from: 7_565_164,
+            chain_id_to: 11_155_111,
+            nonce: 0,
+            receiver: format!("0x{}", "44".repeat(20)),
+            auto_params: "0x".into(),
+            native_sender: format!("0x{}", "55".repeat(32)),
+            token: String::new(),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    /// THE REGRESSION. This struct is a hand-maintained duplicate of
+    /// `bridge_core::store::SubmissionRecord` (the crates cannot link: alloy needs
+    /// `zeroize ^1.5`, solana-client pins `<1.4`). When `bridge_domain` was added
+    /// to the canonical record it was NOT added here, and because the canonical
+    /// field is `#[serde(default)]` the store happily accepted the missing key —
+    /// then rejected the empty value with `malformed field: bridge_domain`, and
+    /// every Solana-origin transfer failed to store. Nothing in either crate's
+    /// tests noticed, because neither can see the other's struct.
+    ///
+    /// So the wire format is pinned HERE, as an explicit key list.
+    #[test]
+    fn the_wire_format_carries_every_field_the_store_requires() {
+        let json = serde_json::to_value(a_record()).expect("serializes");
+        let obj = json.as_object().expect("an object");
+
+        // Exactly the serde names `bridge_core::store::SubmissionRecord` reads.
+        for key in [
+            "submission_id",
+            "bridge_domain",
+            "debridge_id",
+            "amount",
+            "chain_id_from",
+            "chain_id_to",
+            "nonce",
+            "receiver",
+            "auto_params",
+            "native_sender",
+            "token",
+            "signatures",
+            "cancel_signatures",
+            "refund_signatures",
+        ] {
+            assert!(obj.contains_key(key), "the store requires `{key}`, and it is not on the wire");
+        }
+    }
+
+    /// The store parses `bridge_domain` with `B256::from_str`, which accepts only
+    /// `0x` + 64 hex. An empty string — the value a missing field defaults to —
+    /// is the exact failure that took the Solana leg down, so pin the shape.
+    #[test]
+    fn bridge_domain_is_sent_as_an_0x_prefixed_32_byte_hex_string() {
+        let json = serde_json::to_value(a_record()).expect("serializes");
+        let d = json["bridge_domain"].as_str().expect("a string");
+        assert!(d.starts_with("0x"), "must be 0x-prefixed, got {d}");
+        assert_eq!(d.len(), 66, "must be 0x + 64 hex chars, got {} in {d}", d.len());
+        assert!(d[2..].chars().all(|c| c.is_ascii_hexdigit()), "must be hex: {d}");
+        assert_ne!(d, "0x", "an empty domain is rejected by the store, not defaulted");
     }
 }

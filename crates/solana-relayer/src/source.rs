@@ -406,6 +406,11 @@ impl Scanner {
 
         let record = SubmissionRecord {
             submission_id: format!("0x{}", hex::encode(sent.submission_id)),
+            // The SAME domain this scanner recomputed the id under, so the store
+            // re-derives the identical id. Reading it from `self` (which loaded it
+            // from the chain) rather than from config means a relayer can never
+            // attest under a domain the gate does not actually carry.
+            bridge_domain: format!("0x{}", hex::encode(self.bridge_domain)),
             debridge_id: format!("0x{}", hex::encode(sent.debridge_id)),
             amount: sent.amount.to_string(),
             chain_id_from: sent.chain_id_from,

@@ -136,29 +136,57 @@ pub struct GateConfig {
     pub threshold: u32,
 }
 
-/// Decode `Config { owner, guardian, validators, threshold, .. }` — we stop
-/// reading after `threshold`, so trailing fields (chain_id, paused, capacities,
-/// nonce_to) are ignored and may change without breaking this.
+/// A Borsh mirror of `solana_gate::Config`, in the program's field order.
+///
+/// This crate cannot depend on `solana-gate` (it pins an older `solana-program`
+/// than `solana-client` resolves), so the layout is duplicated. Field ORDER is
+/// the wire format: keep it identical to the program's struct.
+///
+/// It is a STRUCT, deliberately, and not a set of byte offsets. The previous
+/// version sliced `validators` from byte 64 on the assumption that `guardian`
+/// followed `owner` directly. When `bridge_domain` was inserted between them,
+/// every offset shifted by 32 and the decoder began reading the validator count
+/// out of the middle of `guardian` — which on a real config is `Pubkey::default()`,
+/// so it decoded as "zero validators, threshold zero" without erroring. The
+/// claim submitter then filtered away every signature it had.
+#[derive(borsh::BorshDeserialize)]
+struct ConfigView {
+    #[allow(dead_code)]
+    owner: [u8; 32],
+    #[allow(dead_code)]
+    bridge_domain: [u8; 32],
+    #[allow(dead_code)]
+    guardian: [u8; 32],
+    validators: Vec<[u8; 20]>,
+    threshold: u32,
+    #[allow(dead_code)]
+    chain_id: u64,
+    #[allow(dead_code)]
+    paused: bool,
+}
+
+/// Decode the gate's `Config` account.
 fn decode_gate_config(data: &[u8]) -> anyhow::Result<GateConfig> {
-    // owner(32) + guardian(32) + vec-len(4)
-    if data.len() < 68 {
-        anyhow::bail!("config account is too short to hold a validator set");
+    // `deserialize`, not `try_from_slice`: the account is sized for its
+    // max_validators/max_corridors capacity, so real data is followed by unused
+    // padding that `try_from_slice` would reject as "not all bytes read". Reading
+    // a prefix also means the trailing fields (capacities, nonce_to) can change
+    // without breaking this.
+    let view = <ConfigView as borsh::BorshDeserialize>::deserialize(&mut &data[..])
+        .map_err(|e| anyhow::anyhow!("config account does not match the expected layout: {e}"))?;
+
+    // An initialized gate ALWAYS has at least one validator — `init` refuses an
+    // empty set. So decoding to none is never a real gate state; it is layout
+    // drift, and it is the specific failure that must not pass silently, because
+    // an empty validator set filters every signature away and is indistinguishable
+    // from "nobody has signed yet".
+    if view.validators.is_empty() {
+        anyhow::bail!(
+            "config decoded with an EMPTY validator set — the account layout has drifted \
+             from this decoder; refusing to run with a filter that drops every signature"
+        );
     }
-    let n = u32::from_le_bytes(data[64..68].try_into()?) as usize;
-    let end = 68 + n * 20;
-    if data.len() < end + 4 {
-        anyhow::bail!("config account declares {n} validators but is too short to hold them");
-    }
-    let validators =
-        (0..n).map(|i| {
-            let off = 68 + i * 20;
-            let mut a = [0u8; 20];
-            a.copy_from_slice(&data[off..off + 20]);
-            a
-        })
-        .collect();
-    let threshold = u32::from_le_bytes(data[end..end + 4].try_into()?);
-    Ok(GateConfig { validators, threshold })
+    Ok(GateConfig { validators: view.validators, threshold: view.threshold })
 }
 
 /// Signatures ordered by recovered signer, ascending, keeping ONLY registered
@@ -259,7 +287,12 @@ impl Submitter {
                 cfg.threshold,
                 cfg.threshold
             ),
-            Some(cfg) => info!(threshold = cfg.threshold, "gate threshold is 1"),
+            Some(cfg) => info!(
+                threshold = cfg.threshold,
+                validators = cfg.validators.len(),
+                "gate threshold is {}; this process alone can reach it",
+                cfg.threshold
+            ),
             None => warn!("could not read the gate config to report its threshold"),
         }
         loop {
@@ -629,23 +662,74 @@ mod tests {
         assert_eq!(ordered_signatures(&id, &raw, &cfg).len(), 2);
     }
 
-    /// Borsh `Config`: owner(32) ‖ guardian(32) ‖ len(4) ‖ validators(20·n) ‖
-    /// threshold(4) ‖ … — decoded by hand here, so it is pinned by a test.
+    /// Build a `Config` account body the way the PROGRAM serializes it. Every
+    /// field is written, in order, including the ones the decoder ignores —
+    /// a fixture that omits a field cannot catch a decoder that omits the same
+    /// field, which is exactly how the `bridge_domain` shift went unnoticed.
+    fn program_config_bytes(validators: &[[u8; 20]], threshold: u32) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[7u8; 32]); // owner
+        d.extend_from_slice(&[9u8; 32]); // bridge_domain
+        d.extend_from_slice(&[0u8; 32]); // guardian — Pubkey::default(), the common case
+        d.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+        for v in validators {
+            d.extend_from_slice(v);
+        }
+        d.extend_from_slice(&threshold.to_le_bytes());
+        d.extend_from_slice(&7_565_164u64.to_le_bytes()); // chain_id
+        d.push(0); // paused
+        d.extend_from_slice(&8u32.to_le_bytes()); // max_validators
+        d.extend_from_slice(&8u32.to_le_bytes()); // max_corridors
+        d.extend_from_slice(&0u32.to_le_bytes()); // nonce_to.len()
+        d
+    }
+
     #[test]
     fn config_layout_matches_the_program() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&[7u8; 32]); // owner
-        data.extend_from_slice(&[8u8; 32]); // guardian
-        data.extend_from_slice(&2u32.to_le_bytes()); // validators.len()
-        data.extend_from_slice(&[0xAAu8; 20]);
-        data.extend_from_slice(&[0xBBu8; 20]);
-        data.extend_from_slice(&3u32.to_le_bytes()); // threshold
-        data.extend_from_slice(&7565164u64.to_le_bytes()); // chain_id — ignored
-        data.push(0); // paused — ignored
-
+        let data = program_config_bytes(&[[0xAAu8; 20], [0xBBu8; 20]], 3);
         let cfg = decode_gate_config(&data).expect("decodes");
         assert_eq!(cfg.validators, vec![[0xAAu8; 20], [0xBBu8; 20]]);
         assert_eq!(cfg.threshold, 3);
+    }
+
+    /// The account is SIZED for max_validators/max_corridors, so a real one is
+    /// followed by unused padding. Decoding must read a prefix, not demand an
+    /// exact fit.
+    #[test]
+    fn trailing_capacity_padding_is_tolerated() {
+        let mut data = program_config_bytes(&[[0xCCu8; 20]], 1);
+        data.extend_from_slice(&[0u8; 200]);
+        let cfg = decode_gate_config(&data).expect("decodes despite padding");
+        assert_eq!(cfg.threshold, 1);
+        assert_eq!(cfg.validators.len(), 1);
+    }
+
+    /// THE REGRESSION. `bridge_domain` was inserted between `owner` and
+    /// `guardian`; a decoder still using the old offsets reads the validator
+    /// count out of `guardian` — all zeros on a real gate — and yields "no
+    /// validators, threshold 0" with no error at all. That silently filtered
+    /// away every signature the claim submitter had.
+    #[test]
+    fn a_config_without_bridge_domain_is_rejected_not_silently_zeroed() {
+        // The pre-domain layout: owner ‖ guardian ‖ validators ‖ threshold ‖ …
+        let mut old = Vec::new();
+        old.extend_from_slice(&[7u8; 32]); // owner
+        old.extend_from_slice(&[0u8; 32]); // guardian
+        old.extend_from_slice(&2u32.to_le_bytes());
+        old.extend_from_slice(&[0xAAu8; 20]);
+        old.extend_from_slice(&[0xBBu8; 20]);
+        old.extend_from_slice(&2u32.to_le_bytes()); // threshold
+        old.extend_from_slice(&7_565_164u64.to_le_bytes());
+        old.push(0);
+
+        match decode_gate_config(&old) {
+            Err(_) => {}
+            Ok(cfg) => panic!(
+                "a stale-layout config decoded instead of erroring: {} validators, threshold {}",
+                cfg.validators.len(),
+                cfg.threshold
+            ),
+        }
     }
 
     /// A truncated or lying account must fail loudly rather than silently decode
@@ -656,9 +740,16 @@ mod tests {
         assert!(decode_gate_config(&[0u8; 40]).is_err(), "too short for the header");
 
         // Header claims 5 validators; the body holds none.
-        let mut lying = vec![0u8; 64];
+        let mut lying = vec![0u8; 96];
         lying.extend_from_slice(&5u32.to_le_bytes());
         assert!(decode_gate_config(&lying).is_err(), "declared length must be honoured");
+
+        // An honestly-empty validator set is also refused: `init` cannot produce
+        // one, so it can only mean layout drift.
+        assert!(
+            decode_gate_config(&program_config_bytes(&[], 0)).is_err(),
+            "an empty validator set must be an error, not a filter that drops everything"
+        );
     }
 
     /// The remediation plan listed the compute cost as "unmeasured, flagged for

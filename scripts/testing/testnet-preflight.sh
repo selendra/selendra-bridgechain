@@ -35,6 +35,29 @@ DEPLOY_MIN=${DEPLOY_MIN:-10000000000000000}   # 0.01 ETH
 KEEPER_MIN=${KEEPER_MIN:-2000000000000000}    # 0.002 ETH
 KEEPER_TOPUP=${KEEPER_TOPUP:-3000000000000000} # 0.003 ETH
 
+# What the DEPLOYER actually needs depends on what this run will do, and those
+# are very different numbers. Once a mesh is deployed and the config pins its
+# addresses (DEPLOY_* all false), the deployer broadcasts nothing at startup —
+# the keeper is the only account that spends, and it has its own check below.
+# Demanding deploy money anyway reports a perfectly runnable stack as NOT READY
+# and sends the operator to a faucet for gas nothing is going to spend.
+#
+# Defaults match run.sh: unset means true, so an incomplete config is held to the
+# HIGHER bar rather than waved through.
+if [[ -n "${DEPLOY:-}" ]]; then
+  DEPLOY_TOKENS="${DEPLOY_TOKENS:-$DEPLOY}"; DEPLOY_BRIDGE="${DEPLOY_BRIDGE:-$DEPLOY}"; DEPLOY_SWAP="${DEPLOY_SWAP:-$DEPLOY}"
+fi
+DEPLOY_TOKENS="${DEPLOY_TOKENS:-true}"; DEPLOY_BRIDGE="${DEPLOY_BRIDGE:-true}"; DEPLOY_SWAP="${DEPLOY_SWAP:-true}"
+if [[ "$DEPLOY_TOKENS" == "true" || "$DEPLOY_BRIDGE" == "true" || "$DEPLOY_SWAP" == "true" ]]; then
+  DEPLOYER_MIN="$DEPLOY_MIN"
+  DEPLOY_MODE="deploying (tokens=$DEPLOY_TOKENS bridge=$DEPLOY_BRIDGE swap=$DEPLOY_SWAP)"
+else
+  # Run-only: the deployer's remaining job is to top the keeper up, so it needs
+  # to be able to afford one transfer.
+  DEPLOYER_MIN="$KEEPER_TOPUP"
+  DEPLOY_MODE="run-only (contracts already deployed; deployer broadcasts nothing)"
+fi
+
 DEPLOYER=$(cast wallet address "$DEPLOYER_KEY")
 KEEPER=$(cast wallet address "$KEEPER_KEY")
 
@@ -63,6 +86,8 @@ if [[ "${SOURCE_ALLOW_ZERO_CONFIRMATION:-false}" == "true" || "${SOURCE_BLOCK_CO
   exit 1
 fi
 echo "finality  : source=${SOURCE_BLOCK_CONFIRMATION} refund=${REFUND_BLOCK_CONFIRMATION} confirmations (zero opt-out off) OK"
+echo "mode      : $DEPLOY_MODE"
+echo "deployer needs $(eth "$DEPLOYER_MIN") ETH per chain; keeper needs $(eth "$KEEPER_MIN") ETH"
 echo
 
 for entry in "${CHAINS[@]}"; do
@@ -83,8 +108,8 @@ for entry in "${CHAINS[@]}"; do
 
   # --- 2. deployer balance
   dbal=$(timeout 20 cast balance "$DEPLOYER" --rpc-url "$rpc" 2>/dev/null || echo 0)
-  if (( $(printf '%s' "$dbal") < DEPLOY_MIN )); then
-    note "DEPLOYER UNDERFUNDED: $(eth "$dbal") ETH, need $(eth "$DEPLOY_MIN") — use a faucet"
+  if (( $(printf '%s' "$dbal") < DEPLOYER_MIN )); then
+    note "DEPLOYER UNDERFUNDED: $(eth "$dbal") ETH, need $(eth "$DEPLOYER_MIN") — use a faucet"
     fail=1
   else
     note "deployer $(eth "$dbal") ETH OK"
@@ -93,7 +118,7 @@ for entry in "${CHAINS[@]}"; do
   # --- 3. keeper balance, topped up from the deployer on request
   kbal=$(timeout 20 cast balance "$KEEPER" --rpc-url "$rpc" 2>/dev/null || echo 0)
   if (( $(printf '%s' "$kbal") < KEEPER_MIN )); then
-    if [[ "$FUND" == "true" ]] && (( $(printf '%s' "$dbal") >= DEPLOY_MIN )); then
+    if [[ "$FUND" == "true" ]] && (( $(printf '%s' "$dbal") >= KEEPER_TOPUP )); then
       note "keeper $(eth "$kbal") ETH — sending $(eth "$KEEPER_TOPUP") ETH from the deployer"
       cast send "$KEEPER" --value "$KEEPER_TOPUP" \
         --private-key "$DEPLOYER_KEY" --rpc-url "$rpc" >/dev/null

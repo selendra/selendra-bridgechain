@@ -41,12 +41,34 @@
 use std::str::FromStr;
 
 use bridge_solana::instruction::{GateInstruction, InitArgs};
+use borsh::BorshDeserialize;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Signer};
 use solana_sdk::transaction::Transaction;
+
+/// A read-only Borsh mirror of `solana_gate::Config`, for `show`.
+///
+/// gate-admin cannot depend on `solana-gate` directly (it pins an older
+/// `solana-program` than `solana-client` resolves), so the layout is duplicated
+/// here. Field ORDER is the wire format — keep it identical to the program's
+/// struct, and append new fields in the same position the program appends them.
+/// `try_from_slice` then fails loudly on drift instead of printing zeros.
+#[derive(borsh::BorshDeserialize)]
+struct ConfigView {
+    owner: Pubkey,
+    bridge_domain: [u8; 32],
+    guardian: Pubkey,
+    validators: Vec<[u8; 20]>,
+    threshold: u32,
+    chain_id: u64,
+    paused: bool,
+    max_validators: u32,
+    max_corridors: u32,
+    nonce_to: Vec<(u64, u64)>,
+}
 
 /// The BPF upgradeable loader — `init` proves the caller is the program's
 /// upgrade authority, which means reading the loader's ProgramData account.
@@ -164,21 +186,41 @@ fn main() -> anyhow::Result<()> {
         match rpc.get_account(&config_pda) {
             Ok(acct) => {
                 println!("config account : {} bytes, owner {}", acct.data.len(), acct.owner);
-                // owner(32) guardian(32) len(4) validators(20n) threshold(4) chain_id(8) paused(1)
-                let d = &acct.data;
-                if d.len() >= 68 {
-                    let n = u32::from_le_bytes(d[64..68].try_into()?) as usize;
-                    let end = 68 + n * 20;
-                    println!("  owner        : {}", Pubkey::new_from_array(d[0..32].try_into()?));
-                    println!("  validators   : {n}");
-                    for i in 0..n {
-                        println!("    0x{}", hex::encode(&d[68 + i * 20..88 + i * 20]));
+                // Deserialized, NOT sliced at hardcoded offsets. The previous
+                // version read `validators` from byte 64 and silently reported
+                // zeros for everything once `bridge_domain` was inserted ahead
+                // of `guardian` — a diagnostic that lies is worse than none, and
+                // every future field would repeat the bug.
+                // `deserialize`, not `try_from_slice`: the account is SIZED for its
+                // max_validators/max_corridors capacity, so a freshly-initialized
+                // config is followed by unused padding. try_from_slice rejects
+                // that as "Not all bytes read".
+                match ConfigView::deserialize(&mut &acct.data[..]) {
+                    Ok(c) => {
+                        println!("  owner        : {}", c.owner);
+                        println!("  bridge domain: 0x{}", hex::encode(c.bridge_domain));
+                        println!(
+                            "  guardian     : {}",
+                            if c.guardian == Pubkey::default() {
+                                "none".to_string()
+                            } else {
+                                c.guardian.to_string()
+                            }
+                        );
+                        println!("  validators   : {}", c.validators.len());
+                        for v in &c.validators {
+                            println!("    0x{}", hex::encode(v));
+                        }
+                        println!("  threshold    : {}", c.threshold);
+                        println!("  chain_id     : {}", c.chain_id);
+                        println!("  paused       : {}", c.paused);
+                        println!("  capacity     : {} validators, {} corridors", c.max_validators, c.max_corridors);
+                        println!("  corridors    : {}", c.nonce_to.len());
+                        for (chain, nonce) in &c.nonce_to {
+                            println!("    -> chain {chain}  next nonce {nonce}");
+                        }
                     }
-                    if d.len() >= end + 13 {
-                        println!("  threshold    : {}", u32::from_le_bytes(d[end..end + 4].try_into()?));
-                        println!("  chain_id     : {}", u64::from_le_bytes(d[end + 4..end + 12].try_into()?));
-                        println!("  paused       : {}", d[end + 12] != 0);
-                    }
+                    Err(e) => println!("  UNREADABLE: {e} (layout drift between program and gate-admin?)"),
                 }
             }
             Err(_) => println!("config account : NOT INITIALIZED (run `init`)"),
