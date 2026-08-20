@@ -32,6 +32,10 @@ use solana_sdk::transaction::Transaction;
 use tracing::{info, warn};
 
 use crate::config::{SourceChain, TargetChain};
+use crate::gate::{
+    compute_budget_for, decode_gate_config, domain_id, hex32, hex_bytes, recovered_address,
+    GateConfig, CANCEL_PREFIX, SPL_TOKEN,
+};
 use crate::store::{Store, SubmissionRecord};
 
 /// Borsh-encode the `Claim` instruction. Built here rather than via
@@ -94,101 +98,6 @@ mod wire {
     }
 }
 
-fn hex_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(hex::decode(s)?)
-}
-
-fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
-    hex_bytes(s)?.try_into().map_err(|_| anyhow::anyhow!("expected 32 bytes"))
-}
-
-/// Recover the EVM address a signature belongs to, so the array can be sorted
-/// ascending as `verify_threshold` requires. A signature that will not recover is
-/// dropped rather than submitted — it could only pad the array toward the gate's
-/// length cap (finding H-1).
-fn recovered_address(digest: &[u8; 32], sig65: &[u8]) -> Option<[u8; 20]> {
-    if sig65.len() != 65 {
-        return None;
-    }
-    let recid = libsecp256k1::RecoveryId::parse(sig65[64].checked_sub(27)?).ok()?;
-    let sig = libsecp256k1::Signature::parse_standard_slice(&sig65[..64]).ok()?;
-    let public = libsecp256k1::recover(&libsecp256k1::Message::parse(digest), &sig, &recid).ok()?;
-    let hash = bridge_solana::hash::keccak(&public.serialize()[1..]);
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&hash[12..]);
-    Some(addr)
-}
-
-/// The subset of the on-chain `Config` this process needs: who may sign, and how
-/// many signatures constitute a quorum.
-///
-/// Hand-decoded from the account's Borsh bytes rather than by depending on
-/// `solana-gate` — that crate is outside this workspace and pins its own
-/// (deliberately v3) lockfile. The layout is pinned by
-/// `config_layout_matches_the_program` below.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GateConfig {
-    pub validators: Vec<[u8; 20]>,
-    pub threshold: u32,
-}
-
-/// A Borsh mirror of `solana_gate::Config`, in the program's field order.
-///
-/// This crate cannot depend on `solana-gate` (it pins an older `solana-program`
-/// than `solana-client` resolves), so the layout is duplicated. Field ORDER is
-/// the wire format: keep it identical to the program's struct.
-///
-/// It is a STRUCT, deliberately, and not a set of byte offsets. The previous
-/// version sliced `validators` from byte 64 on the assumption that `guardian`
-/// followed `owner` directly. When `bridge_domain` was inserted between them,
-/// every offset shifted by 32 and the decoder began reading the validator count
-/// out of the middle of `guardian` — which on a real config is `Pubkey::default()`,
-/// so it decoded as "zero validators, threshold zero" without erroring. The
-/// claim submitter then filtered away every signature it had.
-#[derive(borsh::BorshDeserialize)]
-struct ConfigView {
-    #[allow(dead_code)]
-    owner: [u8; 32],
-    #[allow(dead_code)]
-    bridge_domain: [u8; 32],
-    #[allow(dead_code)]
-    guardian: [u8; 32],
-    validators: Vec<[u8; 20]>,
-    threshold: u32,
-    #[allow(dead_code)]
-    chain_id: u64,
-    #[allow(dead_code)]
-    paused: bool,
-}
-
-/// Decode the gate's `Config` account.
-fn decode_gate_config(data: &[u8]) -> anyhow::Result<GateConfig> {
-    // `deserialize`, not `try_from_slice`: the account is sized for its
-    // max_validators/max_corridors capacity, so real data is followed by unused
-    // padding that `try_from_slice` would reject as "not all bytes read". Reading
-    // a prefix also means the trailing fields (capacities, nonce_to) can change
-    // without breaking this.
-    let view = <ConfigView as borsh::BorshDeserialize>::deserialize(&mut &data[..])
-        .map_err(|e| anyhow::anyhow!("config account does not match the expected layout: {e}"))?;
-
-    // An initialized gate ALWAYS has at least one validator — `init` refuses an
-    // empty set. So decoding to none is never a real gate state; it is layout
-    // drift, and it is the specific failure that must not pass silently, because
-    // an empty validator set filters every signature away and is indistinguishable
-    // from "nobody has signed yet".
-    if view.validators.is_empty() {
-        anyhow::bail!(
-            "config decoded with an EMPTY validator set — the account layout has drifted \
-             from this decoder; refusing to run with a filter that drops every signature"
-        );
-    }
-    Ok(GateConfig { validators: view.validators, threshold: view.threshold })
-}
-
 /// Signatures ordered by recovered signer, ascending, keeping ONLY registered
 /// validators and capping the result at the validator count.
 ///
@@ -197,19 +106,12 @@ fn decode_gate_config(data: &[u8]) -> anyhow::Result<GateConfig> {
 /// costs ~25k CU to recover on-chain, and the array as a whole is now refused
 /// outright if it is longer than the validator set. Forwarding one is therefore
 /// pure downside: at best wasted compute, at worst a permanently stuck transfer.
+///
+/// `digest_input` is the PRE-EIP-191 digest of the domain being authorised — the
+/// raw submissionId for a claim, `domain_id(CANCEL_PREFIX, id)` for a burn.
+/// Passing the wrong one silently drops every signature (none would recover to a
+/// validator), which is why every caller names its domain explicitly.
 fn ordered_signatures(
-    submission_id: &[u8; 32],
-    raw: &[Vec<u8>],
-    cfg: &GateConfig,
-) -> Vec<Vec<u8>> {
-    ordered_signatures_over(submission_id, raw, cfg)
-}
-
-/// As [`ordered_signatures`], but over an arbitrary pre-EIP-191 digest so the
-/// cancel and refund domains can reuse the same validator filtering. Passing the
-/// wrong domain here would silently drop every signature (none would recover to
-/// a validator), which is why the callers name the domain explicitly.
-fn ordered_signatures_over(
     digest_input: &[u8; 32],
     raw: &[Vec<u8>],
     cfg: &GateConfig,
@@ -363,8 +265,8 @@ impl Submitter {
         if raw.is_empty() {
             return Ok(false);
         }
-        let digest = crate::refund::domain_id(2, id); // CANCEL domain
-        let signatures = ordered_signatures_over(&digest, &raw, gate_cfg);
+        let digest = domain_id(CANCEL_PREFIX, id);
+        let signatures = ordered_signatures(&digest, &raw, gate_cfg);
         if (signatures.len() as u32) < gate_cfg.threshold {
             return Ok(false);
         }
@@ -504,7 +406,7 @@ impl Submitter {
                 AccountMeta::new(vault, false),
                 AccountMeta::new(receiver_token, false),
                 AccountMeta::new_readonly(vault_authority, false),
-                AccountMeta::new_readonly(spl_token_id(), false),
+                AccountMeta::new_readonly(Pubkey::from_str(SPL_TOKEN).expect("valid spl-token id"), false),
                 AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
             ],
             data: wire::claim_instruction_data(&args),
@@ -528,24 +430,6 @@ impl Submitter {
         info!(submission_id = %rec.submission_id, tx = %sig, "CLAIMED on Solana");
         Ok(())
     }
-}
-
-/// Compute units to request for a claim against a gate with `validators`
-/// registered signers.
-///
-/// ~25k CU per `secp256k1_recover`, plus headroom for keccak, Borsh
-/// deserialization, marker creation and the SPL transfer. Clamped to Solana's
-/// 1.4M per-transaction maximum; requesting more is rejected outright.
-fn compute_budget_for(validators: usize) -> u32 {
-    const PER_SIGNATURE: u32 = 30_000;
-    const OVERHEAD: u32 = 120_000;
-    const MAX: u32 = 1_400_000;
-    OVERHEAD.saturating_add(PER_SIGNATURE.saturating_mul(validators as u32)).min(MAX)
-}
-
-/// The SPL token program id, hardcoded to avoid pulling spl-token in.
-fn spl_token_id() -> Pubkey {
-    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").expect("valid spl-token id")
 }
 
 #[cfg(test)]
@@ -813,7 +697,10 @@ mod tests {
 
     #[test]
     fn spl_token_id_is_the_canonical_one() {
-        assert_eq!(spl_token_id().to_string(), "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+        assert_eq!(
+            Pubkey::from_str(SPL_TOKEN).unwrap().to_string(),
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
     }
 }
 

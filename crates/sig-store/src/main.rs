@@ -35,8 +35,6 @@
 //!   POST   /allowed/chains               -> add (body: {"chain_id_from":..,"chain_id_to":..})
 //!   DELETE /allowed/chains/:from/:to     -> remove
 
-use std::sync::Arc;
-
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::middleware;

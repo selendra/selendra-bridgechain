@@ -27,6 +27,25 @@ pub struct Failover {
 /// strength of a *different* chain's `executed` flag would be exactly the
 /// mistake that lets a delivered transfer also be refunded.
 pub async fn connect_checked(urls: &[String], expected_chain_id: u64) -> anyhow::Result<DynProvider> {
+    probe(urls, expected_chain_id, true)
+        .await
+        .into_iter()
+        .next()
+        .map(|e| e.provider)
+        .ok_or_else(|| anyhow::anyhow!("no healthy RPC endpoints for chain {expected_chain_id}"))
+}
+
+/// Build a provider for every url that parses, and keep those whose
+/// `eth_chainId` matches, in the order given. Endpoints that fail either check
+/// are logged and dropped. `stop_at_first` returns as soon as one is healthy,
+/// for callers that only ever use a single provider.
+///
+/// The chainId guard is the whole point and is why this is one function rather
+/// than two: a silently-wrong-network endpoint reads plausible state for a
+/// DIFFERENT chain, which is how a validator ends up attesting against gate
+/// state it never actually saw.
+async fn probe(urls: &[String], expected_chain_id: u64, stop_at_first: bool) -> Vec<Endpoint> {
+    let mut healthy = Vec::new();
     for url in urls {
         let provider = match url.parse() {
             Ok(parsed) => ProviderBuilder::new().connect_http(parsed).erased(),
@@ -36,35 +55,24 @@ pub async fn connect_checked(urls: &[String], expected_chain_id: u64) -> anyhow:
             }
         };
         match provider.get_chain_id().await {
-            Ok(id) if id == expected_chain_id => return Ok(provider),
+            Ok(id) if id == expected_chain_id => {
+                healthy.push(Endpoint { url: url.clone(), provider });
+                if stop_at_first {
+                    return healthy;
+                }
+            }
             Ok(id) => warn!(%url, got = id, want = expected_chain_id, "skipping RPC: chainId mismatch"),
             Err(e) => warn!(%url, error = %e, "skipping RPC: unreachable"),
         }
     }
-    anyhow::bail!("no healthy RPC endpoints for chain {expected_chain_id}")
+    healthy
 }
 
 impl Failover {
     /// Connect to every URL, keep only those whose `eth_chainId` matches
     /// `expected_chain_id`. Errors if none survive.
     pub async fn connect(urls: &[String], expected_chain_id: u64) -> anyhow::Result<Self> {
-        let mut endpoints = Vec::new();
-        for url in urls {
-            let provider = match url.parse() {
-                Ok(parsed) => ProviderBuilder::new().connect_http(parsed).erased(),
-                Err(e) => {
-                    warn!(%url, error = %e, "skipping unparseable RPC url");
-                    continue;
-                }
-            };
-            match provider.get_chain_id().await {
-                Ok(id) if id == expected_chain_id => {
-                    endpoints.push(Endpoint { url: url.clone(), provider });
-                }
-                Ok(id) => warn!(%url, got = id, want = expected_chain_id, "skipping RPC: chainId mismatch"),
-                Err(e) => warn!(%url, error = %e, "skipping RPC: unreachable"),
-            }
-        }
+        let endpoints = probe(urls, expected_chain_id, false).await;
         anyhow::ensure!(
             !endpoints.is_empty(),
             "no healthy RPC endpoints for chain {expected_chain_id}"

@@ -11,13 +11,8 @@
 //! independently recompute the submissionId, sign it with the SAME secp256k1 key
 //! the EVM validator uses, and store the signature.
 
-mod config;
-mod refund;
-mod source;
-mod state;
-mod store;
-mod target;
-
+use solana_relayer::gate::evm_address;
+use solana_relayer::{config, refund, source, store, target};
 use tracing::info;
 
 #[tokio::main]
@@ -33,23 +28,25 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&path)?;
     let key = cfg.signer.resolve()?;
 
-    let token = std::env::var(&cfg.store.token_env).ok();
-    if token.is_none() {
+    if std::env::var(&cfg.store.token_env).is_err() {
         tracing::warn!(
             var = %cfg.store.token_env,
             "no sig-store token set — requests will be unauthenticated"
         );
     }
-    let store = store::Store::new(&cfg.store.url, token);
+    // Each loop gets its own client (they run concurrently); one closure so the
+    // url/token pair is read from one place.
+    let sig_store = || store::Store::new(&cfg.store.url, std::env::var(&cfg.store.token_env).ok());
+
+    let secret = libsecp256k1::SecretKey::parse(&key)
+        .map_err(|_| anyhow::anyhow!("signer key is not a valid secp256k1 scalar"))?;
+    let signer_address = evm_address(&secret);
 
     // The claim submitter, when configured. Spawned alongside the scanner and
     // isolated the same way the EVM validator isolates its loops: a dead
     // submitter must never stop this node from signing.
     let submitter = match cfg.target.as_ref() {
-        Some(t) => {
-            let store = store::Store::new(&cfg.store.url, std::env::var(&cfg.store.token_env).ok());
-            Some(target::Submitter::new(&cfg.source, t, store)?)
-        }
+        Some(t) => Some(target::Submitter::new(&cfg.source, t, sig_store())?),
         None => {
             info!("no [target] block — this relayer signs but never delivers claims");
             None
@@ -59,21 +56,9 @@ async fn main() -> anyhow::Result<()> {
     // Destination-side refund attester. Without it an EVM -> Solana transfer that
     // cannot be delivered is burnable and refundable only by hand: the EVM
     // validators cannot read Solana, so nobody votes on the corridor.
-    let attester = refund::Attester::new(
-        &cfg.source,
-        key,
-        {
-            let public = libsecp256k1::PublicKey::from_secret_key(
-                &libsecp256k1::SecretKey::parse(&key)
-                    .map_err(|_| anyhow::anyhow!("signer key is not a valid secp256k1 scalar"))?,
-            );
-            let hash = bridge_solana::hash::keccak(&public.serialize()[1..]);
-            format!("0x{}", hex::encode(&hash[12..]))
-        },
-        store::Store::new(&cfg.store.url, std::env::var(&cfg.store.token_env).ok()),
-    )?;
+    let attester = refund::Attester::new(&cfg.source, key, signer_address, sig_store())?;
 
-    let scanner = source::Scanner::new(cfg.source, key, store)?;
+    let scanner = source::Scanner::new(cfg.source, key, sig_store())?;
     info!(validator = %scanner.signer_address(), "solana-relayer started");
 
     // Each loop is isolated: a dead submitter or attester must never stop this

@@ -17,7 +17,6 @@
 //! signatures don't already carry.
 
 mod config;
-mod source;
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -30,9 +29,9 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use bridge_core::abi::Gate;
+use bridge_core::backend::StoreBackend;
 use bridge_core::store::{SignerSig, SubmissionRecord};
-use config::{Config, TargetChain};
-use source::Source;
+use config::{ChainCfg, Config};
 use tracing::{debug, info, warn};
 
 /// Upper bound on waiting for a submitted tx's receipt. A tx that never confirms
@@ -66,7 +65,8 @@ async fn main() -> anyhow::Result<()> {
 
     let signer = cfg.keeper.load("keeper").context("loading keeper signer")?;
     // Shared across every per-target loop (one HTTP client / one dir handle).
-    let source = Arc::new(Source::from_config(&cfg.store)?);
+    // L-5: read + mark-claimed only — it cannot deposit signatures.
+    let source = Arc::new(StoreBackend::from_config(&cfg.store, "SIG_STORE_KEEPER_TOKEN")?);
 
     info!(
         keeper = %signer.address(),
@@ -124,15 +124,21 @@ async fn main() -> anyhow::Result<()> {
     anyhow::bail!("all {total} target loops have exited");
 }
 
-/// Claim loop for a single destination chain.
-async fn run_target(
-    target: TargetChain,
-    signer: PrivateKeySigner,
-    source: Arc<Source>,
-) -> anyhow::Result<()> {
+/// Connect to one chain and read its gate's parameters — the identical prologue
+/// every submit loop needs (claims on a target, refunds on a source).
+///
+/// Returns the signing provider plus the initial [`GateView`]. Transient RPC
+/// failures retry here rather than killing the loop; only a wrong `chainId` is
+/// fatal, because that is a permanent misconfiguration and submitting to the
+/// wrong network is not something to keep retrying.
+async fn connect_gate(
+    chain: &ChainCfg,
+    signer: &PrivateKeySigner,
+    role: &'static str,
+) -> anyhow::Result<(impl Provider + Clone, Address, GateView)> {
     let wallet = EthereumWallet::from(signer.clone());
-    let gate_addr: Address = target.gate.parse().context("bad gate address")?;
-    let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
+    let gate_addr: Address = chain.gate.parse().context("bad gate address")?;
+    let retry = Duration::from_millis(chain.poll_interval_ms.max(1000));
 
     // SimpleNonceManager fetches the pending nonce from the chain for every tx,
     // instead of the default CachedNonceManager which keeps a local counter.
@@ -147,31 +153,28 @@ async fn run_target(
     let provider = ProviderBuilder::new()
         .wallet(wallet)
         .with_simple_nonce_management()
-        .connect_http(target.rpc.parse()?);
+        .connect_http(chain.rpc.parse()?);
 
     // Verify the RPC is on the expected chain. Unreachable => transient, retry.
     // Wrong chainId => permanent misconfig, return Err (isolated; siblings live).
     loop {
         match provider.get_chain_id().await {
-            Ok(id) if id == target.chain_id => break,
-            Ok(id) => anyhow::bail!(
-                "RPC chainId {id} != configured {} for {}",
-                target.chain_id,
-                target.rpc
-            ),
+            Ok(id) if id == chain.chain_id => break,
+            Ok(id) => {
+                anyhow::bail!("RPC chainId {id} != configured {} for {}", chain.chain_id, chain.rpc)
+            }
             Err(e) => {
-                warn!(chain_id = target.chain_id, error = %e, "get_chain_id failed; retrying");
+                warn!(chain_id = chain.chain_id, error = %e, "get_chain_id failed; retrying");
                 tokio::time::sleep(retry).await;
             }
         }
     }
 
-    let gate = Gate::new(gate_addr, &provider);
-    let mut view = loop {
-        match GateView::load(&gate).await {
+    let view = loop {
+        match GateView::load(&Gate::new(gate_addr, &provider)).await {
             Ok(v) => break v,
             Err(e) => {
-                warn!(chain_id = target.chain_id, error = %e, "read gate params failed; retrying");
+                warn!(chain_id = chain.chain_id, error = %e, "read gate params failed; retrying");
                 tokio::time::sleep(retry).await;
             }
         }
@@ -180,11 +183,23 @@ async fn run_target(
     info!(
         keeper = %signer.address(),
         gate = %gate_addr,
-        chain_id = target.chain_id,
+        chain_id = chain.chain_id,
         threshold = view.threshold,
         validator_count = view.validator_count,
-        "target loop started"
+        "{role} loop started"
     );
+    Ok((provider, gate_addr, view))
+}
+
+/// Claim loop for a single destination chain.
+async fn run_target(
+    target: ChainCfg,
+    signer: PrivateKeySigner,
+    source: Arc<StoreBackend>,
+) -> anyhow::Result<()> {
+    let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
+    let (provider, gate_addr, mut view) = connect_gate(&target, &signer, "target").await?;
+    let gate = Gate::new(gate_addr, &provider);
 
     loop {
         view.refresh_if_stale(&gate).await;
@@ -284,51 +299,12 @@ async fn run_target(
 /// from this gate?" questions are answered by the validators' on-chain checks
 /// and by the Gate's own `sentBy` guard respectively.
 async fn run_source_refunds(
-    src: config::SourceChain,
+    src: ChainCfg,
     signer: PrivateKeySigner,
-    store: Arc<Source>,
+    store: Arc<StoreBackend>,
 ) -> anyhow::Result<()> {
-    let wallet = EthereumWallet::from(signer.clone());
-    let gate_addr: Address = src.gate.parse().context("bad gate address")?;
-    let retry = Duration::from_millis(src.poll_interval_ms.max(1000));
-
-    // Fresh per-tx nonce fetch — see the note in run_target on why the default
-    // cached manager corrupts the sequence after a reverting send.
-    let provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .with_simple_nonce_management()
-        .connect_http(src.rpc.parse()?);
-
-    loop {
-        match provider.get_chain_id().await {
-            Ok(id) if id == src.chain_id => break,
-            Ok(id) => anyhow::bail!("RPC chainId {id} != configured {} for {}", src.chain_id, src.rpc),
-            Err(e) => {
-                warn!(chain_id = src.chain_id, error = %e, "get_chain_id failed; retrying");
-                tokio::time::sleep(retry).await;
-            }
-        }
-    }
-
+    let (provider, gate_addr, mut view) = connect_gate(&src, &signer, "source refund").await?;
     let gate = Gate::new(gate_addr, &provider);
-    let mut view = loop {
-        match GateView::load(&gate).await {
-            Ok(v) => break v,
-            Err(e) => {
-                warn!(chain_id = src.chain_id, error = %e, "read gate params failed; retrying");
-                tokio::time::sleep(retry).await;
-            }
-        }
-    };
-
-    info!(
-        keeper = %signer.address(),
-        gate = %gate_addr,
-        chain_id = src.chain_id,
-        threshold = view.threshold,
-        validator_count = view.validator_count,
-        "source refund loop started"
-    );
 
     loop {
         view.refresh_if_stale(&gate).await;
@@ -423,44 +399,52 @@ async fn try_claim<P: Provider>(
 
     info!(submission_id = %rec.submission_id, sigs = signatures.len(), "submitting claim()");
 
-    let pending = gate
-        .claim(
-            debridge_id,
-            amount,
-            U256::from(rec.chain_id_from),
-            U256::from(rec.nonce),
-            receiver,
-            auto_params,
-            native_sender,
-            signatures,
-        )
-        .send()
-        .await
-        .context("send claim")?;
+    let call = gate.claim(
+        debridge_id,
+        amount,
+        U256::from(rec.chain_id_from),
+        U256::from(rec.nonce),
+        receiver,
+        auto_params,
+        native_sender,
+        signatures,
+    );
+    confirm(call, "claim", &rec.submission_id, "CLAIMED").await.map(Some)
+}
 
+/// Send a prepared gate call, await its receipt, and refuse to report a
+/// mined-but-REVERTED transaction as success.
+///
+/// That last part is the reason this is one helper rather than three copies. A
+/// reverted `claim` reported as success makes the caller run `mark_claimed`,
+/// which also clears the `eligible` refund flag — permanently hiding a stranded
+/// transfer from recovery. A reverted `cancel` reported as success mis-sequences
+/// the two-phase refund, and a reverted `refund` claims funds were returned when
+/// they were not. Failing instead leaves the tick to retry, and each `try_*`
+/// re-checks on-chain state first, so a retry after a tx really landed is a no-op.
+///
+/// `verb` names the call in the error; `done` is the log line on success.
+async fn confirm<P: Provider>(
+    call: alloy::contract::CallBuilder<P, impl alloy::contract::CallDecoder>,
+    verb: &str,
+    submission_id: &str,
+    done: &str,
+) -> anyhow::Result<String> {
+    let pending = call.send().await.with_context(|| format!("send {verb}"))?;
     let receipt = pending
         .with_timeout(Some(RECEIPT_TIMEOUT))
         .get_receipt()
         .await
         .context("await receipt")?;
-    // A mined-but-reverted claim (status 0) must NOT be reported as success: the
-    // caller records success via the store's `mark_claimed`, which also clears the
-    // `eligible` refund flag — so a false success would permanently hide a
-    // stranded transfer from recovery. Surface it as an error so the tick logs a
-    // failure and retries, leaving the transfer refund-eligible.
     if !receipt.status() {
         anyhow::bail!(
-            "claim tx {:#x} reverted (status 0) for submission {}; not recording as claimed",
+            "{verb} tx {:#x} reverted (status 0) for submission {submission_id}; \
+             not recording it as successful",
             receipt.transaction_hash,
-            rec.submission_id
         );
     }
-    info!(
-        submission_id = %rec.submission_id,
-        tx = %receipt.transaction_hash,
-        "CLAIMED"
-    );
-    Ok(Some(format!("{:#x}", receipt.transaction_hash)))
+    info!(submission_id, tx = %receipt.transaction_hash, "{done}");
+    Ok(format!("{:#x}", receipt.transaction_hash))
 }
 
 /// Submit `cancel()` on the destination. `None` if it is already executed
@@ -486,38 +470,17 @@ async fn try_cancel<P: Provider>(
         "submitting cancel() — burning the transfer on the destination"
     );
 
-    let pending = gate
-        .cancel(
-            debridge_id,
-            amount,
-            U256::from(rec.chain_id_from),
-            U256::from(rec.nonce),
-            bytes_of(&rec.receiver)?,
-            bytes_of(&rec.auto_params)?,
-            bytes_of(&rec.native_sender)?,
-            sorted_signatures(sigs)?,
-        )
-        .send()
-        .await
-        .context("send cancel")?;
-
-    let receipt = pending
-        .with_timeout(Some(RECEIPT_TIMEOUT))
-        .get_receipt()
-        .await
-        .context("await receipt")?;
-    // A reverted cancel is not a burn — reporting success would emit a false
-    // operator signal (and, once the indexer keys off it, mis-sequence the
-    // two-phase refund). Fail so the tick retries.
-    if !receipt.status() {
-        anyhow::bail!(
-            "cancel tx {:#x} reverted (status 0) for submission {}",
-            receipt.transaction_hash,
-            rec.submission_id
-        );
-    }
-    info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "CANCELLED");
-    Ok(Some(format!("{:#x}", receipt.transaction_hash)))
+    let call = gate.cancel(
+        debridge_id,
+        amount,
+        U256::from(rec.chain_id_from),
+        U256::from(rec.nonce),
+        bytes_of(&rec.receiver)?,
+        bytes_of(&rec.auto_params)?,
+        bytes_of(&rec.native_sender)?,
+        sorted_signatures(sigs)?,
+    );
+    confirm(call, "cancel", &rec.submission_id, "CANCELLED").await.map(Some)
 }
 
 /// Submit `refund()` on the source. `None` if already refunded, if this gate
@@ -561,37 +524,18 @@ async fn try_refund<P: Provider>(
         "submitting refund() — returning locked funds on the source"
     );
 
-    let pending = gate
-        .refund(
-            token,
-            debridge_id,
-            amount,
-            U256::from(rec.chain_id_to),
-            U256::from(rec.nonce),
-            bytes_of(&rec.receiver)?,
-            bytes_of(&rec.auto_params)?,
-            bytes_of(&rec.native_sender)?,
-            sorted_signatures(sigs)?,
-        )
-        .send()
-        .await
-        .context("send refund")?;
-
-    let receipt = pending
-        .with_timeout(Some(RECEIPT_TIMEOUT))
-        .get_receipt()
-        .await
-        .context("await receipt")?;
-    // A reverted refund did not return funds; don't claim it did.
-    if !receipt.status() {
-        anyhow::bail!(
-            "refund tx {:#x} reverted (status 0) for submission {}",
-            receipt.transaction_hash,
-            rec.submission_id
-        );
-    }
-    info!(submission_id = %rec.submission_id, tx = %receipt.transaction_hash, "REFUNDED");
-    Ok(Some(format!("{:#x}", receipt.transaction_hash)))
+    let call = gate.refund(
+        token,
+        debridge_id,
+        amount,
+        U256::from(rec.chain_id_to),
+        U256::from(rec.nonce),
+        bytes_of(&rec.receiver)?,
+        bytes_of(&rec.auto_params)?,
+        bytes_of(&rec.native_sender)?,
+        sorted_signatures(sigs)?,
+    );
+    confirm(call, "refund", &rec.submission_id, "REFUNDED").await.map(Some)
 }
 
 /// The keeper's live view of one gate: the signature `threshold`, the

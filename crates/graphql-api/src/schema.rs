@@ -10,16 +10,16 @@ use std::sync::Arc;
 
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Object, SimpleObject};
 use bridge_core::allow::{SubmissionHistory, SwapBridgeInfo, SwapRecord};
+use bridge_core::backend::StoreBackend;
 use bridge_core::store::{SignerSig, SubmissionRecord};
 use bridge_db::Db;
 
-use crate::backend::Backend;
 use crate::chain::{ChainInfo, Chains};
 use crate::swap::{PoolInfo, PoolToken, Swaps};
 
 /// Shared, read-mostly state handed to every resolver via the schema's data.
 pub struct ApiState {
-    pub backend: Arc<Backend>,
+    pub backend: Arc<StoreBackend>,
     /// Signature count the keeper requires to claim. `None` => unknown here, so
     /// `meetsThreshold`/`ready` are reported as null/zero.
     pub threshold: Option<u64>,

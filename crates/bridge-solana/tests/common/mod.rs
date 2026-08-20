@@ -32,11 +32,7 @@ impl Validator {
     /// with v∈{27,28} — byte-identical to the validator node's `encode_signature`.
     pub async fn sign(&self, id: &[u8; 32]) -> Vec<u8> {
         let sig = self.signer.sign_message(id).await.expect("sign");
-        let mut out = Vec::with_capacity(65);
-        out.extend_from_slice(&sig.r().to_be_bytes::<32>());
-        out.extend_from_slice(&sig.s().to_be_bytes::<32>());
-        out.push(27 + sig.v() as u8);
-        out
+        bridge_core::signer::signature_bytes(&sig).to_vec()
     }
 }
 

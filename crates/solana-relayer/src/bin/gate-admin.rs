@@ -41,59 +41,16 @@
 use std::str::FromStr;
 
 use bridge_solana::instruction::{GateInstruction, InitArgs};
-use borsh::BorshDeserialize;
+use solana_relayer::gate::{
+    decode_config_view, domain_id, hex20, hex32, ConfigTail, BPF_LOADER_UPGRADEABLE,
+    CANCEL_PREFIX, REFUND_PREFIX, SPL_TOKEN,
+};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Signer};
 use solana_sdk::transaction::Transaction;
-
-/// A read-only Borsh mirror of `solana_gate::Config`, for `show`.
-///
-/// gate-admin cannot depend on `solana-gate` directly (it pins an older
-/// `solana-program` than `solana-client` resolves), so the layout is duplicated
-/// here. Field ORDER is the wire format — keep it identical to the program's
-/// struct, and append new fields in the same position the program appends them.
-/// `try_from_slice` then fails loudly on drift instead of printing zeros.
-#[derive(borsh::BorshDeserialize)]
-struct ConfigView {
-    owner: Pubkey,
-    bridge_domain: [u8; 32],
-    guardian: Pubkey,
-    validators: Vec<[u8; 20]>,
-    threshold: u32,
-    chain_id: u64,
-    paused: bool,
-    max_validators: u32,
-    max_corridors: u32,
-    nonce_to: Vec<(u64, u64)>,
-}
-
-/// The BPF upgradeable loader — `init` proves the caller is the program's
-/// upgrade authority, which means reading the loader's ProgramData account.
-const BPF_LOADER_UPGRADEABLE: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
-const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-
-/// `BridgeHash` domain prefixes. A transfer signature must never authorise a
-/// burn, and a cancel must never authorise a payout, so each lives in its own
-/// keccak domain — mirrored byte-for-byte from `solana-gate` and `BridgeHash.sol`.
-const CANCEL_PREFIX: u64 = 2;
-const REFUND_PREFIX: u64 = 3;
-
-fn be32(v: u64) -> [u8; 32] {
-    let mut o = [0u8; 32];
-    o[24..].copy_from_slice(&v.to_be_bytes());
-    o
-}
-
-/// keccak(prefix || submissionId) — the digest validators sign for cancel/refund.
-fn domain_id(prefix: u64, submission_id: &[u8; 32]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&be32(prefix));
-    buf.extend_from_slice(submission_id);
-    bridge_solana::hash::keccak(&buf)
-}
 
 /// Parse a repeated `--signature 0x..` into 65-byte r||s||v arrays.
 fn parse_sigs(args: &Args) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -110,18 +67,6 @@ fn parse_sigs(args: &Args) -> anyhow::Result<Vec<Vec<u8>>> {
         anyhow::ensure!(s.len() == 65, "each signature must be 65 bytes, got {}", s.len());
     }
     Ok(out)
-}
-
-fn parse_evm(s: &str) -> anyhow::Result<[u8; 20]> {
-    let h = s.strip_prefix("0x").unwrap_or(s);
-    let b = hex::decode(h).map_err(|_| anyhow::anyhow!("validator {s:?} is not hex"))?;
-    b.try_into().map_err(|_| anyhow::anyhow!("validator {s:?} must be 20 bytes"))
-}
-
-fn parse_b32(s: &str) -> anyhow::Result<[u8; 32]> {
-    let h = s.strip_prefix("0x").unwrap_or(s);
-    let b = hex::decode(h).map_err(|_| anyhow::anyhow!("{s:?} is not hex"))?;
-    b.try_into().map_err(|_| anyhow::anyhow!("{s:?} must be 32 bytes"))
 }
 
 /// Minimal flag reader: `--name value`. Repeated flags collect.
@@ -168,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     let (vault_authority, _) = Pubkey::find_program_address(&[b"vault_authority"], &program_id);
 
     if cmd == "digest" {
-        let id = parse_b32(&args.req("--submission-id")?)?;
+        let id = hex32(&args.req("--submission-id")?)?;
         println!("submissionId : 0x{}", hex::encode(id));
         println!("cancelId     : 0x{}", hex::encode(domain_id(CANCEL_PREFIX, &id)));
         println!("refundId     : 0x{}", hex::encode(domain_id(REFUND_PREFIX, &id)));
@@ -186,25 +131,24 @@ fn main() -> anyhow::Result<()> {
         match rpc.get_account(&config_pda) {
             Ok(acct) => {
                 println!("config account : {} bytes, owner {}", acct.data.len(), acct.owner);
-                // Deserialized, NOT sliced at hardcoded offsets. The previous
-                // version read `validators` from byte 64 and silently reported
-                // zeros for everything once `bridge_domain` was inserted ahead
-                // of `guardian` — a diagnostic that lies is worse than none, and
-                // every future field would repeat the bug.
-                // `deserialize`, not `try_from_slice`: the account is SIZED for its
-                // max_validators/max_corridors capacity, so a freshly-initialized
-                // config is followed by unused padding. try_from_slice rejects
-                // that as "Not all bytes read".
-                match ConfigView::deserialize(&mut &acct.data[..]) {
+                // Deserialized through the ONE mirrored layout (`gate::ConfigView`),
+                // never sliced at hardcoded offsets. An earlier version read
+                // `validators` from byte 64 and silently reported zeros for
+                // everything once `bridge_domain` was inserted ahead of `guardian`
+                // — a diagnostic that lies is worse than none. Sharing the struct
+                // with the runner means drift now breaks both loudly, together.
+                let mut cursor: &[u8] = &acct.data;
+                match decode_config_view(&mut cursor) {
                     Ok(c) => {
-                        println!("  owner        : {}", c.owner);
+                        let guardian = Pubkey::new_from_array(c.guardian);
+                        println!("  owner        : {}", Pubkey::new_from_array(c.owner));
                         println!("  bridge domain: 0x{}", hex::encode(c.bridge_domain));
                         println!(
                             "  guardian     : {}",
-                            if c.guardian == Pubkey::default() {
+                            if guardian == Pubkey::default() {
                                 "none".to_string()
                             } else {
-                                c.guardian.to_string()
+                                guardian.to_string()
                             }
                         );
                         println!("  validators   : {}", c.validators.len());
@@ -214,10 +158,22 @@ fn main() -> anyhow::Result<()> {
                         println!("  threshold    : {}", c.threshold);
                         println!("  chain_id     : {}", c.chain_id);
                         println!("  paused       : {}", c.paused);
-                        println!("  capacity     : {} validators, {} corridors", c.max_validators, c.max_corridors);
-                        println!("  corridors    : {}", c.nonce_to.len());
-                        for (chain, nonce) in &c.nonce_to {
-                            println!("    -> chain {chain}  next nonce {nonce}");
+                        // The capacity/corridor tail continues from the same
+                        // cursor. Only `show` reads it, so it stays out of the
+                        // hot-path struct — and if it ever drifts, the fields
+                        // above still print.
+                        match <ConfigTail as borsh::BorshDeserialize>::deserialize(&mut cursor) {
+                            Ok(t) => {
+                                println!(
+                                    "  capacity     : {} validators, {} corridors",
+                                    t.max_validators, t.max_corridors
+                                );
+                                println!("  corridors    : {}", t.nonce_to.len());
+                                for (chain, nonce) in &t.nonce_to {
+                                    println!("    -> chain {chain}  next nonce {nonce}");
+                                }
+                            }
+                            Err(e) => println!("  capacity/corridors UNREADABLE: {e}"),
                         }
                     }
                     Err(e) => println!("  UNREADABLE: {e} (layout drift between program and gate-admin?)"),
@@ -231,7 +187,7 @@ fn main() -> anyhow::Result<()> {
     let (ix_data, accounts) = match cmd.as_str() {
         "init" => {
             let validators: Vec<[u8; 20]> =
-                args.all("--validator").iter().map(|v| parse_evm(v)).collect::<Result<_, _>>()?;
+                args.all("--validator").iter().map(|v| hex20(v)).collect::<Result<_, _>>()?;
             anyhow::ensure!(!validators.is_empty(), "init needs at least one --validator");
             let threshold: u32 = args.req("--threshold")?.parse()?;
             let chain_id: u64 = args.req("--chain-id")?.parse()?;
@@ -241,7 +197,7 @@ fn main() -> anyhow::Result<()> {
                 args.get("--max-corridors").unwrap_or_else(|| "8".into()).parse()?;
             // Required, with no default: a defaulted domain shared by every
             // deployment would be the same as having none.
-            let bridge_domain = parse_b32(&args.req("--bridge-domain")?)?;
+            let bridge_domain = hex32(&args.req("--bridge-domain")?)?;
             let guardian = match args.get("--guardian") {
                 Some(g) => Pubkey::from_str(&g)?.to_bytes(),
                 None => [0u8; 32],
@@ -280,7 +236,7 @@ fn main() -> anyhow::Result<()> {
             ],
         ),
         "register-asset" => {
-            let debridge_id = parse_b32(&args.req("--debridge-id")?)?;
+            let debridge_id = hex32(&args.req("--debridge-id")?)?;
             let mint = Pubkey::from_str(&args.req("--mint")?)?;
             let vault = Pubkey::from_str(&args.req("--vault")?)?;
             let (asset_pda, _) =
@@ -315,7 +271,7 @@ fn main() -> anyhow::Result<()> {
         // that Phase 3 locks against the Solidity fixtures, so this cannot drift
         // from either VM.
         "send" => {
-            let debridge_id = parse_b32(&args.req("--debridge-id")?)?;
+            let debridge_id = hex32(&args.req("--debridge-id")?)?;
             let amount: u64 = args.req("--amount")?.parse()?;
             let chain_id_to: u64 = args.req("--chain-id-to")?.parse()?;
             let receiver = {
@@ -413,7 +369,7 @@ fn main() -> anyhow::Result<()> {
         // Moves no funds; it only unlocks the source-side refund.
         "cancel" => {
             let a = bridge_solana::instruction::CancelArgs {
-                debridge_id: parse_b32(&args.req("--debridge-id")?)?,
+                debridge_id: hex32(&args.req("--debridge-id")?)?,
                 amount: args.req("--amount")?.parse()?,
                 chain_id_from: args.req("--chain-id-from")?.parse()?,
                 nonce: args.req("--nonce")?.parse()?,
@@ -428,7 +384,7 @@ fn main() -> anyhow::Result<()> {
                 )?,
                 signatures: parse_sigs(&args)?,
             };
-            let id = parse_b32(&args.req("--submission-id")?)?;
+            let id = hex32(&args.req("--submission-id")?)?;
             let (executed, _) = Pubkey::find_program_address(&[b"executed", &id], &program_id);
             println!("burning {} (executed PDA {})", hex::encode(id), executed);
             (
@@ -444,7 +400,7 @@ fn main() -> anyhow::Result<()> {
         // M-2, SOURCE side: return the locked funds, but ONLY once the
         // destination burn is on-chain. The gate checks that itself.
         "refund" => {
-            let debridge_id = parse_b32(&args.req("--debridge-id")?)?;
+            let debridge_id = hex32(&args.req("--debridge-id")?)?;
             let a = bridge_solana::instruction::RefundArgs {
                 debridge_id,
                 amount: args.req("--amount")?.parse()?,
@@ -461,7 +417,7 @@ fn main() -> anyhow::Result<()> {
                 )?,
                 signatures: parse_sigs(&args)?,
             };
-            let id = parse_b32(&args.req("--submission-id")?)?;
+            let id = hex32(&args.req("--submission-id")?)?;
             let to_token = Pubkey::from_str(&args.req("--to-token-account")?)?;
             let (asset_pda, _) =
                 Pubkey::find_program_address(&[b"asset", &debridge_id], &program_id);
@@ -490,7 +446,7 @@ fn main() -> anyhow::Result<()> {
         }
         "set-validator" => (
             GateInstruction::SetValidator {
-                validator: parse_evm(&args.req("--validator")?)?,
+                validator: hex20(&args.req("--validator")?)?,
                 active: args.get("--active").unwrap_or_else(|| "true".into()) == "true",
             }
             .to_bytes(),

@@ -32,35 +32,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{info, warn};
 
 use crate::config::SourceChain;
+use crate::gate::{
+    commitment, domain_id, hex32, sign, CANCEL_PREFIX, MARKER_CANCELLED, REFUND_PREFIX,
+};
 use crate::store::{SignerSig, Store};
-
-/// `BridgeHash` domain prefixes — a transfer signature must never authorise a
-/// burn, nor a cancel a payout, so each digest lives in its own keccak domain.
-const CANCEL_PREFIX: u64 = 2;
-const REFUND_PREFIX: u64 = 3;
-
-/// Marker bytes written into the `["executed", id]` PDA by the gate.
-const MARKER_CLAIMED: u8 = 1;
-const MARKER_CANCELLED: u8 = 2;
-
-fn be32(v: u64) -> [u8; 32] {
-    let mut o = [0u8; 32];
-    o[24..].copy_from_slice(&v.to_be_bytes());
-    o
-}
-
-/// keccak(prefix ‖ submissionId) — the digest a validator signs.
-pub fn domain_id(prefix: u64, submission_id: &[u8; 32]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&be32(prefix));
-    buf.extend_from_slice(submission_id);
-    bridge_solana::hash::keccak(&buf)
-}
 
 /// What the Solana destination says about a submission, read from its
 /// `["executed", id]` marker PDA.
@@ -127,16 +106,6 @@ async fn destination_state(
     })
 }
 
-fn sign(secret: &libsecp256k1::SecretKey, digest32: &[u8; 32]) -> String {
-    // Same EIP-191 shape the transfer path uses, so one validator key signs for
-    // both VMs and the EVM gate can verify what we produce here.
-    let digest = bridge_solana::verify::eth_signed_digest(digest32);
-    let (sig, recid) = libsecp256k1::sign(&libsecp256k1::Message::parse(&digest), secret);
-    let mut out = sig.serialize().to_vec();
-    out.push(recid.serialize() + 27);
-    format!("0x{}", hex::encode(out))
-}
-
 pub struct Attester {
     rpc: RpcClient,
     program_id: Pubkey,
@@ -158,14 +127,7 @@ impl Attester {
             // Refund decisions release real funds, so read them at the same
             // commitment the scanner signs at — a rolled-back "not executed"
             // would let us attest a burn for a transfer that was in fact paid.
-            rpc: RpcClient::new_with_commitment(
-                cfg.rpc.clone(),
-                match cfg.commitment.as_str() {
-                    "finalized" => CommitmentConfig::finalized(),
-                    "confirmed" => CommitmentConfig::confirmed(),
-                    _ => CommitmentConfig::processed(),
-                },
-            ),
+            rpc: RpcClient::new_with_commitment(cfg.rpc.clone(), commitment(&cfg.commitment)),
             program_id: Pubkey::from_str(&cfg.program_id)
                 .map_err(|_| anyhow::anyhow!("program_id is not a valid pubkey"))?,
             chain_id: cfg.chain_id,
@@ -198,10 +160,7 @@ impl Attester {
             if rec.chain_id_to != self.chain_id {
                 continue;
             }
-            let id = match hex_id(&rec.submission_id) {
-                Some(id) => id,
-                None => continue,
-            };
+            let Ok(id) = hex32(&rec.submission_id) else { continue };
 
             let dst = match destination_state(&self.rpc, &self.program_id, &id).await {
                 Ok(d) => d,
@@ -236,11 +195,6 @@ impl Attester {
         }
         Ok(())
     }
-}
-
-fn hex_id(s: &str) -> Option<[u8; 32]> {
-    let h = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(h).ok()?.try_into().ok()
 }
 
 #[cfg(test)]
@@ -286,36 +240,6 @@ mod tests {
     fn we_do_not_re_attest_our_own_vote() {
         assert_eq!(decide(&untouched(), true, false), Decision::Skip("cancel already attested by us"));
         assert_eq!(decide(&burned(), false, true), Decision::Skip("refund already attested by us"));
-    }
-
-    /// The cancel and refund digests must be different values, or a cancel
-    /// attestation could be replayed as a refund — authorising a payout with a
-    /// signature that only ever meant "burn this".
-    #[test]
-    fn the_two_digests_are_domain_separated() {
-        let id = [0x11u8; 32];
-        let c = domain_id(CANCEL_PREFIX, &id);
-        let r = domain_id(REFUND_PREFIX, &id);
-        assert_ne!(c, r);
-        assert_ne!(c, id, "a transfer signature must not authorise a burn");
-        assert_ne!(r, id, "a transfer signature must not authorise a payout");
-    }
-
-    /// Pinned against `BridgeHash.getCancelId`/`getRefundId` ground truth — the
-    /// same constants `solana-gate`'s own suite asserts. If these drift, this
-    /// validator signs digests no gate will ever accept and refunds silently
-    /// never reach quorum.
-    #[test]
-    fn digests_match_bridgehash_ground_truth() {
-        let id = [0x11u8; 32];
-        assert_eq!(
-            hex::encode(domain_id(CANCEL_PREFIX, &id)),
-            "5f53d5916a01e246eeb5fd7d9e96634532fe35b576656d6244780290984a5eee"
-        );
-        assert_eq!(
-            hex::encode(domain_id(REFUND_PREFIX, &id)),
-            "3457405ce2152b6317347888618027bd5912e3026e48a5654384dbcb99a45b6e"
-        );
     }
 
     /// A marker PDA owned by anyone but the program proves nothing — treating it

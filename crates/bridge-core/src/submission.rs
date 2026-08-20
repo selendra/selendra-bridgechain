@@ -48,3 +48,29 @@ impl Submission {
         }
     }
 }
+
+/// Build the independent `Submission` a validator recomputes an id from, out of
+/// a decoded `Gate.Sent` event.
+///
+/// An `autoParams` blob that fails to decode yields `auto: None` — deliberately.
+/// The resulting id is then the plain-transfer hash, which cannot match the
+/// emitted one for a transfer that really carries a payload, so the caller's
+/// id check refuses to sign it. Failing the comparison is the fail-closed
+/// outcome; guessing at a payload we could not parse would not be.
+#[cfg(feature = "abi")]
+impl Submission {
+    pub fn from_sent_event(ev: &crate::abi::Gate::Sent, bridge_domain: B256) -> Self {
+        Submission {
+            bridge_domain,
+            debridge_id: ev.debridgeId,
+            amount: ev.amount,
+            chain_id_from: ev.chainIdFrom,
+            chain_id_to: ev.chainIdTo,
+            nonce: ev.nonce,
+            receiver: ev.receiver.to_vec(),
+            auto: crate::decode_auto_params(&ev.autoParams, &ev.nativeSender)
+                .ok()
+                .flatten(),
+        }
+    }
+}

@@ -24,13 +24,13 @@ use bridge_solana::relayer::{
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
 use tracing::{info, warn};
 
 use crate::config::SourceChain;
+use crate::gate::{commitment, decode_config_view, evm_address, sign};
 use crate::state::Cursor;
 use crate::store::{SignerSig, Store, SubmissionRecord};
 
@@ -107,23 +107,6 @@ fn recompute(sent: &Sent, bridge_domain: &[u8; 32]) -> [u8; 32] {
     }
 }
 
-/// 65-byte r||s||v EIP-191 signature over `id`, matching what the EVM validator
-/// produces and what `Gate._verifySignatures` accepts.
-fn sign(secret: &libsecp256k1::SecretKey, id: &[u8; 32]) -> String {
-    let digest = bridge_solana::verify::eth_signed_digest(id);
-    let (sig, recid) = libsecp256k1::sign(&libsecp256k1::Message::parse(&digest), secret);
-    let mut out = sig.serialize().to_vec();
-    out.push(recid.serialize() + 27);
-    format!("0x{}", hex::encode(out))
-}
-
-/// The signer's EVM address — `keccak(uncompressed_pubkey[1..])[12..]`.
-fn evm_address(secret: &libsecp256k1::SecretKey) -> String {
-    let public = libsecp256k1::PublicKey::from_secret_key(secret);
-    let hash = bridge_solana::hash::keccak(&public.serialize()[1..]);
-    format!("0x{}", hex::encode(&hash[12..]))
-}
-
 pub struct Scanner {
     rpc: RpcClient,
     program_id: Pubkey,
@@ -144,11 +127,7 @@ impl Scanner {
         secret_key: [u8; 32],
         store: Store,
     ) -> anyhow::Result<Self> {
-        let commitment = match cfg.commitment.as_str() {
-            "finalized" => CommitmentConfig::finalized(),
-            "confirmed" => CommitmentConfig::confirmed(),
-            _ => CommitmentConfig::processed(),
-        };
+        let commitment = commitment(&cfg.commitment);
         let secret = libsecp256k1::SecretKey::parse(&secret_key)
             .map_err(|_| anyhow::anyhow!("signer key is not a valid secp256k1 scalar"))?;
         let signer_address = evm_address(&secret);
@@ -172,12 +151,13 @@ impl Scanner {
 
     /// Read `bridge_domain` out of the gate's `["config"]` PDA.
     ///
-    /// Borsh lays `Config` out in declaration order with no header, so the field
-    /// sits at a fixed offset: `owner(32) | bridge_domain(32) | guardian(32) | …`.
-    /// Slicing rather than deserializing keeps this crate free of a dependency on
-    /// the program crate — at the cost that REORDERING `Config`'s first fields
-    /// silently changes what is read here. The owner check below is the guard
-    /// that at least proves we are reading the gate's own account.
+    /// DESERIALIZED, not sliced at a byte offset. An earlier version took bytes
+    /// 32..64 on the assumption that `bridge_domain` follows `owner` directly —
+    /// the same assumption that broke the claim submitter when a field was
+    /// inserted, silently yielding a plausible-looking 32 bytes from the wrong
+    /// place. Signing under a wrong domain produces ids no gate ever derives, so
+    /// the failure would be total and completely silent. [`crate::gate::ConfigView`] is the
+    /// single mirrored layout; a drift there is now an error everywhere at once.
     async fn load_bridge_domain(&mut self) -> anyhow::Result<()> {
         let (config_pda, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
         let account = self
@@ -190,11 +170,9 @@ impl Scanner {
             "config PDA {config_pda} is owned by {}, not the gate program",
             account.owner
         );
-        let domain: [u8; 32] = account
-            .data
-            .get(32..64)
-            .and_then(|s| s.try_into().ok())
-            .ok_or_else(|| anyhow::anyhow!("config account is too short to hold a bridge_domain"))?;
+        let domain = decode_config_view(&mut &account.data[..])
+            .with_context(|| format!("decoding gate config PDA {config_pda}"))?
+            .bridge_domain;
         anyhow::ensure!(
             domain != [0u8; 32],
             "gate reports a zero bridge_domain — it predates the deployment-domain fix and \

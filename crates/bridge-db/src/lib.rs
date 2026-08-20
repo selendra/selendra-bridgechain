@@ -40,6 +40,19 @@ fn norm_id(s: &str) -> String {
     format!("0x{}", s.to_ascii_lowercase())
 }
 
+/// [`norm_id`], but rejecting anything that is not a 32-byte hex hash first.
+///
+/// The lifecycle writers all take a submissionId straight off the wire, so the
+/// shape check has to happen before it becomes a query key — a malformed id can
+/// only ever match nothing, and letting it through would silently no-op the
+/// UPDATE and then park a bogus `pending_lifecycle` row under it.
+fn checked_id(submission_id: &str) -> Result<String, DbError> {
+    if !store::is_valid_submission_id(submission_id) {
+        return Err(DbError::BadField("submission_id"));
+    }
+    Ok(norm_id(submission_id))
+}
+
 impl DbError {
     /// True for caller-input errors (HTTP 4xx); false for server/IO faults (5xx).
     pub fn is_client_error(&self) -> bool {
@@ -225,6 +238,86 @@ impl Attestations {
     }
 }
 
+/// The id⇄params binding: a record's `submission_id` MUST equal the canonical
+/// keccak of its own parameters, and its `token` must hash to its `debridge_id`.
+///
+/// This is the check that makes a row self-certifying, and it guards BOTH write
+/// paths into `submissions` (a validator's `upsert_signature` and the indexer's
+/// `observe_submission`). One copy, because a path that skipped it would be a way
+/// to insert a row whose id names one transfer and whose params describe another.
+/// Returns the verified canonical id, so a caller that needs it (to authenticate
+/// an attached signature) does not recompute it.
+fn verify_binding(record: &SubmissionRecord) -> Result<alloy_primitives::B256, DbError> {
+    // Guard the id before it is used as a key (and as a sig-store URL segment).
+    if !store::is_valid_submission_id(&record.submission_id) {
+        return Err(StoreError::BadField("submission_id").into());
+    }
+    let computed = store::canonical_submission_id(record)?;
+    let claimed = alloy_primitives::B256::from_str(&record.submission_id)
+        .map_err(|_| StoreError::BadField("submission_id"))?;
+    if computed != claimed {
+        return Err(StoreError::IdMismatch {
+            claimed: format!("{claimed:#x}"),
+            computed: format!("{computed:#x}"),
+        }
+        .into());
+    }
+    // `token` is not covered by the submissionId, so it gets its own exact
+    // binding (debridge_id == keccak(chain_id_from, token)) before storage.
+    store::verify_token_binding(record)?;
+    Ok(computed)
+}
+
+/// The `INSERT` that creates a `submissions` row, shared by both write paths.
+///
+/// `ON CONFLICT` makes the first insert concurrency-safe: when several
+/// validators POST the same brand-new submissionId at once they all find no
+/// existing row and race here, and without this the losers hit a duplicate-key
+/// error (a 500 that drops their signature). The id⇄params binding guarantees any
+/// existing row has identical params, so the conflict path only ever backfills
+/// `token` — never any other field.
+async fn insert_submission_row<'e, E>(executor: E, id: &str, record: &SubmissionRecord) -> Result<(), DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO submissions \
+         (submission_id, bridge_domain, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
+          receiver, auto_params, native_sender, token) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+         ON CONFLICT (submission_id) DO UPDATE \
+           SET token = COALESCE(submissions.token, EXCLUDED.token)",
+    )
+    .bind(id)
+    .bind(record.bridge_domain.to_ascii_lowercase())
+    .bind(record.debridge_id.to_ascii_lowercase())
+    .bind(&record.amount)
+    .bind(record.chain_id_from as i64)
+    .bind(record.chain_id_to as i64)
+    .bind(record.nonce as i64)
+    .bind(record.receiver.to_ascii_lowercase())
+    .bind(record.auto_params.to_ascii_lowercase())
+    .bind(record.native_sender.to_ascii_lowercase())
+    .bind(Some(record.token.to_ascii_lowercase()).filter(|t| !t.is_empty()))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// The union of a submission's transfer signatures and its cancel/refund
+/// attestations, as `(submission_id, kind, signer, signature)` rows.
+///
+/// `where_clause` is appended verbatim and is a literal in both call sites — it
+/// never carries caller input.
+fn sig_query(where_clause: &str) -> String {
+    format!(
+        "SELECT submission_id, 'transfer' AS kind, signer, signature FROM signatures {where_clause} \
+         UNION ALL \
+         SELECT submission_id, kind, signer, signature FROM attestations {where_clause} \
+         ORDER BY submission_id, kind, signer"
+    )
+}
+
 /// A handle to the bridge database (cheap to clone — wraps a connection pool).
 #[derive(Clone)]
 pub struct Db {
@@ -271,25 +364,10 @@ impl Db {
         record: SubmissionRecord,
         sig: SignerSig,
     ) -> Result<SubmissionRecord, DbError> {
-        // Guard the id before it is used as a key (and as a sig-store URL segment).
-        if !store::is_valid_submission_id(&record.submission_id) {
-            return Err(StoreError::BadField("submission_id").into());
-        }
-        // (1) id <-> params binding and (3) signature authenticity.
-        let computed = store::canonical_submission_id(&record)?;
-        let claimed = alloy_primitives::B256::from_str(&record.submission_id)
-            .map_err(|_| StoreError::BadField("submission_id"))?;
-        if computed != claimed {
-            return Err(StoreError::IdMismatch {
-                claimed: format!("{claimed:#x}"),
-                computed: format!("{computed:#x}"),
-            }
-            .into());
-        }
+        // (1) id <-> params binding, plus the `token` binding, and then
+        // (3) signature authenticity against the id we just verified.
+        let computed = verify_binding(&record)?;
         store::verify_signature(computed, &sig)?;
-        // `token` is not covered by the submissionId, so it gets its own exact
-        // binding (debridge_id == keccak(chain_id_from, token)) before storage.
-        store::verify_token_binding(&record)?;
 
         let id = norm_id(&record.submission_id);
         let mut tx = self.pool.begin().await?;
@@ -325,33 +403,7 @@ impl Db {
                 .await?;
             }
         } else {
-            // ON CONFLICT makes the first-insert concurrency-safe: when several
-            // validators POST the same brand-new submissionId at once they all
-            // SELECT no existing row and race here. Without this the loser hits a
-            // duplicate-key error (a 500 that drops its signature). The id⇄params
-            // binding guarantees any existing row has identical params, so the
-            // conflict path only ever backfills `token` (never other fields).
-            sqlx::query(
-                "INSERT INTO submissions \
-                 (submission_id, bridge_domain, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
-                  receiver, auto_params, native_sender, token) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                 ON CONFLICT (submission_id) DO UPDATE \
-                   SET token = COALESCE(submissions.token, EXCLUDED.token)",
-            )
-            .bind(&id)
-            .bind(record.bridge_domain.to_ascii_lowercase())
-            .bind(record.debridge_id.to_ascii_lowercase())
-            .bind(&record.amount)
-            .bind(record.chain_id_from as i64)
-            .bind(record.chain_id_to as i64)
-            .bind(record.nonce as i64)
-            .bind(record.receiver.to_ascii_lowercase())
-            .bind(record.auto_params.to_ascii_lowercase())
-            .bind(record.native_sender.to_ascii_lowercase())
-            .bind(Some(record.token.to_ascii_lowercase()).filter(|t| !t.is_empty()))
-            .execute(&mut *tx)
-            .await?;
+            insert_submission_row(&mut *tx, &id, &record).await?;
         }
 
         // Merge the signature, deduped by signer.
@@ -393,17 +445,10 @@ impl Db {
                 .await?;
         let Some(row) = row else { return Ok(None) };
 
-        let sigs: Vec<SigRow> = sqlx::query_as(
-            "SELECT submission_id, 'transfer' AS kind, signer, signature FROM signatures \
-               WHERE submission_id = $1 \
-             UNION ALL \
-             SELECT submission_id, kind, signer, signature FROM attestations \
-               WHERE submission_id = $1 \
-             ORDER BY kind, signer",
-        )
-        .bind(&id)
-        .fetch_all(&self.pool)
-        .await?;
+        let sigs: Vec<SigRow> = sqlx::query_as(&sig_query("WHERE submission_id = $1"))
+            .bind(&id)
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut collected = Attestations::default();
         for s in sigs {
@@ -417,16 +462,38 @@ impl Db {
     pub async fn load_all(&self) -> Result<Vec<SubmissionRecord>, DbError> {
         let rows: Vec<SubmissionRow> =
             sqlx::query_as("SELECT * FROM submissions ORDER BY created_at").fetch_all(&self.pool).await?;
-        let sigs: Vec<SigRow> = sqlx::query_as(
-            "SELECT submission_id, 'transfer' AS kind, signer, signature FROM signatures \
-             UNION ALL \
-             SELECT submission_id, kind, signer, signature FROM attestations \
-             ORDER BY submission_id, kind, signer",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        self.attach_signatures(rows, false).await
+    }
 
-        let mut by_id: std::collections::HashMap<String, Attestations> = std::collections::HashMap::new();
+    /// Attach every row's three signature sets in ONE extra query, rather than
+    /// one query per row.
+    ///
+    /// `scoped` restricts that query to the rows in hand. Pass `true` whenever
+    /// the rows are a SUBSET of the table — `refund_candidates` is usually a
+    /// handful out of many thousands, and an unscoped fetch there would trade
+    /// N+1 round trips for dragging the whole signature table across the wire.
+    /// `load_all` passes `false`: its rows are the whole table anyway, so
+    /// scoping would only add a large id array to the query for nothing.
+    async fn attach_signatures(
+        &self,
+        rows: Vec<SubmissionRow>,
+        scoped: bool,
+    ) -> Result<Vec<SubmissionRecord>, DbError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sigs: Vec<SigRow> = if scoped {
+            let ids: Vec<String> = rows.iter().map(|r| r.submission_id.clone()).collect();
+            sqlx::query_as(&sig_query("WHERE submission_id = ANY($1)"))
+                .bind(&ids)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as(&sig_query("")).fetch_all(&self.pool).await?
+        };
+
+        let mut by_id: std::collections::HashMap<String, Attestations> =
+            std::collections::HashMap::new();
         for s in sigs {
             by_id
                 .entry(s.submission_id)
@@ -502,10 +569,7 @@ impl Db {
     /// `executed` flag makes that impossible), so seeing one would mean the two
     /// chains disagree, and quietly overwriting it would hide that.
     pub async fn mark_claimed(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
-        if !store::is_valid_submission_id(submission_id) {
-            return Err(DbError::BadField("submission_id"));
-        }
-        let id = norm_id(submission_id);
+        let id = checked_id(submission_id)?;
         let res = sqlx::query(
             "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now(), \
                     refund_status = CASE WHEN refund_status = 'eligible' THEN 'none' \
@@ -593,10 +657,7 @@ impl Db {
     /// This is the state that unlocks refund attestations, so it is only ever
     /// written from an observed on-chain event, never from a relayer's say-so.
     pub async fn mark_cancelled(&self, submission_id: &str, cancel_tx: &str) -> Result<(), DbError> {
-        if !store::is_valid_submission_id(submission_id) {
-            return Err(DbError::BadField("submission_id"));
-        }
-        let id = norm_id(submission_id);
+        let id = checked_id(submission_id)?;
         let res = sqlx::query(
             "UPDATE submissions SET refund_status = 'cancelled', cancel_tx = $2, updated_at = now() \
              WHERE submission_id = $1 AND refund_status <> 'refunded'",
@@ -612,10 +673,7 @@ impl Db {
 
     /// Record that the source gate returned the funds (`Gate.Refunded`).
     pub async fn mark_refunded(&self, submission_id: &str, refund_tx: &str) -> Result<(), DbError> {
-        if !store::is_valid_submission_id(submission_id) {
-            return Err(DbError::BadField("submission_id"));
-        }
-        let id = norm_id(submission_id);
+        let id = checked_id(submission_id)?;
         let res = sqlx::query(
             "UPDATE submissions SET refund_status = 'refunded', refund_tx = $2, updated_at = now() \
              WHERE submission_id = $1",
@@ -695,44 +753,10 @@ impl Db {
     /// binding as `upsert_signature`, but never touches an existing row (params
     /// are immutable; if a row already exists there is nothing to update here).
     pub async fn observe_submission(&self, record: SubmissionRecord) -> Result<(), DbError> {
-        if !store::is_valid_submission_id(&record.submission_id) {
-            return Err(StoreError::BadField("submission_id").into());
-        }
-        let computed = store::canonical_submission_id(&record)?;
-        let claimed = alloy_primitives::B256::from_str(&record.submission_id)
-            .map_err(|_| StoreError::BadField("submission_id"))?;
-        if computed != claimed {
-            return Err(StoreError::IdMismatch {
-                claimed: format!("{claimed:#x}"),
-                computed: format!("{computed:#x}"),
-            }
-            .into());
-        }
-
-        store::verify_token_binding(&record)?;
+        verify_binding(&record)?;
 
         let id = norm_id(&record.submission_id);
-        let token = Some(record.token.to_ascii_lowercase()).filter(|t| !t.is_empty());
-        sqlx::query(
-            "INSERT INTO submissions \
-             (submission_id, bridge_domain, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
-              receiver, auto_params, native_sender, token) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-             ON CONFLICT (submission_id) DO UPDATE SET token = COALESCE(submissions.token, EXCLUDED.token)",
-        )
-        .bind(&id)
-        .bind(record.bridge_domain.to_ascii_lowercase())
-        .bind(record.debridge_id.to_ascii_lowercase())
-        .bind(&record.amount)
-        .bind(record.chain_id_from as i64)
-        .bind(record.chain_id_to as i64)
-        .bind(record.nonce as i64)
-        .bind(record.receiver.to_ascii_lowercase())
-        .bind(record.auto_params.to_ascii_lowercase())
-        .bind(record.native_sender.to_ascii_lowercase())
-        .bind(token)
-        .execute(&self.pool)
-        .await?;
+        insert_submission_row(&self.pool, &id, &record).await?;
         // A `Claimed`/`Cancelled`/`Refunded` may have been observed on the other
         // chain before this row existed; fold it in now.
         self.apply_pending_lifecycle(&id).await?;
@@ -886,15 +910,11 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id = row.submission_id.clone();
-            // reuse `load` so each record arrives with all three signature sets
-            if let Some(rec) = self.load(&id).await? {
-                out.push(rec);
-            }
-        }
-        Ok(out)
+        // One extra query for every candidate's signature sets, not one per
+        // candidate: this list is polled by every validator's refund loop on
+        // every tick, so the old per-row `load` was N+1 round trips per poll.
+        // Scoped, because candidates are a small subset of the table.
+        self.attach_signatures(rows, true).await
     }
 
     /// Resume cursor for one chain (indexer). `None` if never persisted.

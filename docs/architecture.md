@@ -297,7 +297,7 @@ An axum HTTP service, the shared bulletin board validators write to and keepers 
 Postgres-backed, via `bridge-db`.
 
 A validator does not have to use it.
-`validator::sink::Sink` picks its backend from config: `[store] url = ...` selects the HTTP sig-store, `[store] dir = ...` selects a local filesystem store, and it refuses to start if neither is set.
+`bridge_core::backend::StoreBackend` — shared by the validator, keeper and GraphQL API — picks its backing from config: `[store] url = ...` selects the HTTP sig-store, `[store] dir = ...` selects a local filesystem store, and it refuses to start if neither is set. Each service builds it with its own `SIG_STORE_*_TOKEN`, which is what bounds its authority server-side.
 Single-validator local runs use the file path; a real deployment uses the HTTP path so multiple validators share one view.
 
 **The same guards apply on both paths.**

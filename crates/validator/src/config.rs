@@ -1,3 +1,5 @@
+use bridge_core::backend::StoreConfig;
+use bridge_core::config::ensure_unique;
 use bridge_core::signer::SignerConfig;
 use serde::Deserialize;
 
@@ -14,7 +16,7 @@ pub struct Config {
     /// How this node holds its signing key (raw dev key, env var, or — for
     /// production — an encrypted keystore). See [`SignerConfig`].
     pub signer: SignerConfig,
-    pub store: Store,
+    pub store: StoreConfig,
     /// Optional operator HTTP API (pause/resume/rescan/status).
     #[serde(default)]
     pub api: Option<Api>,
@@ -89,19 +91,24 @@ pub struct RefundChain {
 
 impl RefundChain {
     pub fn endpoints(&self) -> anyhow::Result<Vec<String>> {
-        let mut out = self.rpcs.clone();
-        if let Some(rpc) = &self.rpc {
-            if !out.iter().any(|u| u == rpc) {
-                out.insert(0, rpc.clone());
-            }
-        }
-        anyhow::ensure!(
-            !out.is_empty(),
-            "refund destination {} has no RPC endpoints (set `rpc` or `rpcs`)",
-            self.chain_id
-        );
-        Ok(out)
+        endpoints(&self.rpc, &self.rpcs, &format!("refund destination {}", self.chain_id))
     }
+}
+
+/// Resolve the `rpc` / `rpcs` pair either block accepts into one ordered,
+/// deduplicated, non-empty endpoint list. `what` names the block in the error.
+///
+/// The single-`rpc` form is back-compat; when both are given the singular one
+/// leads, so an operator adding `rpcs` for failover keeps their existing primary.
+fn endpoints(rpc: &Option<String>, rpcs: &[String], what: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = rpcs.to_vec();
+    if let Some(rpc) = rpc {
+        if !out.iter().any(|u| u == rpc) {
+            out.insert(0, rpc.clone());
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "{what} has no RPC endpoints (set `rpc` or `rpcs`)");
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,25 +149,8 @@ pub struct SourceChain {
 impl SourceChain {
     /// Resolve the configured endpoints into a non-empty ordered list.
     pub fn endpoints(&self) -> anyhow::Result<Vec<String>> {
-        let mut out = self.rpcs.clone();
-        if let Some(rpc) = &self.rpc {
-            if !out.iter().any(|u| u == rpc) {
-                out.insert(0, rpc.clone());
-            }
-        }
-        anyhow::ensure!(!out.is_empty(), "no RPC endpoints configured (set `rpc` or `rpcs`)");
-        Ok(out)
+        endpoints(&self.rpc, &self.rpcs, &format!("source chain {}", self.chain_id))
     }
-}
-
-/// Where signatures go. Either a local directory (`dir`) or the HTTP sig-store
-/// (`url`). `url` wins when both are set.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Store {
-    #[serde(default)]
-    pub dir: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -221,21 +211,8 @@ impl Config {
 
         // Each source must be a distinct chain and own a distinct state file,
         // otherwise two scan loops would clobber each other's cursor.
-        for i in 0..cfg.sources.len() {
-            for j in (i + 1)..cfg.sources.len() {
-                if cfg.sources[i].chain_id == cfg.sources[j].chain_id {
-                    anyhow::bail!("duplicate source chain_id {} in config", cfg.sources[i].chain_id);
-                }
-                if cfg.sources[i].state_file == cfg.sources[j].state_file {
-                    anyhow::bail!(
-                        "sources for chains {} and {} share state_file {:?}; give each its own",
-                        cfg.sources[i].chain_id,
-                        cfg.sources[j].chain_id,
-                        cfg.sources[i].state_file
-                    );
-                }
-            }
-        }
+        ensure_unique(&cfg.sources, |s| s.chain_id, "source chain_id")?;
+        ensure_unique(&cfg.sources, |s| s.state_file.as_str(), "source state_file")?;
 
         // SECURITY: signing a `Sent` event at the source chain tip lets a reorg
         // erase the deposit *after* the keeper has already released destination
@@ -265,16 +242,7 @@ impl Config {
                      refund attestation, or list the destination chains to verify"
                 );
             }
-            for i in 0..refund.destinations.len() {
-                for j in (i + 1)..refund.destinations.len() {
-                    if refund.destinations[i].chain_id == refund.destinations[j].chain_id {
-                        anyhow::bail!(
-                            "duplicate refund destination chain_id {}",
-                            refund.destinations[i].chain_id
-                        );
-                    }
-                }
-            }
+            ensure_unique(&refund.destinations, |d| d.chain_id, "refund destination chain_id")?;
 
             // SECURITY: a source-chain refund is irreversible and is authorised
             // only on a destination `cancelled` read. Reading at the chain tip

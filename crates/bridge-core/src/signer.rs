@@ -150,6 +150,27 @@ impl SignerConfig {
     }
 }
 
+/// Encode an alloy signature as 65 bytes `r||s||v` with `v` in {27,28} — the
+/// OpenZeppelin ECDSA form every `Gate` entry point expects, and the form the
+/// sig-store recovers against.
+///
+/// One definition, because a divergent one here is silent: a signature encoded
+/// with `v` in {0,1} recovers to a different address, so it is dropped as
+/// "not a validator" rather than reported as malformed.
+pub fn encode_signature(sig: &alloy::primitives::Signature) -> String {
+    format!("0x{}", hex::encode(signature_bytes(sig)))
+}
+
+/// The raw 65 bytes behind [`encode_signature`], for callers that hand the
+/// signature to a contract or an instruction rather than to the store.
+pub fn signature_bytes(sig: &alloy::primitives::Signature) -> [u8; 65] {
+    let mut out = [0u8; 65];
+    out[..32].copy_from_slice(&sig.r().to_be_bytes::<32>());
+    out[32..64].copy_from_slice(&sig.s().to_be_bytes::<32>());
+    out[64] = 27 + sig.v() as u8;
+    out
+}
+
 // Never let a secret leak into logs/panics via `{:?}`. The config struct that
 // embeds this derives `Debug`, so redact rather than skip the impl.
 impl std::fmt::Debug for SignerConfig {

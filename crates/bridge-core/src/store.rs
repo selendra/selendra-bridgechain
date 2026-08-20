@@ -88,6 +88,60 @@ pub struct SubmissionRecord {
     pub refund_signatures: Vec<SignerSig>,
 }
 
+/// Construction from an on-chain `Gate.Sent` event — the ONE place the event's
+/// fields are mapped onto the store record.
+///
+/// Every off-chain component that observes `Sent` (the validator, which signs
+/// it; the indexer, which mirrors it) needs exactly this mapping, and a copy that
+/// drifts is invisible: two components would compute two different
+/// submissionIds for the same transfer and simply never agree, with no error
+/// anywhere.
+#[cfg(feature = "abi")]
+impl SubmissionRecord {
+    /// `None` when a chainId or the nonce exceeds `u64`.
+    ///
+    /// Those three are re-encoded as `U256` when a claim is rebuilt, so a value
+    /// that only fits by saturating would reconstruct a DIFFERENT submissionId
+    /// (and alias two distinct chains or nonces into one corridor). A real gate
+    /// never emits them; callers skip such an event rather than record or sign it.
+    pub fn from_sent_event(
+        ev: &crate::abi::Gate::Sent,
+        bridge_domain: alloy_primitives::B256,
+    ) -> Option<Self> {
+        let (chain_id_from, chain_id_to, nonce) = sent_event_u64s(ev)?;
+        Some(SubmissionRecord {
+            submission_id: format!("{:#x}", ev.submissionId),
+            bridge_domain: format!("{bridge_domain:#x}"),
+            debridge_id: format!("{:#x}", ev.debridgeId),
+            amount: ev.amount.to_string(),
+            chain_id_from,
+            chain_id_to,
+            nonce,
+            receiver: format!("0x{}", hex::encode(&ev.receiver)),
+            auto_params: format!("0x{}", hex::encode(&ev.autoParams)),
+            native_sender: format!("0x{}", hex::encode(&ev.nativeSender)),
+            // The locked asset, for the refund path. Not covered by the
+            // submissionId, so the store re-derives debridgeId from it before
+            // accepting (see `verify_token_binding`).
+            token: format!("{:#x}", ev.token),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        })
+    }
+}
+
+/// The event's `(chainIdFrom, chainIdTo, nonce)` as `u64`s, or `None` if any of
+/// them overflows. See [`SubmissionRecord::from_sent_event`] for why that is a
+/// refusal rather than a saturating cast.
+#[cfg(feature = "abi")]
+fn sent_event_u64s(ev: &crate::abi::Gate::Sent) -> Option<(u64, u64, u64)> {
+    match (u64::try_from(ev.chainIdFrom), u64::try_from(ev.chainIdTo), u64::try_from(ev.nonce)) {
+        (Ok(from), Ok(to), Ok(nonce)) => Some((from, to, nonce)),
+        _ => None,
+    }
+}
+
 /// Which digest domain a signature authorises. Each maps to a different
 /// on-chain effect, so they are stored and counted separately — a transfer
 /// quorum must never be usable as a cancel or refund quorum.
@@ -208,7 +262,6 @@ fn hex_bytes(field: &'static str, s: &str) -> Result<Vec<u8>, StoreError> {
 /// params: if the record's `submission_id` doesn't equal this, the record is forged.
 #[cfg(feature = "abi")]
 pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitives::B256, StoreError> {
-    use alloy::sol_types::SolValue;
     use alloy_primitives::{B256, U256};
     use std::str::FromStr;
 
@@ -223,19 +276,13 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
     let chain_to = U256::from(rec.chain_id_to);
     let nonce = U256::from(rec.nonce);
 
-    let id = if auto_params.is_empty() {
-        crate::submission_id(bridge_domain, debridge_id, amount, chain_from, chain_to, nonce, &receiver)
-    } else {
-        let ap = crate::abi::AutoParamsTo::abi_decode(&auto_params)
-            .map_err(|_| StoreError::BadField("auto_params"))?;
-        let auto = crate::AutoParams {
-            execution_fee: ap.executionFee,
-            flags: ap.flags,
-            fallback_address: ap.fallbackAddress.to_vec(),
-            data: ap.data.to_vec(),
-            native_sender,
-        };
-        crate::submission_id_with_auto(
+    let auto = crate::decode_auto_params(&auto_params, &native_sender)
+        .map_err(|_| StoreError::BadField("auto_params"))?;
+    let id = match auto {
+        None => {
+            crate::submission_id(bridge_domain, debridge_id, amount, chain_from, chain_to, nonce, &receiver)
+        }
+        Some(auto) => crate::submission_id_with_auto(
             bridge_domain,
             debridge_id,
             amount,
@@ -244,7 +291,7 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
             nonce,
             &receiver,
             &auto,
-        )
+        ),
     };
     Ok(id)
 }
@@ -470,18 +517,9 @@ mod tests {
     use super::*;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::signers::SignerSync;
-    use alloy_primitives::{Address, Signature, B256, U256};
+    use alloy_primitives::{Address, B256, U256};
+    use crate::signer::encode_signature as encode_sig;
     use std::str::FromStr;
-
-    // Encode an alloy signature as 65 bytes r||s||v (v in {27,28}), as the
-    // validator does and the Gate expects.
-    fn encode_sig(sig: &Signature) -> String {
-        let mut out = Vec::with_capacity(65);
-        out.extend_from_slice(&sig.r().to_be_bytes::<32>());
-        out.extend_from_slice(&sig.s().to_be_bytes::<32>());
-        out.push(27 + sig.v() as u8);
-        format!("0x{}", hex::encode(out))
-    }
 
     /// The ERC-20 `make_record` pretends was locked on chain 1337.
     fn token() -> Address {

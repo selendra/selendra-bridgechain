@@ -233,6 +233,13 @@ where
     Ok(())
 }
 
+/// The log's transaction hash as `0x`-prefixed hex, or `""` if the RPC omitted
+/// it. Every handler records one, so the fallback lives here rather than being
+/// spelled out at each call site.
+fn tx_hash(log: &Log) -> String {
+    log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default()
+}
+
 async fn handle_gate_log(
     db: Db,
     chain_id: u64,
@@ -241,36 +248,17 @@ async fn handle_gate_log(
 ) -> anyhow::Result<()> {
     if let Ok(decoded) = Gate::Sent::decode_log(&log.inner) {
         let ev = &decoded.data;
-        // Reject (skip) an event whose chainId/nonce overflows u64 rather than
-        // aliasing it to u64::MAX and mis-keying the history row. Skip, not error:
-        // the scan cursor must still advance past a permanently-malformed log.
-        let (chain_id_from, chain_id_to, nonce) =
-            match (u64::try_from(ev.chainIdFrom), u64::try_from(ev.chainIdTo), u64::try_from(ev.nonce)) {
-                (Ok(f), Ok(t), Ok(n)) => (f, t, n),
-                _ => {
-                    warn!(
-                        chain_id,
-                        submission_id = %format!("{:#x}", ev.submissionId),
-                        "skipping Sent with chainId/nonce exceeding u64 (malformed/hostile source)"
-                    );
-                    return Ok(());
-                }
-            };
-        let record = SubmissionRecord {
-            submission_id: format!("{:#x}", ev.submissionId),
-            bridge_domain: format!("{bridge_domain:#x}"),
-            debridge_id: format!("{:#x}", ev.debridgeId),
-            amount: ev.amount.to_string(),
-            chain_id_from,
-            chain_id_to,
-            nonce,
-            receiver: format!("0x{}", hex::encode(&ev.receiver)),
-            auto_params: format!("0x{}", hex::encode(&ev.autoParams)),
-            native_sender: format!("0x{}", hex::encode(&ev.nativeSender)),
-            token: format!("{:#x}", ev.token),
-            signatures: vec![],
-            cancel_signatures: vec![],
-            refund_signatures: vec![],
+        // An event whose chainId/nonce overflows u64 is skipped rather than
+        // aliased to u64::MAX (which would mis-key the history row). Skip, not
+        // error: the scan cursor must still advance past a permanently-malformed
+        // log, or it would re-read the same range forever.
+        let Some(record) = SubmissionRecord::from_sent_event(ev, bridge_domain) else {
+            warn!(
+                chain_id,
+                submission_id = %format!("{:#x}", ev.submissionId),
+                "skipping Sent with chainId/nonce exceeding u64 (malformed/hostile source)"
+            );
+            return Ok(());
         };
         let id = record.submission_id.clone();
         db.observe_submission(record).await?;
@@ -279,7 +267,7 @@ async fn handle_gate_log(
     }
     if let Ok(decoded) = Gate::Claimed::decode_log(&log.inner) {
         let ev = &decoded.data;
-        let tx = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+        let tx = tx_hash(&log);
         let id = format!("{:#x}", ev.submissionId);
         db.mark_claimed(&id, &tx).await?;
         info!(chain_id, submission_id = %id, %tx, "observed Claimed");
@@ -291,7 +279,7 @@ async fn handle_gate_log(
     // list both read.
     if let Ok(decoded) = Gate::Cancelled::decode_log(&log.inner) {
         let ev = &decoded.data;
-        let tx = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+        let tx = tx_hash(&log);
         let id = format!("{:#x}", ev.submissionId);
         db.mark_cancelled(&id, &tx).await?;
         info!(chain_id, submission_id = %id, %tx, "observed Cancelled (destination burned)");
@@ -299,7 +287,7 @@ async fn handle_gate_log(
     }
     if let Ok(decoded) = Gate::Refunded::decode_log(&log.inner) {
         let ev = &decoded.data;
-        let tx = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+        let tx = tx_hash(&log);
         let id = format!("{:#x}", ev.submissionId);
         db.mark_refunded(&id, &tx).await?;
         info!(chain_id, submission_id = %id, %tx, "observed Refunded (source repaid)");
@@ -310,7 +298,7 @@ async fn handle_gate_log(
 async fn handle_pool_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()> {
     let Ok(decoded) = SwapPool::Swapped::decode_log(&log.inner) else { return Ok(()) };
     let ev = &decoded.data;
-    let tx_hash = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+    let tx_hash = tx_hash(&log);
     let log_index = log.log_index.unwrap_or(0) as i64;
     db.record_swap(
         chain_id,
@@ -348,7 +336,7 @@ async fn handle_router_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()
     if let Ok(decoded) = SwapRouter::Finalized::decode_log(&log.inner) {
         let ev = &decoded.data;
         let id = format!("{:#x}", ev.submissionId);
-        let tx = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+        let tx = tx_hash(&log);
         db.record_finalized(&id, &tx, &ev.amountOut.to_string(), false).await?;
         info!(chain_id, submission_id = %id, "observed Finalized");
         return Ok(());
@@ -356,7 +344,7 @@ async fn handle_router_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()
     if let Ok(decoded) = SwapRouter::FinalizeFallback::decode_log(&log.inner) {
         let ev = &decoded.data;
         let id = format!("{:#x}", ev.submissionId);
-        let tx = log.transaction_hash.map(|h| format!("{h:#x}")).unwrap_or_default();
+        let tx = tx_hash(&log);
         db.record_finalized(&id, &tx, &ev.stableAmount.to_string(), true).await?;
         info!(chain_id, submission_id = %id, "observed FinalizeFallback");
     }

@@ -15,7 +15,6 @@ mod api;
 mod config;
 mod provider;
 mod refund;
-mod sink;
 mod state;
 
 use std::collections::BTreeMap;
@@ -27,14 +26,15 @@ use alloy::primitives::{Address, B256};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
-use alloy_sol_types::{SolEvent, SolValue};
+use alloy_sol_types::SolEvent;
 use anyhow::Context;
-use bridge_core::abi::{AutoParamsTo, Gate};
+use bridge_core::abi::Gate;
 use bridge_core::allow::Allowlist;
+use bridge_core::backend::StoreBackend;
+use bridge_core::signer::encode_signature;
 use bridge_core::store::{SignerSig, SubmissionRecord};
-use bridge_core::{AutoParams, Submission};
+use bridge_core::Submission;
 use config::{Config, SourceChain};
-use sink::Sink;
 use state::{NonceDecision, PauseReason, Runtime};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -53,8 +53,9 @@ async fn main() -> anyhow::Result<()> {
 
     let signer = cfg.signer.load("validator").context("loading validator signer")?;
     let signer_addr = signer.address();
-    // One sink, shared across every per-source scan loop.
-    let sink = Arc::new(Sink::from_config(&cfg.store)?);
+    // One sink, shared across every per-source scan loop. L-5: read + sign only —
+    // it cannot mark claimed or edit the allowlist.
+    let sink = Arc::new(StoreBackend::from_config(&cfg.store, "SIG_STORE_VALIDATOR_TOKEN")?);
 
     info!(
         validator = %signer_addr,
@@ -130,7 +131,7 @@ async fn scan_source(
     source: SourceChain,
     signer: PrivateKeySigner,
     signer_addr: Address,
-    sink: Arc<Sink>,
+    sink: Arc<StoreBackend>,
     runtime: Arc<Mutex<Runtime>>,
 ) -> anyhow::Result<()> {
     let gate: Address = source.gate.parse().context("bad gate address")?;
@@ -291,7 +292,7 @@ async fn scan_source(
 async fn handle_log(
     signer: &PrivateKeySigner,
     signer_addr: Address,
-    sink: &Sink,
+    sink: &StoreBackend,
     runtime: &Arc<Mutex<Runtime>>,
     log: &alloy::rpc::types::Log,
     allowlist: Option<&Allowlist>,
@@ -301,26 +302,22 @@ async fn handle_log(
     let ev = &decoded.data;
 
     let emitted_id: B256 = ev.submissionId;
-    // Chain ids and the nonce MUST fit u64: they are re-encoded as U256 by the
-    // keeper's claim(), so a value that only fits by saturating to u64::MAX would
-    // reconstruct a different submissionId (and alias two distinct chains/nonces
-    // into one corridor). A real gate never emits these; treat it as a malformed
-    // or hostile source and refuse to sign — but skip, don't error, so a single
-    // bad log can't wedge the batch (H3 retries errors forever).
-    let (chain_from, chain_to, nonce) =
-        match (u64::try_from(ev.chainIdFrom), u64::try_from(ev.chainIdTo), u64::try_from(ev.nonce)) {
-            (Ok(f), Ok(t), Ok(n)) => (f, t, n),
-            _ => {
-                warn!(
-                    submission_id = %emitted_id,
-                    chain_from = %ev.chainIdFrom,
-                    chain_to = %ev.chainIdTo,
-                    nonce = %ev.nonce,
-                    "Sent event has a chainId/nonce that exceeds u64 — refusing to sign (aliased value would mis-key the nonce and break claim reconstruction)"
-                );
-                return Ok(true); // skip this event; never sign an aliased transfer
-            }
-        };
+    // Chain ids and the nonce MUST fit u64 (see `SubmissionRecord::from_sent_event`
+    // for why an aliasing cast would break claim reconstruction). A real gate
+    // never emits these; treat it as a malformed or hostile source and refuse to
+    // sign — but skip, don't error, so a single bad log can't wedge the batch
+    // (H3 retries errors forever).
+    let Some(record) = SubmissionRecord::from_sent_event(ev, bridge_domain) else {
+        warn!(
+            submission_id = %emitted_id,
+            chain_from = %ev.chainIdFrom,
+            chain_to = %ev.chainIdTo,
+            nonce = %ev.nonce,
+            "Sent event has a chainId/nonce that exceeds u64 — refusing to sign (aliased value would mis-key the nonce and break claim reconstruction)"
+        );
+        return Ok(true); // skip this event; never sign an aliased transfer
+    };
+    let (chain_from, chain_to, nonce) = (record.chain_id_from, record.chain_id_to, record.nonce);
 
     // Sequential-nonce enforcement (mirrors NonceControllingService). The nonce
     // sequence is per (chain_from, chain_to): each source gate runs its own
@@ -348,8 +345,7 @@ async fn handle_log(
     }
 
     // Independently recompute the submissionId; never sign one we can't reproduce.
-    let submission = submission_from_event(ev, bridge_domain);
-    let computed_id = submission.compute_id();
+    let computed_id = Submission::from_sent_event(ev, bridge_domain).compute_id();
     if computed_id != emitted_id {
         warn!(
             emitted = %emitted_id,
@@ -385,25 +381,6 @@ async fn handle_log(
     let sig = signer.sign_message(emitted_id.as_slice()).await?;
     let sig_hex = encode_signature(&sig);
 
-    let record = SubmissionRecord {
-        submission_id: format!("{emitted_id:#x}"),
-        bridge_domain: format!("{bridge_domain:#x}"),
-        debridge_id: format!("{:#x}", ev.debridgeId),
-        amount: ev.amount.to_string(),
-        chain_id_from: chain_from,
-        chain_id_to: chain_to,
-        nonce,
-        receiver: format!("0x{}", hex::encode(&ev.receiver)),
-        auto_params: format!("0x{}", hex::encode(&ev.autoParams)),
-        native_sender: format!("0x{}", hex::encode(&ev.nativeSender)),
-        // The locked asset, for the refund path. Not covered by the submissionId,
-        // so the store re-derives debridgeId from it before accepting.
-        token: format!("{:#x}", ev.token),
-        signatures: vec![],
-        cancel_signatures: vec![],
-        refund_signatures: vec![],
-    };
-
     sink.upsert(record, SignerSig { signer: format!("{signer_addr:#x}"), signature: sig_hex })
         .await?;
 
@@ -417,42 +394,4 @@ async fn handle_log(
         "SIGNED and stored"
     );
     Ok(true)
-}
-
-/// Build our independent `Submission` from a decoded `Sent` event.
-fn submission_from_event(ev: &Gate::Sent, bridge_domain: B256) -> Submission {
-    let auto = if ev.autoParams.is_empty() {
-        None
-    } else {
-        match AutoParamsTo::abi_decode(&ev.autoParams) {
-            Ok(ap) => Some(AutoParams {
-                execution_fee: ap.executionFee,
-                flags: ap.flags,
-                fallback_address: ap.fallbackAddress.to_vec(),
-                data: ap.data.to_vec(),
-                native_sender: ev.nativeSender.to_vec(),
-            }),
-            Err(_) => None,
-        }
-    };
-
-    Submission {
-        bridge_domain,
-        debridge_id: ev.debridgeId,
-        amount: ev.amount,
-        chain_id_from: ev.chainIdFrom,
-        chain_id_to: ev.chainIdTo,
-        nonce: ev.nonce,
-        receiver: ev.receiver.to_vec(),
-        auto,
-    }
-}
-
-/// Encode an alloy signature as 65 bytes r||s||v with v in {27,28} (OZ ECDSA form).
-fn encode_signature(sig: &alloy::primitives::Signature) -> String {
-    let mut out = Vec::with_capacity(65);
-    out.extend_from_slice(&sig.r().to_be_bytes::<32>());
-    out.extend_from_slice(&sig.s().to_be_bytes::<32>());
-    out.push(27 + sig.v() as u8);
-    format!("0x{}", hex::encode(out))
 }

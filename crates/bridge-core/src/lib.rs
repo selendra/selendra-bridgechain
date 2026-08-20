@@ -11,6 +11,7 @@ mod submission;
 pub use submission::Submission;
 
 pub mod allow;
+pub mod config;
 pub mod store;
 
 #[cfg(feature = "abi")]
@@ -23,6 +24,12 @@ pub mod signer;
 
 #[cfg(feature = "http")]
 pub mod remote;
+
+// The shared read/write view over the signature store (file dir or the HTTP
+// sig-store), used by the validator, keeper and GraphQL API alike. Needs both
+// the `http` client and the `abi` trust-boundary checks the file path runs.
+#[cfg(all(feature = "http", feature = "abi"))]
+pub mod backend;
 
 #[cfg(feature = "axum-auth")]
 pub mod auth;
@@ -122,6 +129,34 @@ pub fn submission_id_with_auto(
     packed.extend_from_slice(keccak256(&auto.data).as_slice());
     packed.extend_from_slice(keccak256(&auto.native_sender).as_slice());
     keccak256(packed)
+}
+
+/// Decode the abi-encoded `autoParams` blob a `Sent` event carries, pairing it
+/// with the event's packed `nativeSender` (which rides alongside the blob rather
+/// than inside it).
+///
+/// `Ok(None)` is "no execution payload" (an empty blob). `Err` is "there IS a
+/// payload but it does not decode" — a caller must fail closed on that and must
+/// never fold it into `None`, because the plain-transfer id and the with-auto id
+/// for the same transfer are different hashes.
+#[cfg(feature = "abi")]
+pub fn decode_auto_params(
+    auto_params: &[u8],
+    native_sender: &[u8],
+) -> Result<Option<AutoParams>, alloy::sol_types::Error> {
+    use alloy::sol_types::SolValue;
+
+    if auto_params.is_empty() {
+        return Ok(None);
+    }
+    let ap = abi::AutoParamsTo::abi_decode(auto_params)?;
+    Ok(Some(AutoParams {
+        execution_fee: ap.executionFee,
+        flags: ap.flags,
+        fallback_address: ap.fallbackAddress.to_vec(),
+        data: ap.data.to_vec(),
+        native_sender: native_sender.to_vec(),
+    }))
 }
 
 /// Digest a validator signs to authorise CANCELLING a transfer on the

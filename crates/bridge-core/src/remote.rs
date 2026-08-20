@@ -4,7 +4,7 @@
 //! The validator POSTs its signature; the keeper GETs all records. The server
 //! dedupes by signer, so multiple validators converge on one record per id.
 
-use crate::allow::{AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest};
+use crate::allow::{AllowedChain, AllowedToken, Allowlist, AttestationRequest, ClaimedRequest};
 use crate::store::{SigKind, SignerSig, SubmissionRecord};
 
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +114,19 @@ impl RemoteStore {
     pub async fn allowed_chains(&self) -> Result<Vec<AllowedChain>, RemoteError> {
         let url = format!("{}/allowed/chains", self.base);
         Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Both allowlists, assembled into the in-memory [`Allowlist`] the hot path
+    /// checks against.
+    ///
+    /// The validator and the keeper are the two independent enforcement points
+    /// and both need exactly this pair of fetches, so it lives here rather than
+    /// being spelled out twice: a copy that fetched only one list would disable
+    /// half the enforcement at that component with nothing to show for it.
+    pub async fn allowlist(&self) -> Result<Allowlist, RemoteError> {
+        let tokens = self.allowed_tokens().await?;
+        let chains = self.allowed_chains().await?;
+        Ok(Allowlist::from_parts(&tokens, &chains))
     }
 
     /// Mark a submission claimed after the keeper executes `claim()` on-chain.

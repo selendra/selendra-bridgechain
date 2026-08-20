@@ -14,7 +14,6 @@
 //! Read-only by default for safety; pass `--allow-mutations` to expose the
 //! `submitSignature` mutation. Bind to localhost unless you front it with auth.
 
-mod backend;
 mod chain;
 mod schema;
 mod swap;
@@ -27,10 +26,10 @@ use async_graphql_axum::GraphQL;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
+use bridge_core::backend::StoreBackend;
 use clap::Parser;
 use tracing::info;
 
-use backend::Backend;
 use chain::Chains;
 use schema::{ApiState, Mutation, Query};
 use swap::Swaps;
@@ -91,8 +90,11 @@ async fn main() -> anyhow::Result<()> {
 
     let backend = match (&args.dir, &args.store_url) {
         (Some(_), Some(_)) => anyhow::bail!("pass only one of --dir or --store-url"),
-        (Some(dir), None) => Backend::file(dir),
-        (None, Some(url)) => Backend::remote(url.clone()),
+        (Some(dir), None) => StoreBackend::file(dir)?,
+        // L-5: a read-only credential. This is the most exposed component, so it
+        // must hold nothing that can write — the token, not the type, is what
+        // enforces that server-side.
+        (None, Some(url)) => StoreBackend::remote_for_role(url.clone(), "SIG_STORE_READER_TOKEN"),
         (None, None) => anyhow::bail!("need a store: pass --dir <path> or --store-url <url>"),
     };
     let described = backend.describe();

@@ -38,12 +38,13 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use anyhow::Context;
 use bridge_core::abi::Gate;
+use bridge_core::backend::StoreBackend;
+use bridge_core::signer::encode_signature;
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
 use tracing::{info, warn};
 
 use crate::config::RefundConfig;
 use crate::provider;
-use crate::sink::Sink;
 
 /// One chain this validator can independently read gate state from.
 struct GateReader {
@@ -242,7 +243,7 @@ pub async fn run(
     cfg: RefundConfig,
     sources: Vec<(u64, String, Vec<String>)>, // (chain_id, gate, endpoints)
     signer: PrivateKeySigner,
-    sink: std::sync::Arc<Sink>,
+    sink: std::sync::Arc<StoreBackend>,
 ) -> anyhow::Result<()> {
     let signer_addr = signer.address();
     let retry = Duration::from_millis(cfg.poll_interval_ms.max(1000));
@@ -320,7 +321,7 @@ async fn handle_candidate(
     dest_readers: &BTreeMap<u64, GateReader>,
     signer: &PrivateKeySigner,
     signer_addr: Address,
-    sink: &Sink,
+    sink: &StoreBackend,
     timeout_secs: i64,
 ) -> anyhow::Result<()> {
     // Only vote on corridors we can verify BOTH ends of. Attesting on a chain we
@@ -388,15 +389,6 @@ async fn handle_candidate(
         "ATTESTED"
     );
     Ok(())
-}
-
-/// 65 bytes r||s||v with v in {27,28} — the same encoding the transfer path uses.
-fn encode_signature(sig: &alloy::primitives::Signature) -> String {
-    let mut out = Vec::with_capacity(65);
-    out.extend_from_slice(&sig.r().to_be_bytes::<32>());
-    out.extend_from_slice(&sig.s().to_be_bytes::<32>());
-    out.push(27 + sig.v() as u8);
-    format!("0x{}", hex::encode(out))
 }
 
 #[cfg(test)]

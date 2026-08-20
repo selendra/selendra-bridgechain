@@ -1,3 +1,5 @@
+use bridge_core::backend::StoreConfig;
+use bridge_core::config::ensure_unique;
 use bridge_core::signer::SignerConfig;
 use serde::Deserialize;
 
@@ -6,53 +8,37 @@ use serde::Deserialize;
 pub struct Config {
     /// Legacy single-target form: `[target]`. Folded into `targets` on load.
     #[serde(default)]
-    pub target: Option<TargetChain>,
+    pub target: Option<ChainCfg>,
     /// Multi-target form: one `[[targets]]` block per destination chain the
     /// keeper should deliver claims to (e.g. chainB *and* chainC).
     #[serde(default)]
-    pub targets: Vec<TargetChain>,
+    pub targets: Vec<ChainCfg>,
     /// How the keeper holds the funded gas-payer key that signs `claim()` txs
     /// (raw dev key, env var, or an encrypted keystore). See [`SignerConfig`].
     pub keeper: SignerConfig,
-    pub store: Store,
+    pub store: StoreConfig,
     /// Source chains this keeper can submit `refund()` to. Refunds execute on the
     /// chain the funds were locked on, which is the *source* of a transfer — so
     /// they need their own blocks, separate from the claim targets. Empty (the
     /// default) means this keeper never submits refunds.
     #[serde(default)]
-    pub sources: Vec<SourceChain>,
+    pub sources: Vec<ChainCfg>,
 }
 
-/// A source chain the keeper can submit `refund()` transactions to.
+/// One chain the keeper submits transactions to.
+///
+/// A `[[targets]]` block (claims + cancels, on the destination) and a
+/// `[[sources]]` block (refunds, on the chain the funds were locked on) take
+/// exactly the same settings — only the loop that consumes them differs — so
+/// they share one type rather than two that must be kept in step.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SourceChain {
+pub struct ChainCfg {
     pub chain_id: u64,
     pub rpc: String,
     pub gate: String,
     #[serde(default = "default_interval")]
     pub poll_interval_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TargetChain {
-    pub chain_id: u64,
-    pub rpc: String,
-    pub gate: String,
-    #[serde(default = "default_interval")]
-    pub poll_interval_ms: u64,
-}
-
-/// Where the keeper reads signatures: a local directory (`dir`) or the HTTP
-/// sig-store (`url`). `url` wins when both are set.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Store {
-    #[serde(default)]
-    pub dir: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
 }
 
 fn default_interval() -> u64 {
@@ -79,28 +65,10 @@ impl Config {
             anyhow::bail!("config needs at least one [[targets]] block (or a legacy [target])");
         }
 
-        // Guard against two blocks claiming the same destination chain.
-        for i in 0..cfg.targets.len() {
-            for j in (i + 1)..cfg.targets.len() {
-                if cfg.targets[i].chain_id == cfg.targets[j].chain_id {
-                    anyhow::bail!(
-                        "duplicate target chain_id {} in config",
-                        cfg.targets[i].chain_id
-                    );
-                }
-            }
-        }
-
-        for i in 0..cfg.sources.len() {
-            for j in (i + 1)..cfg.sources.len() {
-                if cfg.sources[i].chain_id == cfg.sources[j].chain_id {
-                    anyhow::bail!(
-                        "duplicate source chain_id {} in config",
-                        cfg.sources[i].chain_id
-                    );
-                }
-            }
-        }
+        // Guard against two blocks claiming the same chain: two loops on one chain
+        // would submit from the same account and contend on its nonce.
+        ensure_unique(&cfg.targets, |t| t.chain_id, "target chain_id")?;
+        ensure_unique(&cfg.sources, |s| s.chain_id, "source chain_id")?;
 
         Ok(cfg)
     }
