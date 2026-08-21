@@ -67,7 +67,7 @@ export function Explorer({ chains, initialFilter }: ExplorerProps) {
   const decimalsByChain = useChainDecimals(chains);
 
   // Best-effort: the DB-backed history/swap views only exist when graphql-api
-  // was started with --db-url. Swallow failures into an empty list instead of
+  // was started with --store-url. Swallow failures into an empty list instead of
   // surfacing an error, so an unconfigured deployment looks exactly as it did
   // before this feature existed — the Stuck badge and Swaps tab just stay empty.
   const history = usePoll<HistoryEntry[]>(

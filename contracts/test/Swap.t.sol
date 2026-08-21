@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {SwapPool} from "../src/SwapPool.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @dev ERC-20 with configurable decimals (to exercise the swap's decimal
 ///      normalisation — e.g. a 6-dec stablecoin against 18-dec tokens).
@@ -397,6 +398,56 @@ contract SwapTest is Test {
         pool.setPrice(address(weth), 3100e18);
         (,, uint256 price,) = _info(address(weth));
         assertEq(price, 3100e18, "a re-listed token must be freely pricable");
+    }
+
+    /// The stable's price is the pool's unit of account and `setPrice` refuses to
+    /// move it — but delisting was the way around that: drain the reserve, delist,
+    /// re-list at any price at all, never touching `setPrice`. The cross-chain
+    /// SwapRouter's accounting rests on that peg, so the hatch has to be shut.
+    function test_Delist_StableIsForbidden() public {
+        pool.withdrawLiquidity(address(usd), 1_000_000e6, address(this));
+        (,,, uint256 reserve) = _info(address(usd));
+        assertEq(reserve, 0, "premise: the owner can drain the stable's reserve");
+
+        vm.expectRevert(SwapPool.StableDelistForbidden.selector);
+        pool.delistToken(address(usd));
+
+        (bool listed,, uint256 price,) = _info(address(usd));
+        assertTrue(listed, "the stable must stay listed");
+        assertEq(price, PRICE_ONE, "the stable's price must stay pinned");
+    }
+
+    /// Re-listing is a reprice, so it obeys the same deviation cap `setPrice`
+    /// does. Otherwise delist -> relist walked any token to any price in one
+    /// transaction, around both the cap and the cooldown — which would make the
+    /// documented rate limit a constraint on the oracle only, never on the owner.
+    function test_Relist_IsBoundedByTheDeviationCap() public {
+        pool.withdrawLiquidity(address(weth), 100e18, address(this));
+        pool.delistToken(address(weth));
+
+        // WETH_PRICE is 3180; the cap is 10%, so 1 wei over 3498 must revert.
+        uint256 tooHigh = WETH_PRICE + Math.mulDiv(WETH_PRICE, DEVIATION, 10_000) + 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SwapPool.PriceDeviationTooHigh.selector, WETH_PRICE, tooHigh, DEVIATION
+            )
+        );
+        pool.listToken(address(weth), tooHigh);
+
+        // ...and the same move one wei inside the cap is still allowed.
+        pool.listToken(address(weth), tooHigh - 1);
+        (,, uint256 price,) = _info(address(weth));
+        assertEq(price, tooHigh - 1);
+    }
+
+    /// A token this pool has never seen has no remembered price, so its first
+    /// listing is unconstrained — the cap needs something to measure against.
+    function test_FirstListing_IsUnconstrained() public {
+        MockERC20 fresh = new MockERC20("Fresh", "FR", 18);
+        pool.listToken(address(fresh), 999_999e18);
+        (bool listed,, uint256 price,) = _info(address(fresh));
+        assertTrue(listed);
+        assertEq(price, 999_999e18);
     }
 
     function test_MaxSwapOut() public view {

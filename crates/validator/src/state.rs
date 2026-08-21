@@ -163,6 +163,25 @@ impl Runtime {
         self.persist.nonces.entry(chain_from).or_default().insert(chain_to, nonce);
     }
 
+    /// Copy of the whole nonce cursor, to be handed back to [`Runtime::restore_nonces`].
+    ///
+    /// The scan loop advances this cursor per EVENT but its block cursor per
+    /// BATCH, so the two only agree at a batch boundary. Taking a snapshot at
+    /// that boundary is what lets a half-finished batch be undone.
+    pub fn nonce_snapshot(&self) -> BTreeMap<u64, BTreeMap<u64, u64>> {
+        self.persist.nonces.clone()
+    }
+
+    /// Roll the nonce cursor back to a [`Runtime::nonce_snapshot`].
+    ///
+    /// Called whenever a batch stops early and the block cursor therefore stays
+    /// put: the same events are about to be replayed, and a cursor left ahead of
+    /// them would read the replay as DUPLICATED_NONCE and pause the scanner on an
+    /// anomaly that never happened.
+    pub fn restore_nonces(&mut self, snapshot: BTreeMap<u64, BTreeMap<u64, u64>>) {
+        self.persist.nonces = snapshot;
+    }
+
     pub fn pause(&mut self, reason: PauseReason) {
         self.persist.paused = true;
         self.persist.pause_reason = Some(reason);
@@ -254,6 +273,53 @@ mod tests {
         assert_eq!(r.check_nonce(1339, TO, 1), NonceDecision::Accept);
         // and a genuine replay within a corridor is still caught
         assert_eq!(r.check_nonce(1337, TO, 0), NonceDecision::Duplicated);
+    }
+
+    /// THE regression. The scan loop advances the nonce cursor per event but the
+    /// block cursor per batch, so a batch that stops early (a sig-store blip, a
+    /// nonce anomaly) leaves the two out of step and the SAME events get
+    /// rescanned. Without the rollback the replay of an already-accepted nonce
+    /// reads as DUPLICATED and pauses the validator — a persisted stop, on a
+    /// fault that never happened.
+    #[test]
+    fn a_rolled_back_batch_replays_without_a_false_duplicate() {
+        let mut r = rt();
+        r.accept_nonce(FROM, TO, 4);
+
+        // Batch boundary: snapshot, then consume nonce 5 before the batch fails.
+        let before = r.nonce_snapshot();
+        assert_eq!(r.check_nonce(FROM, TO, 5), NonceDecision::Accept);
+        r.accept_nonce(FROM, TO, 5);
+
+        // Pre-fix: the replay of 5 lands on last == 5 and reads as a duplicate.
+        assert_eq!(r.check_nonce(FROM, TO, 5), NonceDecision::Duplicated);
+
+        r.restore_nonces(before);
+        assert_eq!(
+            r.check_nonce(FROM, TO, 5),
+            NonceDecision::Accept,
+            "a rescanned event must be re-processable, not read as a replay"
+        );
+        // ...and a genuine replay is still caught once the batch does complete.
+        r.accept_nonce(FROM, TO, 5);
+        assert_eq!(r.check_nonce(FROM, TO, 5), NonceDecision::Duplicated);
+    }
+
+    /// The rollback must not mask a real anomaly either: a gap is still a gap
+    /// after the replay, so the operator sees MISSED_NONCE rather than the
+    /// DUPLICATED_NONCE the un-rolled-back cursor invented.
+    #[test]
+    fn rollback_preserves_a_genuine_gap() {
+        let mut r = rt();
+        r.accept_nonce(FROM, TO, 4);
+        let before = r.nonce_snapshot();
+
+        r.accept_nonce(FROM, TO, 5); // first event of the batch, fine
+        assert_eq!(r.check_nonce(FROM, TO, 8), NonceDecision::Missed); // second: a gap
+
+        r.restore_nonces(before);
+        assert_eq!(r.check_nonce(FROM, TO, 5), NonceDecision::Accept);
+        assert_eq!(r.check_nonce(FROM, TO, 8), NonceDecision::Missed);
     }
 
     #[test]

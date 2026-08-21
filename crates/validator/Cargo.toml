@@ -21,3 +21,8 @@ reqwest = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
 axum = { workspace = true }
+
+[dev-dependencies]
+# Drive the operator-API router in-process (no socket) via `oneshot`, so the
+# tests cover the HTTP handlers rather than only the `Runtime` beneath them.
+tower = { version = "0.5", features = ["util"] }

@@ -14,6 +14,7 @@
 //!   GET    /submissions/:id              -> one record (404 if unknown)
 //!   POST   /submissions/:id/claimed      -> mark claimed (body: {"claim_tx": "0x.."})
 //!   GET    /history                      -> history view (status, counts, timestamps)
+//!   GET    /swaps?chain_id=&limit=       -> same-chain swap history (newest first)
 //!
 //!   # refund path (two-phase: burn on the destination, then repay on the source)
 //!   POST   /submissions/:id/attestations -> a validator's cancel/refund signature
@@ -35,14 +36,14 @@
 //!   POST   /allowed/chains               -> add (body: {"chain_id_from":..,"chain_id_to":..})
 //!   DELETE /allowed/chains/:from/:to     -> remove
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bridge_core::allow::{
     AddTokenRequest, AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest,
-    SubmissionHistory,
+    SubmissionHistory, SwapRecord,
 };
 use bridge_core::auth::{require_scope, Auth, Scope};
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
@@ -143,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/submissions/:id", get(get_submission))
         .route("/refund-candidates", get(get_refund_candidates))
         .route("/history", get(get_history))
+        .route("/swaps", get(get_swaps))
         .route("/allowed/tokens", get(list_tokens))
         .route("/allowed/chains", get(list_chains))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Read), require_scope));
@@ -265,6 +267,26 @@ async fn get_history(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<SubmissionHistory>>, (StatusCode, String)> {
     Ok(Json(s.db.history().await.map_err(db_err)?))
+}
+
+/// Query for [`get_swaps`]. Both fields optional: no `chain_id` means every
+/// chain, and `limit` defaults to 100 and is capped so one request cannot ask
+/// the database for the whole table.
+#[derive(serde::Deserialize)]
+struct SwapQuery {
+    chain_id: Option<u64>,
+    limit: Option<u64>,
+}
+
+/// Same-chain swap history. Read scope, like `/history` — it exists so the
+/// GraphQL API can serve `swapHistory` with its read-only bearer token instead
+/// of a Postgres credential of its own.
+async fn get_swaps(
+    State(s): State<AppState>,
+    Query(q): Query<SwapQuery>,
+) -> Result<Json<Vec<SwapRecord>>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(100).min(1000) as i64;
+    Ok(Json(s.db.list_swaps(q.chain_id, limit).await.map_err(db_err)?))
 }
 
 // --- refund path ----------------------------------------------------------

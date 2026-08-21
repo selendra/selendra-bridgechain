@@ -150,6 +150,35 @@ impl StoreBackend {
         }
     }
 
+    /// The transaction-history view.
+    ///
+    /// Only the sig-store keeps a lifecycle, so the file backing has nothing to
+    /// report and says so rather than returning a misleading empty list.
+    pub async fn history(&self) -> anyhow::Result<Vec<crate::allow::SubmissionHistory>> {
+        match self {
+            StoreBackend::File { .. } => anyhow::bail!(
+                "transaction history needs the sig-store — start with `--store-url`; \
+                 a file-backed store keeps signatures only, not a lifecycle"
+            ),
+            StoreBackend::Remote(remote) => Ok(remote.history().await?),
+        }
+    }
+
+    /// Same-chain swap history, newest first, optionally scoped to one chain.
+    pub async fn swaps(
+        &self,
+        chain_id: Option<u64>,
+        limit: u64,
+    ) -> anyhow::Result<Vec<crate::allow::SwapRecord>> {
+        match self {
+            StoreBackend::File { .. } => anyhow::bail!(
+                "swap history needs the sig-store — start with `--store-url`; \
+                 a file-backed store keeps signatures only"
+            ),
+            StoreBackend::Remote(remote) => Ok(remote.swaps(chain_id, limit).await?),
+        }
+    }
+
     /// The directory this backend writes to, if it is file-backed.
     pub fn dir(&self) -> Option<&Path> {
         match self {

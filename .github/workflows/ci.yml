@@ -166,7 +166,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Throwaway values for the `${VAR:?}` guards. Every secret in the compose
+      # file is required-with-no-default ON PURPOSE, so that `docker compose up`
+      # refuses to start a deployment with weak secrets — which also means this
+      # schema check cannot run without something in the variables. Supplying
+      # junk here keeps the guards doing their job at deploy time while letting
+      # CI validate the file's shape; it never reaches a running container.
+      # Without this the step failed on every push, so the whole job was red and
+      # the three checks below it never reported.
       - name: docker compose config
+        env:
+          POSTGRES_PASSWORD: ci-not-a-real-secret
+          SIG_STORE_VALIDATOR_TOKEN: ci-not-a-real-secret
+          SIG_STORE_KEEPER_TOKEN: ci-not-a-real-secret
+          SIG_STORE_READER_TOKEN: ci-not-a-real-secret
+          SIG_STORE_ADMIN_TOKEN: ci-not-a-real-secret
         run: docker compose config --quiet
 
       # Every generated config in these scripts is a place a fail-closed check can

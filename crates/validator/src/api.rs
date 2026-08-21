@@ -164,7 +164,15 @@ async fn pause_one(
     Path(chain_id): Path<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let rt = runtime_of(&s, chain_id)?;
-    rt.lock().await.pause(crate::state::PauseReason::Operator);
+    {
+        let mut rt = rt.lock().await;
+        rt.pause(crate::state::PauseReason::Operator);
+        // Persist it, exactly as `resume`/`rescan` do and as `state::Persist`
+        // requires: a safety stop that lived in memory only would be cleared by
+        // the next container restart, and the validator would come back signing
+        // into whatever the operator halted it for.
+        let _ = rt.save();
+    }
     info!(chain_id, "scanner paused via operator API");
     Ok(Json(json!({ "ok": true, "chain_id": chain_id, "paused": true })))
 }
@@ -217,4 +225,88 @@ async fn rescan_bare(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let cid = only_chain(&s)?;
     rescan_one(State(s), Path(cid), body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    const CHAIN: u64 = 1337;
+
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "validator-api-test-{}-{}-{tag}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn app(path: &std::path::Path) -> Router {
+        let runtime = Runtime::load_or_init(path, 0).unwrap();
+        let mut sources = BTreeMap::new();
+        sources.insert(CHAIN, Arc::new(Mutex::new(runtime)));
+        router(ApiState {
+            sources: Arc::new(sources),
+            validator: "0xtest".into(),
+            token: None, // unauthenticated: this exercises the handlers, not auth
+        })
+    }
+
+    async fn post(app: Router, uri: &str) -> StatusCode {
+        let req = Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// THE regression. `state::Persist` requires a safety stop to survive a
+    /// restart — a crash-loop must not silently clear a halt nobody has
+    /// investigated. `pause` used to mutate the in-memory `Runtime` and return
+    /// without saving, so with compose's `restart: unless-stopped` a validator an
+    /// operator halted mid-incident came back signing.
+    ///
+    /// Asserted through the ROUTER, not through `Runtime`: the pre-existing
+    /// `pause_state_survives_save_and_reload` drives `Runtime` directly, which is
+    /// exactly why it stayed green while the path an operator actually uses was
+    /// broken.
+    #[tokio::test]
+    async fn an_operator_pause_is_persisted() {
+        let path = temp_state_path("pause");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(post(app(&path), &format!("/pause/{CHAIN}")).await, StatusCode::OK);
+
+        let reloaded = Runtime::load_or_init(&path, 0).unwrap();
+        assert!(reloaded.paused(), "an operator pause must survive a restart");
+        assert_eq!(reloaded.pause_reason(), Some(&crate::state::PauseReason::Operator));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other half: a resume must be just as durable, or a restart would
+    /// re-halt a validator the operator had cleared.
+    #[tokio::test]
+    async fn an_operator_resume_is_persisted() {
+        let path = temp_state_path("resume");
+        let _ = std::fs::remove_file(&path);
+
+        let app = app(&path);
+        assert_eq!(post(app.clone(), &format!("/pause/{CHAIN}")).await, StatusCode::OK);
+        assert_eq!(post(app, &format!("/resume/{CHAIN}")).await, StatusCode::OK);
+
+        assert!(!Runtime::load_or_init(&path, 0).unwrap().paused());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_chain_is_not_found() {
+        let path = temp_state_path("unknown");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(post(app(&path), "/pause/9999").await, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_file(&path);
+    }
 }

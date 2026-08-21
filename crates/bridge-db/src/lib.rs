@@ -29,6 +29,16 @@ pub enum DbError {
     Sqlx(#[from] sqlx::Error),
     #[error("bad field: {0}")]
     BadField(&'static str),
+    /// Deleting this row would leave `{0}` empty, and an empty allowlist means
+    /// "allow everything" — so the delete is refused rather than silently
+    /// disabling enforcement. See [`Db::remove_allowed_token`].
+    #[error(
+        "refusing to delete the last {0} entry: an empty allowlist allows EVERYTHING, \
+         so emptying it would silently disable enforcement at both the validator and \
+         the keeper. Add a replacement entry first, or drop the table to opt out \
+         deliberately."
+    )]
+    LastAllowlistEntry(&'static str),
 }
 
 /// Canonical form of a submissionId used as the DB key everywhere: lowercase,
@@ -59,6 +69,7 @@ impl DbError {
         match self {
             DbError::Store(e) => !matches!(e, StoreError::Io(_) | StoreError::Json(_)),
             DbError::BadField(_) => true,
+            DbError::LastAllowlistEntry(_) => true,
             DbError::Sqlx(_) => false,
         }
     }
@@ -316,6 +327,45 @@ fn sig_query(where_clause: &str) -> String {
          SELECT submission_id, kind, signer, signature FROM attestations {where_clause} \
          ORDER BY submission_id, kind, signer"
     )
+}
+
+/// Serialize writers to an allowlist table for the rest of the transaction.
+///
+/// Without it, [`refuse_if_emptied`] is racy in the obvious way: two concurrent
+/// deletes each count the rows against their own snapshot, each sees one left,
+/// each commits, and the list is empty anyway. `SHARE ROW EXCLUSIVE` blocks
+/// other writers while still letting the validator's and keeper's reads through,
+/// and this is an admin-frequency path where that costs nothing.
+///
+/// `table` is a LITERAL at every call site, never caller input — it is
+/// interpolated because a table name cannot be a bind parameter.
+async fn lock_allowlist_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &'static str,
+) -> Result<(), DbError> {
+    sqlx::query(&format!("LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Fail the transaction if the delete that just ran emptied the table.
+///
+/// Checked AFTER the delete rather than before, so a delete that matched nothing
+/// still reports "not found" rather than being refused as if it were the last
+/// row. Returning `Err` drops the transaction uncommitted, which rolls the
+/// delete back.
+async fn refuse_if_emptied(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &'static str,
+) -> Result<(), DbError> {
+    let (remaining,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*)::BIGINT FROM {table}"))
+        .fetch_one(&mut **tx)
+        .await?;
+    if remaining == 0 {
+        return Err(DbError::LastAllowlistEntry(table));
+    }
+    Ok(())
 }
 
 /// A handle to the bridge database (cheap to clone — wraps a connection pool).
@@ -975,13 +1025,27 @@ impl Db {
     }
 
     /// Remove a token from the allowlist. Returns true if a row was deleted.
+    ///
+    /// Refuses to delete the LAST entry. The list's semantics are opt-in —
+    /// `Allowlist::token_allowed` treats an empty list as "no restriction
+    /// configured" — so pruning row by row crosses from deny-by-default to
+    /// allow-everything the moment the final row goes, with no error and no log,
+    /// at both enforcement points at once (the validator and the keeper build
+    /// their view from the same fetch). Turning enforcement off should be a
+    /// decision, not the side effect of one more DELETE.
     pub async fn remove_allowed_token(&self, chain_id: u64, token: &str) -> Result<bool, DbError> {
         let addr = Address::from_str(token.trim()).map_err(|_| DbError::BadField("token"))?;
+        let mut tx = self.pool.begin().await?;
+        lock_allowlist_table(&mut tx, "allowed_tokens").await?;
         let res = sqlx::query("DELETE FROM allowed_tokens WHERE chain_id = $1 AND token_address = $2")
             .bind(chain_id as i64)
             .bind(format!("{addr:#x}"))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        if res.rows_affected() > 0 {
+            refuse_if_emptied(&mut tx, "allowed_tokens").await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1015,13 +1079,21 @@ impl Db {
         Ok(AllowedChain { chain_id_from: from, chain_id_to: to })
     }
 
+    /// Remove a chain pair from the allowlist. Returns true if a row was deleted.
+    /// Refuses the last entry, for the reason [`Db::remove_allowed_token`] gives.
     pub async fn remove_allowed_chain(&self, from: u64, to: u64) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        lock_allowlist_table(&mut tx, "allowed_chains").await?;
         let res =
             sqlx::query("DELETE FROM allowed_chains WHERE chain_id_from = $1 AND chain_id_to = $2")
                 .bind(from as i64)
                 .bind(to as i64)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+        if res.rows_affected() > 0 {
+            refuse_if_emptied(&mut tx, "allowed_chains").await?;
+        }
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 

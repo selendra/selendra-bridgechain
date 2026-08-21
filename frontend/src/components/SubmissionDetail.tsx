@@ -34,7 +34,7 @@ export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
   );
   const decimalsByChain = useChainDecimals(chains);
 
-  // Best-effort: only populated when graphql-api was started with --db-url.
+  // Best-effort: only populated when graphql-api was started with --store-url.
   const { data: historyRows } = usePoll<HistoryEntry[]>(
     () => fetchHistory({ submissionId }).catch(() => []),
     [submissionId],

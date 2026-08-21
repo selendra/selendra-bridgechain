@@ -201,18 +201,20 @@ services:
       - "--chains-file"
       - "/configs/chains.json"
     environment:
-      # READ-ONLY: this service can query the store but cannot write signatures,
-      # mark transfers claimed, or edit the allowlist.
+      # READ-ONLY, and this is now the service's ONLY credential. It used to also
+      # carry DATABASE_URL with the same full-privilege `bridge` role the
+      # sig-store uses, which made every scope above decorative for exactly the
+      # component they were designed to contain: this is the only service
+      # published to the internet, and a direct Postgres connection sits outside
+      # `bridge_core::auth` entirely. `history`/`swapHistory` now come back
+      # through the sig-store's Read-scoped routes instead.
       SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN, e.g. $(openssl rand -hex 32)}"
-      DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random secret}@postgres:5432/bridge"
-      RUST_LOG: "graphql_api=info,bridge_db=info"
+      RUST_LOG: "graphql_api=info"
     volumes:
       - ./docker/configs:/configs:ro
     ports: ["8088:8088"]
     depends_on:
       sig-store:
-        condition: service_healthy
-      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]

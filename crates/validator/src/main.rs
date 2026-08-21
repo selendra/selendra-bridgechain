@@ -246,6 +246,24 @@ async fn scan_source(
                 }
             };
 
+            // The nonce cursor and the block cursor must advance TOGETHER.
+            //
+            // `handle_log` advances the nonce cursor per event, as soon as that
+            // event is durably stored, but `last_block` only advances once the
+            // WHOLE batch is handled — so a mid-batch stop rescans events whose
+            // nonces were already consumed. `check_nonce` reads those as
+            // DUPLICATED and pauses the scanner on an anomaly that never
+            // happened, a persisted stop only an operator can clear. One
+            // transient sig-store error was enough to take a validator out of
+            // quorum until someone noticed.
+            //
+            // So snapshot the nonce cursor here and roll it back below whenever
+            // the block cursor stays put. The rollback also keeps a genuine
+            // anomaly legible: without it, a MISSED_NONCE stop that the operator
+            // resumes comes back as DUPLICATED_NONCE on the replay, hiding the
+            // real reason behind an invented one.
+            let nonces_before = runtime.lock().await.nonce_snapshot();
+
             let mut paused = false;
             let mut batch_failed = false;
             for log in &logs {
@@ -261,10 +279,9 @@ async fn scan_source(
                     Err(e) => {
                         // A sign/store failure must NOT lose the signature: stop the
                         // batch and leave the cursor put, so the range is rescanned
-                        // next tick. `accept_nonce` runs only after a durable store
-                        // (see handle_log), so the failed event's nonce was never
-                        // consumed — re-signing the range is idempotent (the store
-                        // upserts) and the nonce sequence stays intact.
+                        // next tick. Re-signing the range is idempotent (the store
+                        // upserts), and the nonce rollback below puts the sequence
+                        // back where the replay expects to find it.
                         warn!(chain_id = source.chain_id, error = %e, "failed handling log; will retry same range");
                         batch_failed = true;
                         break;
@@ -272,14 +289,17 @@ async fn scan_source(
                 }
             }
 
-            if !paused && !batch_failed {
-                // Advance and persist the cursor only after the whole batch is
-                // durably handled.
-                let mut rt = runtime.lock().await;
+            let mut rt = runtime.lock().await;
+            if paused || batch_failed {
+                // This range will be rescanned, so put the nonce cursor back where
+                // the block cursor still points. See `nonces_before` above.
+                rt.restore_nonces(nonces_before);
+            } else {
+                // Advance the cursor only after the whole batch is durably handled.
                 rt.persist.last_block = to_block;
-                if let Err(e) = rt.save() {
-                    warn!(chain_id = source.chain_id, error = %e, "failed to persist cursor");
-                }
+            }
+            if let Err(e) = rt.save() {
+                warn!(chain_id = source.chain_id, error = %e, "failed to persist scanner state");
             }
         }
 

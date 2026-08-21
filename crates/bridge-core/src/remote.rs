@@ -4,7 +4,10 @@
 //! The validator POSTs its signature; the keeper GETs all records. The server
 //! dedupes by signer, so multiple validators converge on one record per id.
 
-use crate::allow::{AllowedChain, AllowedToken, Allowlist, AttestationRequest, ClaimedRequest};
+use crate::allow::{
+    AllowedChain, AllowedToken, Allowlist, AttestationRequest, ClaimedRequest, SubmissionHistory,
+    SwapRecord,
+};
 use crate::store::{SigKind, SignerSig, SubmissionRecord};
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +130,36 @@ impl RemoteStore {
         let tokens = self.allowed_tokens().await?;
         let chains = self.allowed_chains().await?;
         Ok(Allowlist::from_parts(&tokens, &chains))
+    }
+
+    // --- history (read scope) ---------------------------------------------
+
+    /// The transaction-history view: every observed transfer with its lifecycle
+    /// status, signature counts and timestamps.
+    ///
+    /// Served over HTTP at the `Read` scope rather than read from Postgres, so
+    /// the GraphQL API — the only component exposed to the internet — needs no
+    /// database credential at all. It used to hold the same full-privilege role
+    /// the sig-store does, which made the whole scope split decorative for
+    /// exactly the service it was designed to contain.
+    pub async fn history(&self) -> Result<Vec<SubmissionHistory>, RemoteError> {
+        let url = format!("{}/history", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Same-chain swap history (`SwapPool.Swapped`), newest first, optionally
+    /// scoped to one chain. Companion to [`RemoteStore::history`]; see there for
+    /// why this is an HTTP read rather than a query.
+    pub async fn swaps(
+        &self,
+        chain_id: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<SwapRecord>, RemoteError> {
+        let mut url = format!("{}/swaps?limit={limit}", self.base);
+        if let Some(chain_id) = chain_id {
+            url.push_str(&format!("&chain_id={chain_id}"));
+        }
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
     }
 
     /// Mark a submission claimed after the keeper executes `claim()` on-chain.

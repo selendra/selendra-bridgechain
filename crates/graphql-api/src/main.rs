@@ -13,6 +13,22 @@
 //!
 //! Read-only by default for safety; pass `--allow-mutations` to expose the
 //! `submitSignature` mutation. Bind to localhost unless you front it with auth.
+//!
+//! ## No database credential, on purpose
+//!
+//! This is the only bridge service published to the internet, so it holds
+//! exactly one credential: the sig-store's read-only bearer token. Everything it
+//! serves — submissions, history, swap history, allowlists — comes back through
+//! routes gated on `bridge_core::auth::Scope::Read`.
+//!
+//! It used to take a `--db-url` and connect to the indexer's Postgres with the
+//! same full-privilege role the sig-store uses (and, via `Db::connect`, run the
+//! schema migration). That put the most exposed component outside the scope
+//! model entirely: compromise it and you could write signatures, rewrite the
+//! allowlists, and forge the `refund_status` that the sig-store deliberately
+//! exposes at NO scope, because a false `refunded` permanently hides a stuck
+//! transfer from the recovery relayers. The flag is gone rather than made
+//! optional, so it cannot be reintroduced by a config.
 
 mod chain;
 mod schema;
@@ -70,11 +86,6 @@ struct Args {
     /// Expose the `submitSignature` mutation (off by default — read-only).
     #[arg(long, env = "GRAPHQL_ALLOW_MUTATIONS", default_value_t = false)]
     allow_mutations: bool,
-    /// Postgres connection string (the same DB the `indexer` writes to), e.g.
-    /// postgres://bridge:bridge@localhost:5432/bridge. Enables the `history`/
-    /// `swapHistory` queries; without it they return a clear error.
-    #[arg(long, env = "DATABASE_URL")]
-    db_url: Option<String>,
 }
 
 #[tokio::main]
@@ -129,19 +140,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let swap_ids = swaps.configured();
 
-    let db = match &args.db_url {
-        Some(url) => Some(bridge_db::Db::connect(url).await?),
-        None => None,
-    };
-    let db_configured = db.is_some();
-
     let state = ApiState {
         backend: Arc::new(backend),
         threshold: args.threshold,
         chains,
         registry,
         swaps,
-        db,
     };
 
     // Depth/complexity caps so one request can't fan out to hundreds of store
@@ -175,7 +179,9 @@ async fn main() -> anyhow::Result<()> {
         mutations = args.allow_mutations,
         on_chain_status_for = ?chain_ids,
         swap_pools_for = ?swap_ids,
-        history = db_configured,
+        // History lives behind the sig-store's read scope, so a dir-backed run
+        // has none — say so at startup rather than at the first query.
+        history = args.store_url.is_some(),
         "graphql-api listening (GraphiQL at /)"
     );
     axum::serve(listener, app).await?;

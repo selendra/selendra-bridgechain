@@ -549,7 +549,9 @@ say "starting graphql-api ($GQL_BIND)"
 GQL_ARGS=(--bind "$GQL_BIND" --store-url "$STORE_URL" --threshold "$THRESHOLD"
           --chains-file "$REG_JSON" --allow-mutations)
 for i in "${!CID[@]}"; do GQL_ARGS+=(--gate "${CID[$i]}=${CRPC[$i]},${CGATE[$i]}"); done
-[[ "$ENABLE_INDEXER" == "true" ]] && GQL_ARGS+=(--db-url "$DATABASE_URL")
+# No --db-url: graphql-api reads the indexer's history through the sig-store's
+# Read scope, on the reader token it already holds. It is the only service meant
+# to face the internet, so it gets no database credential of its own.
 # The pool's token list is discovered by replaying its TokenListed logs, so its
 # scan floor must be AT OR BEFORE the pool's deployment — always. That is a
 # different requirement from the scanners' floor, which is "this deployment's

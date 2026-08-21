@@ -12,6 +12,14 @@
 //! tokens pass. The chain list behaves the same way, independently. This keeps
 //! every existing end-to-end script working until an operator deliberately seeds
 //! the lists, then enforcement turns on with no code change.
+//!
+//! The sharp edge is the way back out, which is why `bridge_db` refuses to
+//! delete the LAST row of either list. Pruning row by row would otherwise cross
+//! from deny-by-default to allow-everything the moment the final row went — no
+//! error, no log, and both enforcement points (the validator before it signs,
+//! the keeper before it claims) turned off at once, since they build their view
+//! from the same fetch. Turning enforcement off stays possible; it just has to
+//! be done to the table, not stumbled into one DELETE at a time.
 
 use std::collections::HashSet;
 

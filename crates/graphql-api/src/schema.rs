@@ -12,7 +12,6 @@ use async_graphql::{ComplexObject, Context, Enum, InputObject, Object, SimpleObj
 use bridge_core::allow::{SubmissionHistory, SwapBridgeInfo, SwapRecord};
 use bridge_core::backend::StoreBackend;
 use bridge_core::store::{SignerSig, SubmissionRecord};
-use bridge_db::Db;
 
 use crate::chain::{ChainInfo, Chains};
 use crate::swap::{PoolInfo, PoolToken, Swaps};
@@ -33,11 +32,13 @@ pub struct ApiState {
     /// Optional same-chain `SwapPool` RPCs, so `pools`/`swapQuote` can report
     /// live pool state. Empty => those fields are null.
     pub swaps: Swaps,
-    /// Optional Postgres connection (the same DB the `indexer` writes to), for
-    /// the `history`/`swapHistory` queries. `None` when started without
-    /// `--db-url` — those queries then return a clear error instead of silently
-    /// reporting empty data.
-    pub db: Option<Db>,
+    // NOTE: there is deliberately no database handle here. `history` and
+    // `swapHistory` read the indexer's data through the sig-store's `Read`
+    // scope, on the same read-only bearer token this service already carries.
+    // A Postgres credential in THIS process — the only one published to the
+    // internet — would sit outside `bridge_core::auth` entirely and could write
+    // signatures, rewrite the allowlists, and forge the `refund_status` the
+    // sig-store refuses to expose at any scope.
 }
 
 /// A network the bridge UI can target. Mirrors [`ChainInfo`] for the wire.
@@ -310,13 +311,7 @@ fn state<'c>(ctx: &Context<'c>) -> &'c ApiState {
     ctx.data_unchecked::<ApiState>()
 }
 
-/// Look up the configured DB, or a clear error telling the operator how to fix it.
-fn require_db<'c>(ctx: &Context<'c>) -> async_graphql::Result<&'c Db> {
-    state(ctx)
-        .db
-        .as_ref()
-        .ok_or_else(|| async_graphql::Error::new("transaction history not configured — start graphql-api with --db-url"))
-}
+
 
 /// The swap intent (and destination outcome, once known) of a
 /// `SwapRouter.swapAndBridge` transfer — a plain bridge send has none.
@@ -600,18 +595,22 @@ impl Query {
         })
     }
 
-    /// Database-backed transaction history: every bridge transfer the `indexer`
-    /// has observed on-chain, including ones stuck at zero signatures (which
-    /// `submissions` can never show, since that view only exists once a
-    /// validator has signed). Requires `--db-url`. Newest first.
+    /// Transaction history: every bridge transfer the `indexer` has observed
+    /// on-chain, including ones stuck at zero signatures (which `submissions` can
+    /// never show, since that view only exists once a validator has signed).
+    /// Newest first.
+    ///
+    /// Read through the sig-store's `/history` route on this service's read-only
+    /// bearer token — deliberately NOT straight from Postgres. This process is
+    /// the one exposed to the internet, and a database credential here would
+    /// bypass every scope in `bridge_core::auth`. Needs `--store-url`.
     async fn history(
         &self,
         ctx: &Context<'_>,
         filter: Option<HistoryFilter>,
     ) -> async_graphql::Result<Vec<HistoryEntry>> {
-        let db = require_db(ctx)?;
         let f = filter.unwrap_or_default();
-        let rows = db.history().await?;
+        let rows = state(ctx).backend.history().await?;
         Ok(rows
             .into_iter()
             .filter(|r| f.chain_id_from.is_none_or(|c| r.chain_id_from == c))
@@ -623,15 +622,15 @@ impl Query {
     }
 
     /// Same-chain swap history (`SwapPool.Swapped`), mirrored by the `indexer`.
-    /// Requires `--db-url`. Newest first, optionally scoped to one chain.
+    /// Newest first, optionally scoped to one chain. Served over the sig-store's
+    /// read scope for the reason `history` documents. Needs `--store-url`.
     async fn swap_history(
         &self,
         ctx: &Context<'_>,
         chain_id: Option<u64>,
         limit: Option<u64>,
     ) -> async_graphql::Result<Vec<SwapHistoryEntry>> {
-        let db = require_db(ctx)?;
-        let rows = db.list_swaps(chain_id, limit.unwrap_or(100).min(1000) as i64).await?;
+        let rows = state(ctx).backend.swaps(chain_id, limit.unwrap_or(100)).await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 }

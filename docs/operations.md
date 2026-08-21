@@ -18,15 +18,13 @@ Eight crates, five of them binaries.
 | `validator` | source RPC, a signing key, the store | No transfer is ever attested. One per independent operator. |
 | `keeper` | target RPC, a funded key, the store | Nothing is ever submitted on-chain. Anyone can run one; it is permissionless. |
 | `indexer` | Postgres, RPC per chain | History, stuck detection, and **the entire refund lifecycle**. It is the only writer of `refund_status`. |
-| `graphql-api` | the store, optionally Postgres | The frontend has no backend. |
+| `graphql-api` | the store (read scope only) | The frontend has no backend. Holds no database credential: history comes back through the sig-store. |
 
 The dependency that catches people out is the refund one.
 A refund needs the indexer running, because the keeper's refund loop only ever sees candidates the store has already nominated, and the sweep that nominates them (`bridge_db::Db::sweep_refund_eligible`) is called from the indexer and nowhere else.
 
-> **Known gap.** `Dockerfile` builds only `validator`, `keeper`, and `sig-store`, and `docker-compose.yml` deploys only those.
-> In the stack this repository currently ships, refunds never advance and the frontend has no backend.
-> Tracked as H2 in `report.md`.
-> Until that is fixed, run `indexer` and `graphql-api` yourself against the compose Postgres.
+`Dockerfile` builds all five binaries and `docker-compose.yml` deploys all of them, so the shipped stack advances refunds and serves the frontend on its own.
+Note that `graphql-api` is the one service with no `DATABASE_URL`: it reads the indexer's history over the sig-store's read scope, not from Postgres, so do not hand it a database URL when running it by hand either.
 
 ---
 
@@ -209,7 +207,7 @@ Other secrets in the system:
 | --- | --- | --- |
 | sig-store bearer token | `SIG_STORE_TOKEN` | Unset means the API is unauthenticated, and the process warns about it. Compose defaults to `dev-local-bridge-token`. |
 | validator operator API token | `[api] token` or `VALIDATOR_API_TOKEN` | Unset means `/pause`, `/resume`, and `/rescan` are unauthenticated. |
-| Postgres URL | `DATABASE_URL` or config | |
+| Postgres URL | `DATABASE_URL` or config | `sig-store` and `indexer` only. `graphql-api` deliberately has none — it is the internet-facing service, and a direct connection would sit outside the scope model in `bridge_core::auth`. |
 
 `docker/configs/*.toml` carry inline private keys.
 They are anvil's well-known development keys, so nothing there is at risk today, and `.dockerignore` excludes them from the Docker build context.

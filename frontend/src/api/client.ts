@@ -102,7 +102,7 @@ export function fetchSubmission(submissionId: string): Promise<Submission | null
   ).then((d) => d.submission);
 }
 
-// --- transaction history (database-backed, requires graphql-api --db-url) -
+// --- transaction history (served via the sig-store's read scope) ---------
 
 export function fetchHistory(filter?: HistoryFilter): Promise<HistoryEntry[]> {
   return gql<{ history: HistoryEntry[] }>(

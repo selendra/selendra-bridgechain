@@ -2651,7 +2651,6 @@ dependencies = [
  "async-graphql-axum",
  "axum 0.7.9",
  "bridge-core",
- "bridge-db",
  "clap",
  "serde",
  "serde_json",
@@ -5995,6 +5994,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

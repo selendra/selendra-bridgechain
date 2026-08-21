@@ -111,6 +111,9 @@ contract SwapPool is ReentrancyGuard {
     /// @dev computed output was below the caller's minimum (slippage / stale price).
     error Slippage(uint256 got, uint256 min);
     error StableRepriceForbidden();
+    /// @dev delisting the stable would let it be re-listed at any price, which is
+    ///      `StableRepriceForbidden` with extra steps. See {delistToken}.
+    error StableDelistForbidden();
     error PriceDeviationTooHigh(uint256 oldPrice, uint256 newPrice, uint16 maxBps);
     /// @dev setPrice() called again before the per-token cooldown elapsed.
     error PriceUpdateTooSoon(address token, uint256 nextAllowed);
@@ -233,14 +236,40 @@ contract SwapPool is ReentrancyGuard {
 
     /// @notice List a token for swapping at an initial USD price (PRICE_ONE-scaled).
     /// @dev    Decimals are cached from IERC20Metadata. The stable is listed in the
-    ///         constructor and cannot be re-listed.
+    ///         constructor and can never be delisted, so it never reaches here.
+    ///
+    ///         RE-LISTING IS A REPRICE, and is bounded like one. `delistToken`
+    ///         keeps the token's last price precisely so this can check against
+    ///         it: without that, delist -> relist was an unbounded, instant
+    ///         repricing path straight around `setPrice`'s deviation cap AND its
+    ///         cooldown. The owner can already move liquidity, so this is not a
+    ///         new theft primitive — but the rate limit is documented as a
+    ///         security property, and a limit with a one-transaction bypass is
+    ///         not one. The cooldown itself stays cleared on delist (finding
+    ///         L-2): the FIRST `setPrice` after a listing is still free, it just
+    ///         starts from a price the cap had a say in.
     function listToken(address token, uint256 price) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
-        if (tokens[token].listed) revert TokenAlreadyListed(token);
+        TokenInfo storage t = tokens[token];
+        if (t.listed) revert TokenAlreadyListed(token);
         if (price == 0) revert ZeroPrice();
 
+        uint256 previous = t.price; // nonzero only for a token listed before
+        if (previous != 0) {
+            uint256 diff = price > previous ? price - previous : previous - price;
+            if (diff > Math.mulDiv(previous, maxPriceDeviationBps, BPS_DENOM)) {
+                revert PriceDeviationTooHigh(previous, price, maxPriceDeviationBps);
+            }
+        }
+
         uint8 dec = IERC20Metadata(token).decimals();
-        tokens[token] = TokenInfo({listed: true, decimals: dec, price: price, reserve: 0});
+        t.listed = true;
+        t.decimals = dec;
+        t.price = price;
+        // `reserve` is left alone rather than zeroed: `delistToken` already
+        // requires it to be zero and a never-listed token has none, so there is
+        // nothing to reset — and writing a zero here would be the one place a
+        // real balance could be erased if that invariant ever slipped.
         emit TokenListed(token, price, dec);
     }
 
@@ -275,11 +304,22 @@ contract SwapPool is ReentrancyGuard {
 
     /// @notice Delist a token. Only when its reserve is fully withdrawn, so we
     ///         never strand locked liquidity behind an unlisted entry.
+    /// @dev    THE STABLE CAN NEVER BE DELISTED. Its price is the pool's unit of
+    ///         account, fixed at PRICE_ONE, and `setPrice` refuses to move it.
+    ///         Delisting was the way around that: delist (its reserve can be
+    ///         drained to zero by the owner) and re-list at any price at all,
+    ///         never touching `setPrice`. The "immutable" peg is what the
+    ///         cross-chain SwapRouter's accounting rests on, so the escape hatch
+    ///         is closed here rather than in `listToken`.
     function delistToken(address token) external onlyOwner {
+        if (token == stable) revert StableDelistForbidden();
         TokenInfo storage t = tokens[token];
         if (!t.listed) revert TokenNotListed(token);
         if (t.reserve != 0) revert ReserveNonZero();
-        delete tokens[token];
+        // Flip the listing off but KEEP `price`: it is what bounds a future
+        // re-listing (see listToken). `decimals` and `reserve` are both rewritten
+        // or provably zero on the way back in.
+        t.listed = false;
         // Clear the repricing clock with the listing it belonged to. `setPrice`
         // exempts the FIRST update after listing via `last == 0`; leaving a stale
         // timestamp here would carry into a future re-listing and block that
