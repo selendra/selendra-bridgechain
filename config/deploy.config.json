@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "name": "local-anvil",
+  "profile": "local",
+  "deployer": {
+    "private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+    "private_key_env": null,
+    "keystore": null,
+    "keystore_password_file": null
+  },
+  "gate": {
+    "bridge_domain": "auto",
+    "validators": [
+      "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+      "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+    ],
+    "threshold": 2,
+    "guardian": null,
+    "owner": null
+  },
+  "chains": [
+    {
+      "chain_id": 1337,
+      "name": "Anvil A",
+      "rpc_url": "http://127.0.0.1:8545",
+      "deploy_gate": true,
+      "gate": null
+    },
+    {
+      "chain_id": 1338,
+      "name": "Anvil B",
+      "rpc_url": "http://127.0.0.1:8546",
+      "deploy_gate": true,
+      "gate": null
+    }
+  ],
+  "assets": [
+    {
+      "symbol": "TST",
+      "name": "Test Token",
+      "decimals": 18,
+      "register_corridors": true,
+      "test_liquidity": {
+        "enabled": true,
+        "mint_to_deployer": "1000000",
+        "mint_to_gate": "1000000"
+      },
+      "deployments": [
+        {
+          "chain_id": 1337,
+          "address": "auto"
+        },
+        {
+          "chain_id": 1338,
+          "address": "auto"
+        }
+      ]
+    }
+  ],
+  "swap": {
+    "enabled": true,
+    "chain_id": 1337,
+    "deploy": true,
+    "pool": null
+  },
+  "solana": {
+    "enabled": false,
+    "chain_id": 7565164,
+    "cluster": "localnet",
+    "rpc": "http://127.0.0.1:8899",
+    "payer_keypair": ".solana/payer.json",
+    "gate_admin_bin": "crates/solana-relayer/target/debug/gate-admin",
+    "build": false,
+    "program": {
+      "deploy": true,
+      "program_id": null,
+      "so_path": "crates/solana-gate/target/deploy/solana_gate.so",
+      "use_rpc": true
+    },
+    "init": {
+      "run": true,
+      "guardian": null,
+      "max_validators": 8,
+      "max_corridors": 8
+    },
+    "register_corridors": true,
+    "assets": [
+      {
+        "symbol": "TST",
+        "mint": null,
+        "vault": null,
+        "from_chains": "all",
+        "debridge_id": null
+      }
+    ]
+  },
+  "output": {
+    "file": "config/deployments/local-anvil.json",
+    "update_bridge_config": "config/bridge.config.json"
+  }
+}

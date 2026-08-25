@@ -30,6 +30,25 @@ The MetaMask network + import details are printed at the end.
 > `scripts/testing/` holds the phase/e2e demos (`e2e.sh`, `phase7.sh`,
 > `refund-relayer-e2e.sh`, …); `scripts/run.sh` is the everyday launcher.
 
+### JSON configs (deploy and run, separately)
+
+The same stack, driven by JSON instead of one bash config, with deployment split
+from operation — so you can redeploy without restarting, or restart without
+redeploying:
+
+```bash
+bash scripts/deploy-from-json.sh config/deploy.config.json   # gates, tokens, corridors
+bash scripts/bridge-from-json.sh config/bridge.config.json   # validators, keeper, indexer, API
+```
+
+The deploy step writes every address it produced into `config/deployments/` and
+patches them into the runtime config, so no addresses are copied by hand. A
+`production` profile enforces the real safety parameters (≥ 3 validators, a
+strict-majority threshold, a guardian, ownership to a multisig). The Solana leg
+is covered too — its own `solana` block in each file deploys/initializes the gate
+program and runs the relayers, sharing the EVM validator set and `bridge_domain`.
+Field reference: [`config/README.md`](config/README.md).
+
 ```
 .
 ├── contracts/                # Foundry: Gate, BridgeHash, SwapPool, SwapRouter + tests

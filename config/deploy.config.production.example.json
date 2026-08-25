@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "name": "selendra-mainnet-gen1",
+  "profile": "production",
+  "deployer": {
+    "private_key": null,
+    "private_key_env": null,
+    "keystore": "/etc/bridge/keys/deployer.json",
+    "keystore_password_file": "/etc/bridge/keys/deployer.pass"
+  },
+  "gate": {
+    "bridge_domain": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "validators": [
+      "0x1111111111111111111111111111111111111111",
+      "0x2222222222222222222222222222222222222222",
+      "0x3333333333333333333333333333333333333333",
+      "0x4444444444444444444444444444444444444444",
+      "0x5555555555555555555555555555555555555555"
+    ],
+    "threshold": 3,
+    "guardian": "0x6666666666666666666666666666666666666666",
+    "owner": "0x7777777777777777777777777777777777777777"
+  },
+  "chains": [
+    {
+      "chain_id": 1961,
+      "name": "Selendra",
+      "rpc_url": "https://rpc.selendra.org",
+      "deploy_gate": true,
+      "gate": null
+    },
+    {
+      "chain_id": 56,
+      "name": "BNB Chain",
+      "rpc_url": "https://bsc-dataseed.binance.org",
+      "deploy_gate": true,
+      "gate": null
+    }
+  ],
+  "assets": [
+    {
+      "symbol": "USDT",
+      "name": "Tether USD",
+      "decimals": 6,
+      "register_corridors": true,
+      "test_liquidity": {
+        "enabled": false,
+        "mint_to_deployer": "0",
+        "mint_to_gate": "0"
+      },
+      "deployments": [
+        {
+          "chain_id": 1961,
+          "address": "0x0000000000000000000000000000000000000000"
+        },
+        {
+          "chain_id": 56,
+          "address": "0x55d398326f99059fF775485246999027B3197955"
+        }
+      ]
+    }
+  ],
+  "swap": {
+    "enabled": false,
+    "chain_id": null,
+    "deploy": false,
+    "pool": null
+  },
+  "solana": {
+    "enabled": false,
+    "chain_id": 7565164,
+    "cluster": "mainnet-beta",
+    "rpc": "https://api.mainnet-beta.solana.com",
+    "payer_keypair": ".solana/payer.json",
+    "gate_admin_bin": "crates/solana-relayer/target/debug/gate-admin",
+    "build": false,
+    "program": {
+      "deploy": false,
+      "program_id": "HvGQTWChe6bMpSYGNavDhGcG8YrJkubJQCDmBrxNR133",
+      "so_path": "crates/solana-gate/target/deploy/solana_gate.so",
+      "use_rpc": true
+    },
+    "init": {
+      "run": true,
+      "guardian": "11111111111111111111111111111111",
+      "max_validators": 8,
+      "max_corridors": 8
+    },
+    "register_corridors": true,
+    "assets": [
+      {
+        "symbol": "USDT",
+        "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        "vault": null,
+        "from_chains": "all",
+        "debridge_id": null
+      }
+    ]
+  },
+  "output": {
+    "file": "config/deployments/selendra-mainnet-gen1.json",
+    "update_bridge_config": null
+  }
+}

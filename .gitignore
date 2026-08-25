@@ -81,3 +81,8 @@ heap_info.json
 # (scripts/testing/solana-onchain.sh mounts the repo into the container).
 .docker-cargo/
 .docker-rustup/
+
+# JSON configs holding real keys / API endpoints (mirrors scripts/*.config.local)
+config/*.local.json
+# Deploy records: generated, and they carry the RPC URLs (API keys) they used.
+config/deployments/*.json

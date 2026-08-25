@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "name": "local-mesh",
+  "threshold": 2,
+  "runtime": {
+    "run_dir": "/tmp/bridge-json-run",
+    "bin_dir": "target/debug",
+    "build": true,
+    "log_level": "info"
+  },
+  "database": {
+    "url": "postgres://bridge:bridge@127.0.0.1:5433/bridge?sslmode=disable",
+    "docker": {
+      "enabled": true,
+      "container": "bridge-json-pg",
+      "image": "postgres:16-alpine",
+      "port": 5433,
+      "volume": "bridge-json-pg-data",
+      "user": "bridge",
+      "password": "bridge",
+      "db": "bridge"
+    }
+  },
+  "sig_store": {
+    "enabled": true,
+    "bind": "127.0.0.1:8080",
+    "url": "http://127.0.0.1:8080",
+    "tokens": {
+      "generate_if_unset": true,
+      "validator": null,
+      "keeper": null,
+      "reader": null,
+      "admin": null
+    }
+  },
+  "defaults": {
+    "poll_interval_ms": 500,
+    "max_block_range": 1000,
+    "start_block": 0,
+    "block_confirmation": 0,
+    "allow_zero_confirmation": true
+  },
+  "chains": [
+    {
+      "chain_id": 1337,
+      "name": "Anvil A",
+      "rpcs": [
+        "http://127.0.0.1:8545"
+      ],
+      "gate": "0x0000000000000000000000000000000000000000",
+      "source": true,
+      "destination": true,
+      "start_block": 0,
+      "block_confirmation": 0,
+      "allow_zero_confirmation": true,
+      "poll_interval_ms": 500,
+      "max_block_range": 1000,
+      "pool": null,
+      "router": null,
+      "tokens": [
+        {
+          "symbol": "TST",
+          "address": "0x0000000000000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "chain_id": 1338,
+      "name": "Anvil B",
+      "rpcs": [
+        "http://127.0.0.1:8546"
+      ],
+      "gate": "0x0000000000000000000000000000000000000000",
+      "source": true,
+      "destination": true,
+      "start_block": 0,
+      "block_confirmation": 0,
+      "allow_zero_confirmation": true,
+      "poll_interval_ms": 500,
+      "max_block_range": 1000,
+      "pool": null,
+      "router": null,
+      "tokens": [
+        {
+          "symbol": "TST",
+          "address": "0x0000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ],
+  "validators": [
+    {
+      "name": "val-1",
+      "enabled": true,
+      "signer": {
+        "private_key": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+      },
+      "sources": "all",
+      "api": {
+        "enabled": false,
+        "bind": "127.0.0.1:9101",
+        "token_env": "VAL1_API_TOKEN"
+      }
+    },
+    {
+      "name": "val-2",
+      "enabled": true,
+      "signer": {
+        "private_key": "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+      },
+      "sources": "all",
+      "api": {
+        "enabled": false,
+        "bind": "127.0.0.1:9102",
+        "token_env": "VAL2_API_TOKEN"
+      }
+    }
+  ],
+  "refund": {
+    "enabled": true,
+    "timeout_secs": 60,
+    "poll_interval_ms": 2000,
+    "block_confirmation": 0,
+    "allow_zero_confirmation": true,
+    "destinations": "all"
+  },
+  "keepers": [
+    {
+      "name": "keeper-1",
+      "enabled": true,
+      "signer": {
+        "private_key": "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a"
+      },
+      "targets": "all",
+      "refund_sources": "all",
+      "poll_interval_ms": 500
+    }
+  ],
+  "solana": {
+    "enabled": false,
+    "name": "Solana",
+    "chain_id": 7565164,
+    "rpc": "http://127.0.0.1:8899",
+    "program_id": null,
+    "commitment": "finalized",
+    "allow_unfinalized": false,
+    "poll_interval_ms": 2000,
+    "max_batch": 100,
+    "bin": "crates/solana-relayer/target/debug/solana-relayer",
+    "build": false,
+    "include_in_registry": false,
+    "relayers": [
+      {
+        "name": "sol-1",
+        "enabled": true,
+        "signer": {
+          "private_key": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+          "private_key_env": null
+        },
+        "deliver": true,
+        "payer_keypair": ".solana/payer.json",
+        "poll_interval_ms": 2000
+      },
+      {
+        "name": "sol-2",
+        "enabled": true,
+        "signer": {
+          "private_key": "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+          "private_key_env": null
+        },
+        "deliver": false,
+        "payer_keypair": null,
+        "poll_interval_ms": 2000
+      }
+    ],
+    "tokens": [
+      {
+        "symbol": "TST",
+        "mint": null
+      }
+    ]
+  },
+  "indexer": {
+    "enabled": true,
+    "chains": "all",
+    "refund_timeout_secs": 60,
+    "sweep_interval_secs": 5
+  },
+  "graphql": {
+    "enabled": true,
+    "bind": "127.0.0.1:8088",
+    "allow_mutations": true,
+    "swap": {
+      "enabled": false,
+      "chain_id": 1337,
+      "pool": null,
+      "from_block": 0
+    }
+  },
+  "frontend": {
+    "enabled": true,
+    "dir": "frontend",
+    "node_bin": null,
+    "host": "127.0.0.1",
+    "port": 5173,
+    "install": true
+  }
+}
