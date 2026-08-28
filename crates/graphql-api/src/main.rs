@@ -31,6 +31,7 @@
 //! optional, so it cannot be reintroduced by a config.
 
 mod chain;
+mod solana_pool;
 mod schema;
 mod swap;
 
@@ -137,6 +138,16 @@ async fn main() -> anyhow::Result<()> {
     }
     for spec in &args.swaps {
         swaps.add_spec(spec)?;
+    }
+    // An SPL mint has no on-chain symbol (it lives in Metaplex metadata), so a
+    // Solana pool takes its token names from the same registry the UI reads.
+    // Without this the Swap view would list raw base58 addresses.
+    for c in &registry {
+        let symbols: std::collections::BTreeMap<String, String> =
+            c.tokens.iter().map(|t| (t.address.clone(), t.symbol.clone())).collect();
+        if !symbols.is_empty() {
+            swaps.set_symbols(c.chain_id, symbols);
+        }
     }
     let swap_ids = swaps.configured();
 

@@ -3,11 +3,24 @@ import { Dropdown, type DropdownOption } from "./Dropdown";
 import { TxBanner, type TxState } from "./TxBanner";
 import { ArrowDown, Glyph, Help, Refresh } from "./icons";
 import { chainViz, formatUnits, formatUnitsRaw, parseUnits, shortHex, tokenGradient } from "../data/format";
-import { fetchSwapPool, fetchSwapQuote } from "../api/client";
+import {
+  fetchSolanaBlockhash,
+  fetchSolanaSignatureStatus,
+  fetchSolanaTokenBalance,
+  fetchSwapPool,
+  fetchSwapQuote,
+} from "../api/client";
 import { usePoll, useDebounced } from "../api/hooks";
 import { errMsg, readAllowance, readBalance, sendApprove, sendSwap, waitReceipt } from "../wallet/eth";
 import type { Chain, PoolToken, SwapPoolInfo } from "../api/types";
 import type { WalletState } from "../wallet/useWallet";
+import type { SolanaWalletState } from "../wallet/useSolanaWallet";
+import {
+  associatedTokenAddress,
+  buildSwapInstruction,
+  createAtaInstruction,
+  serializeMessage,
+} from "../wallet/solana";
 
 const eq = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
@@ -16,9 +29,15 @@ const SLIPPAGE_OPTS = [10, 50, 100]; // bps: 0.1%, 0.5%, 1%
 interface Props {
   chains: Chain[];
   wallet: WalletState;
+  /** The Solana wallet, used when the selected pool lives on Solana. */
+  solana: SolanaWalletState;
 }
 
-export function SwapView({ chains, wallet }: Props) {
+/** A pool address that is not `0x…` is a Solana program id — the same rule the
+ *  API uses to tell the two VMs apart, so the UI needs no extra flag. */
+const isSolanaPool = (address: string | undefined) => !!address && !address.startsWith("0x");
+
+export function SwapView({ chains, wallet, solana }: Props) {
   // Which chain's pool we're swapping on. Prefer the connected wallet chain.
   const [chainId, setChainId] = useState<number | null>(null);
   useEffect(() => {
@@ -84,12 +103,35 @@ export function SwapView({ chains, wallet }: Props) {
   const reserveOut = tout ? BigInt(tout.reserve) : 0n;
   const exceedsLock = quoteBase > reserveOut;
 
+  const solanaMode = isSolanaPool(pool?.address);
+  const account = solanaMode ? solana.address : wallet.address;
+
   // --- on-chain balance + allowance (only when on the pool's chain) ------
-  const onRightChain = wallet.chainId === chainId;
+  // A Solana pool has no chain to switch to: the wallet is bound to its cluster,
+  // so "right chain" is simply "connected".
+  const onRightChain = solanaMode ? solana.address != null : wallet.chainId === chainId;
   const [balance, setBalance] = useState<bigint | null>(null);
   const [allowance, setAllowance] = useState<bigint | null>(null);
 
   const refreshOnchain = useCallback(async () => {
+    if (solanaMode) {
+      // SPL: the balance lives in the owner's associated token account, which
+      // the browser derives; there is no allowance — the signer authorises the
+      // transfer directly.
+      setAllowance(null);
+      if (!solana.address || !tin || chainId == null) {
+        setBalance(null);
+        return;
+      }
+      try {
+        const ata = await associatedTokenAddress(solana.address, tin.token);
+        const raw = await fetchSolanaTokenBalance(chainId, ata);
+        setBalance(raw != null ? BigInt(raw) : null);
+      } catch {
+        setBalance(null);
+      }
+      return;
+    }
     if (!wallet.address || !onRightChain || !tin || !pool) {
       setBalance(null);
       setAllowance(null);
@@ -112,7 +154,8 @@ export function SwapView({ chains, wallet }: Props) {
     refreshOnchain();
   }, [refreshOnchain]);
 
-  const needsApprove = allowance != null && amountBase > 0n && allowance < amountBase;
+  // No approve step on Solana: an SPL transfer is authorised by the signer.
+  const needsApprove = !solanaMode && allowance != null && amountBase > 0n && allowance < amountBase;
   const insufficient = balance != null && amountBase > balance;
   const busy = tx.kind === "pending";
 
@@ -158,6 +201,72 @@ export function SwapView({ chains, wallet }: Props) {
     }
   };
 
+  /**
+   * The Solana swap. Every account that decides where the output lands — the
+   * user's associated token accounts and the pool's PDAs — is derived HERE, in
+   * the browser (`wallet/solana.ts`). The API contributes only a blockhash and
+   * the pool's vaults, neither of which can misdirect funds: a wrong vault is
+   * refused by the program, which pins it in its own token record.
+   */
+  const doSwapSolana = async () => {
+    if (!pool || !tin || !tout || !solana.address || chainId == null) return;
+    if (!tin.vault || !tout.vault) {
+      setTx({ kind: "error", message: "Pool vaults unavailable — try again in a moment" });
+      return;
+    }
+    setTx({ kind: "pending", label: "Building transaction…" });
+    try {
+      const [userIn, userOut, blockhash] = await Promise.all([
+        associatedTokenAddress(solana.address, tin.token),
+        associatedTokenAddress(solana.address, tout.token),
+        fetchSolanaBlockhash(chainId),
+      ]);
+      if (!blockhash) throw new Error("No recent blockhash from the API");
+
+      const swapIx = await buildSwapInstruction({
+        programId: pool.address,
+        user: solana.address,
+        mintIn: tin.token,
+        mintOut: tout.token,
+        vaultIn: tin.vault,
+        vaultOut: tout.vault,
+        userIn,
+        userOut,
+        amountIn: amountBase,
+        minAmountOut: minOut,
+      });
+      // Create the destination account first, idempotently: a user who has
+      // never held the output mint has no account for it, and an SPL transfer
+      // into a missing account fails rather than creating one.
+      const message = serializeMessage(solana.address, blockhash, [
+        createAtaInstruction(solana.address, userOut, solana.address, tout.token),
+        swapIx,
+      ]);
+
+      setTx({ kind: "pending", label: "Confirm in your wallet…" });
+      const signature = await solana.signAndSend(message);
+      setTx({ kind: "pending", label: "Confirming swap…", hash: signature });
+
+      // Poll the cluster through the API until it settles either way.
+      let status = "pending";
+      for (let i = 0; i < 40 && status !== "confirmed" && status !== "finalized"; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        status = (await fetchSolanaSignatureStatus(chainId, signature)) ?? "pending";
+        if (status === "failed") throw new Error("Swap failed on-chain");
+      }
+      setTx({
+        kind: "done",
+        label: `Swapped for ${formatUnits(quoteBase, tout.decimals)} ${tout.symbol}`,
+        hash: signature,
+      });
+      setAmount("");
+      setQuote(null);
+      await Promise.all([refreshOnchain(), poolQ.refetch()]);
+    } catch (e) {
+      setTx({ kind: "error", message: errMsg(e) });
+    }
+  };
+
   const flip = () => {
     setTokenIn(tokenOut);
     setTokenOut(tokenIn);
@@ -169,8 +278,13 @@ export function SwapView({ chains, wallet }: Props) {
   // --- primary button state ---------------------------------------------
   const chainName = chains.find((c) => c.chainId === chainId)?.name ?? `chain ${chainId}`;
   let button: { label: string; onClick?: () => void; disabled?: boolean };
-  if (!wallet.address) button = { label: "Connect Wallet", onClick: () => wallet.connect() };
-  else if (chainId != null && !onRightChain)
+  if (solanaMode && !solana.available)
+    button = { label: "Install Phantom", disabled: true };
+  else if (!account)
+    button = solanaMode
+      ? { label: "Connect Phantom", onClick: () => solana.connect() }
+      : { label: "Connect Wallet", onClick: () => wallet.connect() };
+  else if (!solanaMode && chainId != null && !onRightChain)
     button = { label: `Switch to ${chainName}`, onClick: () => wallet.switchChain(chainId) };
   else if (!pool) button = { label: "No pool on this chain", disabled: true };
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
@@ -179,7 +293,7 @@ export function SwapView({ chains, wallet }: Props) {
   else if (!quote || quoteBase <= 0n) button = { label: "No quote available", disabled: true };
   else if (exceedsLock) button = { label: "Exceeds pool lock", disabled: true };
   else if (needsApprove) button = { label: `Approve ${tin?.symbol ?? "token"}`, onClick: doApprove };
-  else button = { label: "Swap", onClick: doSwap };
+  else button = { label: "Swap", onClick: solanaMode ? doSwapSolana : doSwap };
   if (busy) button = { label: tx.label, disabled: true };
 
   const outStr = tout && quoteBase > 0n ? formatUnits(quoteBase, tout.decimals) : "0";

@@ -167,7 +167,9 @@ test("the same-chain swaps tab renders live swap history", async ({ page }) => {
   if (rows.length === 0) {
     await expect(page.locator(".tbl__empty")).toContainText("No same-chain swaps recorded yet");
   } else {
-    await expect(page.locator(".tbl tbody")).toContainText("Ethereum Sepolia", { timeout: 25_000 });
+    // Which chain the rows came from depends on where swaps happened, so assert
+    // that rows render at all rather than naming one chain.
+    await expect(page.locator(".tbl tbody tr").first()).toBeVisible({ timeout: 25_000 });
   }
 });
 
@@ -183,12 +185,14 @@ test("chain ids reach the backend as bare integers", async () => {
   }).then((r) => r.json());
   expect(ok.data.swapPool).not.toBeNull();
 
-  const hoodi = await fetch(`${API}/graphql`, {
+  // An UNCONFIGURED chain id must come back as a clean null rather than an
+  // error — the point being that the literal is parsed as a number, not that any
+  // particular chain lacks a pool (every chain in the mesh has one now).
+  const unknown = await fetch(`${API}/graphql`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ query: `{ swapPool(chainId: ${HOODI}) { address } }` }),
+    body: JSON.stringify({ query: `{ swapPool(chainId: 424242) { address } }` }),
   }).then((r) => r.json());
-  // No pool deployed on Hoodi — must be a clean null, not an error.
-  expect(hoodi.data.swapPool).toBeNull();
-  expect(hoodi.errors).toBeUndefined();
+  expect(unknown.data.swapPool).toBeNull();
+  expect(unknown.errors).toBeUndefined();
 });

@@ -6,14 +6,18 @@ import { Explorer } from "./components/Explorer";
 import { fetchChains, health } from "./api/client";
 import { usePoll } from "./api/hooks";
 import { useWallet } from "./wallet/useWallet";
+import { useSolanaWallet } from "./wallet/useSolanaWallet";
 import type { Chain, SubmissionFilter } from "./api/types";
 
 export default function App() {
   const [view, setView] = useState<View>("swap");
   const [explorerFilter, setExplorerFilter] = useState<SubmissionFilter | undefined>();
 
-  // One wallet connection, shared by the navbar chip and both views.
+  // One wallet connection each, shared by the navbar chip and both views. The
+  // Solana one is only reached when the selected pool lives on Solana, so a user
+  // who never touches that chain is never asked to install anything.
   const wallet = useWallet();
+  const solana = useSolanaWallet();
 
   // Shared backend state: reachability + the chain registry.
   const online = usePoll<boolean>(() => health(), [], 5000);
@@ -33,8 +37,8 @@ export default function App() {
       <div className="app__panel">
         <Navbar view={view} onNavigate={setView} connected={connected} wallet={wallet} />
         <main className={`app__main${wide ? " app__main--wide" : ""}`}>
-          {view === "bridge" && <BridgeView chains={chains} wallet={wallet} onReview={goExplorer} />}
-          {view === "swap" && <SwapView chains={chains} wallet={wallet} />}
+          {view === "bridge" && <BridgeView chains={chains} wallet={wallet} solana={solana} onReview={goExplorer} />}
+          {view === "swap" && <SwapView chains={chains} wallet={wallet} solana={solana} />}
           {view === "explorer" && <Explorer chains={chains} initialFilter={explorerFilter} />}
         </main>
       </div>

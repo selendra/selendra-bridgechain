@@ -96,6 +96,9 @@ pub(crate) fn provider_for(addr: &str, rpc: &str, ctx: &str) -> anyhow::Result<(
 #[derive(Clone, Default)]
 pub struct Chains {
     gates: BTreeMap<u64, (DynProvider, Address)>,
+    /// Solana gates, which are programs read over JSON-RPC rather than
+    /// contracts called through a provider.
+    solana_gates: BTreeMap<u64, crate::solana_pool::SolanaGate>,
 }
 
 impl Chains {
@@ -108,16 +111,32 @@ impl Chains {
     /// (no network I/O yet); the first `executed()` call is what hits the chain.
     pub fn add_spec(&mut self, spec: &str) -> anyhow::Result<u64> {
         let (chain_id, rpc, gate_s) = split_spec(spec, "--gate")?;
+        // A base58 gate is a Solana PROGRAM, not an EVM contract: it is read
+        // through JSON-RPC account fetches rather than an alloy provider, so it
+        // is kept aside instead of being forced into one. Same rule as --swap,
+        // so an operator never has to declare which VM a chain is.
+        if !gate_s.trim().starts_with("0x") {
+            self.solana_gates.insert(
+                chain_id,
+                crate::solana_pool::SolanaGate::new(rpc.trim(), gate_s.trim()),
+            );
+            return Ok(chain_id);
+        }
         let (provider, gate) = provider_for(gate_s, rpc, &format!("--gate {spec:?}"))?;
         self.gates.insert(chain_id, (provider, gate));
         Ok(chain_id)
+    }
+
+    /// The Solana gate configured for a chain, if any.
+    pub fn solana_gate(&self, chain_id: u64) -> Option<&crate::solana_pool::SolanaGate> {
+        self.solana_gates.get(&chain_id)
     }
 
     /// Register a destination gate from already-parsed parts (used to fold the
     /// `--chains-file` registry into the executed-gate map). A no-op if this
     /// chain already has a gate (an explicit `--gate` wins).
     pub fn add(&mut self, chain_id: u64, rpc: &str, gate: &str) -> anyhow::Result<()> {
-        if self.gates.contains_key(&chain_id) {
+        if self.gates.contains_key(&chain_id) || self.solana_gates.contains_key(&chain_id) {
             return Ok(());
         }
         let (provider, gate) = provider_for(gate, rpc, &format!("chain {chain_id}"))?;

@@ -24,15 +24,22 @@ import {
 } from "../wallet/eth";
 import type { Chain, SubmissionFilter, SwapPoolInfo } from "../api/types";
 import type { WalletState } from "../wallet/useWallet";
+import type { SolanaWalletState } from "../wallet/useSolanaWallet";
+import { SolanaBridgePanel } from "./SolanaBridgePanel";
 
 const eqAddr = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 const SLIPPAGE_OPTS = [10, 50, 100]; // bps: 0.1%, 0.5%, 1%
+
+/** A registry entry with no EVM RPC is a non-EVM chain — today, Solana. */
+const isNonEvmChain = (c: Chain) => !c.rpcUrl && !c.gate;
 
 interface Props {
   chains: Chain[];
   wallet: WalletState;
   /** Jump to the Explorer filtered to this corridor after a send. */
   onReview: (filter: SubmissionFilter) => void;
+  /** The Solana wallet, for the bridge-out-of-Solana panel. */
+  solana: SolanaWalletState;
 }
 
 /** What we captured from the source `Sent` log, needed to call `finalize()` later. */
@@ -137,7 +144,15 @@ export function loadPendingFlows(): PersistedFlow[] {
   return out;
 }
 
-export function BridgeView({ chains, wallet, onReview }: Props) {
+export function BridgeView({ chains, wallet, solana, onReview }: Props) {
+  // Sending FROM Solana is a different flow with a different wallet, so it gets
+  // its own panel rather than a branch through this one — see SolanaBridgePanel.
+  const solanaChain = useMemo(() => chains.find(isNonEvmChain) ?? null, [chains]);
+  const [source, setSource] = useState<"evm" | "solana">("evm");
+  useEffect(() => {
+    if (!solanaChain && source === "solana") setSource("evm");
+  }, [solanaChain, source]);
+
   const fromChainId = wallet.chainId; // sends execute on the connected chain
   const fromReg = useMemo(
     () => chains.find((c) => c.chainId === fromChainId) ?? null,
@@ -590,12 +605,42 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
         <div>
           <h2 className="card__title">Bridge</h2>
           <p className="card__subtitle">
-            {crossSwap
-              ? "Swap locally, bridge the stable, swap again on arrival — one flow."
-              : "Lock on the source chain; a threshold of validators signs the claim."}
+            {source === "solana"
+              ? "Lock SPL on Solana; a threshold of relayers signs the claim."
+              : crossSwap
+                ? "Swap locally, bridge the stable, swap again on arrival — one flow."
+                : "Lock on the source chain; a threshold of validators signs the claim."}
           </p>
         </div>
       </div>
+
+      {/* Only offered when the mesh actually has a non-EVM chain, so an
+          EVM-only deployment sees the form it always saw. */}
+      {solanaChain && (
+        <div className="source-switch" role="tablist" aria-label="Source chain">
+          <button
+            role="tab"
+            aria-selected={source === "evm"}
+            className={`source-switch__tab${source === "evm" ? " source-switch__tab--on" : ""}`}
+            onClick={() => setSource("evm")}
+          >
+            From EVM
+          </button>
+          <button
+            role="tab"
+            aria-selected={source === "solana"}
+            className={`source-switch__tab${source === "solana" ? " source-switch__tab--on" : ""}`}
+            onClick={() => setSource("solana")}
+          >
+            From {solanaChain.name}
+          </button>
+        </div>
+      )}
+
+      {source === "solana" && solanaChain ? (
+        <SolanaBridgePanel solanaChain={solanaChain} chains={chains} wallet={solana} />
+      ) : (
+        <>
 
       <div className="summary__row" style={{ marginBottom: 20 }}>
         <dt>Mode</dt>
@@ -855,6 +900,8 @@ export function BridgeView({ chains, wallet, onReview }: Props) {
       <button type="button" className="review-btn" disabled={button.disabled || !button.onClick} onClick={button.onClick}>
         {button.label}
       </button>
+        </>
+      )}
     </section>
   );
 }

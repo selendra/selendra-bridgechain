@@ -26,6 +26,12 @@ description = "The Solana leg's off-chain runner: scan Sent, sign, and submit cl
 # (see the note at the top of this file). Hashing and event parsing — everything
 # the source side needs — remain available; signing/sorting uses libsecp256k1.
 bridge-solana = { path = "../bridge-solana", default-features = false }
+# The swap program's own types — instruction enum, account layouts and the
+# pricing math — imported rather than mirrored. A hand-copied struct is how the
+# gate's two `Sent` definitions silently drifted apart; there is nothing to drift
+# if there is only one definition. `no-entrypoint` keeps the BPF entrypoint out
+# of a host binary.
+solana-swap = { path = "../solana-swap", features = ["no-entrypoint"] }
 solana-client = "=1.18.26"
 solana-sdk = "=1.18.26"
 solana-program = "=1.18.26"

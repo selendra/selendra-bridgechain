@@ -9,11 +9,12 @@ members = [
     "crates/sig-store",
     "crates/graphql-api",
     "crates/indexer",
+    "crates/swap-math",
 ]
 # The deployable Solana BPF program is built with the Solana toolchain
 # (`cargo build-sbf`), not the host workspace — its solana-program/spl-token deps
 # don't compile for the host target.
-exclude = ["crates/solana-gate", "crates/solana-relayer"]
+exclude = ["crates/solana-gate", "crates/solana-swap", "crates/solana-relayer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +22,8 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+swap-math = { path = "crates/swap-math" }
+bridge-solana = { path = "crates/bridge-solana" }
 bridge-core = { path = "crates/bridge-core" }
 bridge-db = { path = "crates/bridge-db" }
 

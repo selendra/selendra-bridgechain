@@ -1,0 +1,32 @@
+[package]
+name = "swap-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Swap pricing + account layouts shared by the Solana pool program and the read API"
+
+# Deliberately dependency-light: this crate is linked into BOTH the BPF program
+# (crates/solana-swap, built for SBF) and graphql-api (built with alloy). Those
+# two dependency trees are mutually exclusive — solana-program pins zeroize <1.4,
+# alloy needs ^1.5 — so anything shared between them can depend on neither.
+#
+# That constraint is the whole reason this crate exists. The alternative was a
+# hand-copied struct and a hand-copied formula on each side, which is exactly how
+# the gate's two `Sent` definitions drifted apart while both kept compiling.
+
+[dependencies]
+borsh = { version = "1", features = ["derive"] }
+uint = { version = "0.9", default-features = false }
+# PDA derivation, for off-chain readers only — the program derives its own with
+# solana-program syscalls. Optional because the BPF build must not link them.
+# curve25519-dalek 4 (not 3) is deliberate: 3.x caps zeroize at <1.4, which is
+# exactly the pin that keeps solana-client out of an alloy binary.
+sha2 = { version = "0.10", optional = true }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"], optional = true }
+
+[features]
+default = []
+pda = ["dep:sha2", "dep:curve25519-dalek"]
+
+[dev-dependencies]
+serde_json = "1"

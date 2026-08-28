@@ -149,9 +149,69 @@ export async function fetchSwapPool(chainId: number): Promise<SwapPoolInfo | nul
   return gql<{ swapPool: SwapPoolInfo | null }>(
     `{ swapPool(chainId: ${intLiteral("chainId", chainId)}) {
          chainId address stable
-         tokens { token symbol decimals price reserve maxSwapUsd isStable }
+         tokens { token symbol decimals price reserve maxSwapUsd isStable vault }
        } }`
   ).then((d) => d.swapPool);
+}
+
+/** A recent blockhash for a Solana pool's cluster (the one thing the browser
+ *  cannot derive; everything else in the transaction is built locally). */
+export async function fetchSolanaBlockhash(chainId: number): Promise<string | null> {
+  return gql<{ solanaBlockhash: string | null }>(
+    `{ solanaBlockhash(chainId: ${intLiteral("chainId", chainId)}) }`
+  ).then((d) => d.solanaBlockhash);
+}
+
+export interface SolanaGateContext {
+  programId: string;
+  bridgeDomain: string;
+  chainId: number;
+  nonce: number;
+  debridgeId: string;
+  vault: string;
+  decimals: number;
+  paused: boolean;
+}
+
+/** What the browser needs to build a `send` out of Solana. None of it decides
+ *  where the funds go — see `SolanaBridgePanel`. */
+export async function fetchSolanaGateContext(
+  chainId: number,
+  symbol: string,
+  chainIdTo: number
+): Promise<SolanaGateContext | null> {
+  return gql<{ solanaGateContext: SolanaGateContext | null }>(
+    `query Q($sym: String!) {
+       solanaGateContext(chainId: ${intLiteral("chainId", chainId)}, symbol: $sym, chainIdTo: ${intLiteral(
+         "chainIdTo",
+         chainIdTo
+       )}) { programId bridgeDomain chainId nonce debridgeId vault decimals paused }
+     }`,
+    { sym: symbol }
+  ).then((d) => d.solanaGateContext);
+}
+
+/** SPL balance of a token account the CALLER derived. */
+export async function fetchSolanaTokenBalance(chainId: number, account: string): Promise<string | null> {
+  return gql<{ solanaTokenBalance: string | null }>(
+    `query Q($acct: String!) {
+       solanaTokenBalance(chainId: ${intLiteral("chainId", chainId)}, account: $acct)
+     }`,
+    { acct: account }
+  ).then((d) => d.solanaTokenBalance);
+}
+
+/** `pending` | `processed` | `confirmed` | `finalized` | `failed`. */
+export async function fetchSolanaSignatureStatus(
+  chainId: number,
+  signature: string
+): Promise<string | null> {
+  return gql<{ solanaSignatureStatus: string | null }>(
+    `query Q($sig: String!) {
+       solanaSignatureStatus(chainId: ${intLiteral("chainId", chainId)}, signature: $sig)
+     }`,
+    { sig: signature }
+  ).then((d) => d.solanaSignatureStatus);
 }
 
 export async function fetchSwapQuote(

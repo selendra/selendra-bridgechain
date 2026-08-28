@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # deploy-from-json.sh — deploy the bridge contracts from a JSON config.
 #
-#   bash scripts/deploy-from-json.sh [config.json] [--dry-run] [--no-config-update]
+#   bash scripts/deploy-from-json.sh [config.json] [--dry-run] [--no-config-update] [--redeploy]
 #
 # Default config: config/deploy.config.json  (see config/README.md for the field
 # reference). Two profiles:
@@ -26,10 +26,12 @@ CONTRACTS="$ROOT/contracts"
 CONFIG="config/deploy.config.json"
 DRY_RUN=false
 UPDATE_CFG=true
+REDEPLOY=false
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run)          DRY_RUN=true ;;
+    --redeploy)         REDEPLOY=true ;;
     --no-config-update) UPDATE_CFG=false ;;
     -h|--help)          sed -n '2,25p' "$0"; exit 0 ;;
     -*)                 echo "unknown flag: $arg" >&2; exit 1 ;;
@@ -166,6 +168,16 @@ say "deploying gates"
 for cid in "${CHAIN_IDS[@]}"; do
   deploy_gate="$(j ".chains[] | select(.chain_id == $cid) | .deploy_gate")"
   existing="$(jq -r ".chains[] | select(.chain_id == $cid) | .gate // empty" "$CONFIG")"
+  # A gate already in the record is reused for the same reason a token is: a
+  # fresh gate restarts its nonces and strands every transfer in flight.
+  if [[ "$deploy_gate" == "true" ]] && ! $REDEPLOY && [[ -f "$OUT_FILE" ]]; then
+    prev_gate="$(jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .gate // empty' "$OUT_FILE")"
+    if [[ "$prev_gate" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+      GATE[$cid]="$prev_gate"
+      info "${CNAME[$cid]} ($cid) gate=$prev_gate (from $(basename "$OUT_FILE"); --redeploy to replace)"
+      continue
+    fi
+  fi
   if [[ "$deploy_gate" != "true" ]]; then
     [[ "$existing" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "chain $cid has deploy_gate=false but no gate address"
     GATE[$cid]="$existing"; info "${CNAME[$cid]} ($cid) reusing gate ${GATE[$cid]}"; continue
@@ -217,8 +229,23 @@ if (( ${#SYMS[@]} )); then
       fi
       addr="$(j ".assets[] | select(.symbol == \"$sym\") | .deployments[] | select(.chain_id == $cid) | .address")"
       if [[ "$addr" == "auto" ]]; then
-        addr="$(fc src/TestToken.sol:TestToken "${RPC[$cid]}" --constructor-args "$tname" "$sym")"
-        [[ "$addr" =~ ^0x ]] || die "TestToken deploy failed: $sym on chain $cid"
+        # "auto" means "deploy if we do not already have one" — NOT "deploy
+        # again". A second run that mints a fresh token silently rewires the
+        # whole mesh to it and orphans the liquidity in the old one, which is
+        # exactly the failure the bash launcher's config warns about in prose.
+        # The previous run's record is the memory that makes re-running safe.
+        prev=""
+        if ! $REDEPLOY && [[ -f "$OUT_FILE" ]]; then
+          prev="$(jq -r --argjson c "$cid" --arg s "$sym" \
+            '.chains[]? | select(.chain_id == $c) | .tokens[$s] // empty' "$OUT_FILE")"
+        fi
+        if [[ -n "$prev" ]]; then
+          addr="$prev"
+          info "$sym @ $cid = $addr (from $(basename "$OUT_FILE"); --redeploy to replace)"
+        else
+          addr="$(fc src/TestToken.sol:TestToken "${RPC[$cid]}" --constructor-args "$tname" "$sym")"
+          [[ "$addr" =~ ^0x ]] || die "TestToken deploy failed: $sym on chain $cid"
+        fi
       else
         [[ "$addr" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "asset $sym on chain $cid: '$addr' is neither \"auto\" nor an address"
         code="$(cast code "$addr" --rpc-url "${RPC[$cid]}" 2>/dev/null || echo 0x)"
@@ -310,6 +337,9 @@ if [[ "$(j '.swap.enabled')" == "true" ]] && [[ "$(j '[.swap.pools[]?] | length'
     [[ -n "$stable_tok" ]] || die "swap pool on chain $cid names stable '$stable_sym', which is not an asset on that chain"
 
     existing="$(jq -r "($pjson).pool // empty" "$CONFIG")"
+    if [[ -z "$existing" ]] && ! $REDEPLOY && [[ -f "$OUT_FILE" ]]; then
+      existing="$(jq -r --argjson c "$cid" '.swap_pools[]? | select(.chain_id == $c) | .pool // empty' "$OUT_FILE")"
+    fi
     if [[ -n "$existing" ]]; then
       pool="$existing"; from_block="$(jq -r "($pjson).from_block // 0" "$CONFIG")"
       info "chain $cid reusing pool $pool"
@@ -549,9 +579,111 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
       '. + [{symbol: $s, mint: $m, vault: $v, registrations: $ids}]' <<<"$SOL_ASSETS")"
   done
 
+  # --- the Solana swap pool (a SEPARATE program from the gate) ---------------
+  #
+  # Separate on purpose, exactly as `SwapPool.sol` is a separate contract from
+  # `Gate.sol`: the gate holds bridge liquidity, and a bug in swap pricing must
+  # not be able to reach it.
+  SOL_SWAP_JSON='null'
+  if [[ "$(j '.solana.swap.enabled // false')" == "true" ]]; then
+    SWAP_ADMIN="$(jr '.solana.swap.swap_admin_bin')"
+    SWAP_ADMIN="${SWAP_ADMIN:-crates/solana-relayer/target/debug/swap-admin}"
+    [[ "$SWAP_ADMIN" = /* ]] || SWAP_ADMIN="$ROOT/$SWAP_ADMIN"
+    [[ -x "$SWAP_ADMIN" ]] || die "no swap-admin at $SWAP_ADMIN (cargo build --manifest-path crates/solana-relayer/Cargo.toml --bin swap-admin)"
+
+    say "solana swap pool"
+    if [[ "$(j '.solana.swap.deploy')" == "true" ]]; then
+      so="$(j '.solana.swap.so_path')"; [[ "$so" = /* ]] || so="$ROOT/$so"
+      [[ -f "$so" ]] || die "swap program binary not found: $so (bash scripts/testing/build-solana.sh swap)"
+      out="$RUN_LOG_DIR/solana-swap-deploy.json"
+      rpc_flag=(); [[ "$(j '.solana.swap.use_rpc')" != "false" ]] && rpc_flag=(--use-rpc)
+      solana program deploy "$so" --url "$SOL_RPC" --keypair "$PAYER" "${rpc_flag[@]}" --output json > "$out" \
+        || { cat "$out"; die "solana swap program deploy failed"; }
+      SWAP_PROGRAM="$(jq -r '.programId' "$out")"
+      info "program : $SWAP_PROGRAM (deployed)"
+    else
+      SWAP_PROGRAM="$(jr '.solana.swap.program_id')"
+      [[ -n "$SWAP_PROGRAM" ]] || die "solana.swap.deploy = false needs solana.swap.program_id"
+      info "program : $SWAP_PROGRAM (existing)"
+    fi
+
+    sa() { "$SWAP_ADMIN" --rpc "$SOL_RPC" --keypair "$PAYER" --program "$SWAP_PROGRAM" "$@"; }
+    sa_retry() {
+      local out attempt
+      for attempt in 1 2 3 4 5; do
+        if out="$(sa "$@" 2>&1)"; then return 0; fi
+        sleep 3
+      done
+      echo "$out" >&2
+      return 1
+    }
+    for _ in $(seq 1 20); do
+      solana program show "$SWAP_PROGRAM" --url "$SOL_RPC" >/dev/null 2>&1 && break
+      sleep 2
+    done
+
+    hub_sym="$(j '.solana.swap.hub')"
+    hub_mint="$(jr ".solana.assets[] | select(.symbol == \"$hub_sym\") | .mint")"
+    hub_vault="$(jr ".solana.assets[] | select(.symbol == \"$hub_sym\") | .swap_vault")"
+    [[ -n "$hub_mint" && -n "$hub_vault" ]] \
+      || die "solana.swap.hub is '$hub_sym', but that asset has no mint/swap_vault"
+
+    # Idempotent: an initialized pool is left alone, the same way the gate is.
+    if sa show 2>&1 | grep -q "NOT INITIALIZED"; then
+      sa_retry init --hub-mint "$hub_mint" --hub-vault "$hub_vault" \
+        --fee-bps "$(j '.solana.swap.fee_bps')" \
+        --deviation-bps "$(j '.solana.swap.deviation_bps')" \
+        --min-price-interval "$(j '.solana.swap.min_price_interval')" >/dev/null \
+        || die "swap-admin init failed"
+      info "init    : hub $hub_sym at 1.0, fee $(j '.solana.swap.fee_bps') bps"
+    else
+      info "init    : already initialized (leaving it alone)"
+    fi
+
+    SOL_SWAP_TOKENS="$(jq -c -n --arg s "$hub_sym" --arg m "$hub_mint" '[{symbol:$s, mint:$m, price:"1"}]')"
+    for sym in $(j '.solana.swap.list[]?.symbol'); do
+      mint="$(jr ".solana.assets[] | select(.symbol == \"$sym\") | .mint")"
+      vault="$(jr ".solana.assets[] | select(.symbol == \"$sym\") | .swap_vault")"
+      [[ -n "$mint" && -n "$vault" ]] || die "swap lists '$sym', which has no mint/swap_vault in solana.assets"
+      price="$(j ".solana.swap.list[] | select(.symbol == \"$sym\") | .price")"
+      # Prices are quoted in WHOLE hub units and scaled by PRICE_ONE (1e18) —
+      # the pool's fixed point, independent of either mint's decimals.
+      price_scaled="$(scaled "$price" 18)"
+      if sa show --mint "$mint" 2>&1 | grep -q "NOT LISTED"; then
+        sa_retry list-token --mint "$mint" --vault "$vault" --price "$price_scaled" >/dev/null \
+          || die "swap-admin list-token $sym failed"
+        info "listed  : $sym at $price $hub_sym"
+      else
+        info "listed  : $sym already listed (price left alone)"
+      fi
+      SOL_SWAP_TOKENS="$(jq -c --arg s "$sym" --arg m "$mint" --arg p "$price" \
+        '. + [{symbol:$s, mint:$m, price:$p}]' <<<"$SOL_SWAP_TOKENS")"
+    done
+
+    # Reserves. A pool with no reserve of the OUT token quotes fine and then
+    # fails the swap on its own lock, which reads as a broken UI.
+    for sym in $(j '.solana.swap.seed | keys[]?'); do
+      mint="$(jr ".solana.assets[] | select(.symbol == \"$sym\") | .mint")"
+      from="$(jr ".solana.assets[] | select(.symbol == \"$sym\") | .seed_from")"
+      amount="$(j ".solana.swap.seed.$sym")"
+      if [[ -z "$from" ]]; then
+        warn "no seed_from token account for $sym — reserve left as is"
+        continue
+      fi
+      sa_retry seed --mint "$mint" --amount "$amount" --from "$from" >/dev/null \
+        || die "swap-admin seed $sym failed"
+      info "seeded  : $amount $sym"
+    done
+
+    SOL_SWAP_JSON="$(jq -n --arg prog "$SWAP_PROGRAM" --argjson tokens "$SOL_SWAP_TOKENS" \
+      '{program_id:$prog, tokens:$tokens}')"
+  fi
+
   SOLANA_JSON="$(jq -n --argjson cid "$SOL_CHAIN_ID" --arg rpc "$SOL_RPC" --arg prog "$SOL_PROGRAM" \
     --arg owner "$PAYER_PUBKEY" --argjson cor "$SOL_CORRIDORS" --argjson assets "$SOL_ASSETS" \
-    '{chain_id:$cid, rpc:$rpc, program_id:$prog, owner:$owner, corridors:$cor, assets:$assets}')"
+    --argjson swap "$SOL_SWAP_JSON" \
+    '{chain_id:$cid, rpc:$rpc, program_id:$prog, owner:$owner, corridors:$cor, assets:$assets,
+      swap:$swap}')"
 fi
 
 # --- record ----------------------------------------------------------------
@@ -597,6 +729,17 @@ if $UPDATE_CFG && [[ -n "$BRIDGE_CFG" ]]; then
       then .solana = ((.solana // {}) + { enabled: true, chain_id: $dep.solana.chain_id,
                                           rpc: $dep.solana.rpc, program_id: $dep.solana.program_id })
          | .solana.tokens = [ $dep.solana.assets[] | {symbol, mint} ]
+         # The Solana pool is served through the same `graphql.swaps` list as the
+         # EVM ones; the API tells the two apart by the address form (base58 vs
+         # 0x), so nothing else in the config has to say which VM it is.
+         | if $dep.solana.swap != null
+           then .solana.swap = { program_id: $dep.solana.swap.program_id,
+                                 tokens: $dep.solana.swap.tokens }
+              | .graphql.swaps = ((.graphql.swaps // []) | map(select(.chain_id != $dep.solana.chain_id)))
+                                 + [{ chain_id: $dep.solana.chain_id,
+                                      pool: $dep.solana.swap.program_id,
+                                      from_block: 0 }]
+           else . end
       else . end
     | if ($dep.swap_pools | length) > 0
       then .graphql.swaps = [ $dep.swap_pools[] | {chain_id, pool, from_block} ]

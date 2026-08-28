@@ -1599,3 +1599,31 @@ body {
   justify-content: center;
   margin-top: 14px;
 }
+
+/* Source switch — only rendered when the mesh has a non-EVM chain. */
+.source-switch {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+}
+.source-switch__tab {
+  flex: 1;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-dim, #9aa4b2);
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.source-switch__tab--on {
+  background: var(--surface-3, rgba(255, 255, 255, 0.08));
+  color: var(--text, #e8ecf1);
+}
+.solana-bridge .summary {
+  margin-top: 12px;
+}

@@ -178,7 +178,11 @@
         "symbol": "TST",
         "mint": null
       }
-    ]
+    ],
+    "swap": {
+      "program_id": null,
+      "tokens": []
+    }
   },
   "indexer": {
     "enabled": true,

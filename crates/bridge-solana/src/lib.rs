@@ -16,6 +16,7 @@
 //! The deployable BPF program (../../crates/solana-gate) is a thin entrypoint
 //! over [`gate`], built with `cargo build-sbf`.
 
+pub mod account;
 pub mod gate;
 pub mod hash;
 pub mod instruction;

@@ -413,6 +413,10 @@ if [[ "$SOLANA_ON" == "true" && "$(j '.solana.include_in_registry')" == "true" ]
            token: ($c[0].solana.tokens[0].mint // null),
            tokens: [$c[0].solana.tokens[] | select(.mint != null) | {symbol, address: .mint}],
            router: null }]' "$REG_JSON" > "$tmp" && mv "$tmp" "$REG_JSON"
+  # `mktemp` creates 0600 and `mv` carries that mode over — which makes the
+  # registry unreadable to the container uid under compose, where the file is
+  # bind-mounted rather than read by this user.
+  chmod 644 "$REG_JSON"
 fi
 info "registry -> $REG_JSON"
 
@@ -527,12 +531,19 @@ if [[ "$MODE" == "compose" ]]; then
       printf '      - "--gate"\n      - "%s=%s,%s"\n' "$cid" \
         "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")" "$(cf "$cid" gate)"
     done
+    if [[ "$SOLANA_ON" == "true" ]]; then
+      printf '      - "--gate"\n      - "%s=%s,%s"\n' "$SOL_CHAIN_ID" "$(j '.solana.rpc')" "$SOL_PROGRAM"
+    fi
     for scid in $(j '.graphql.swaps[]?.chain_id'); do
-      printf '      - "--swap"\n      - "%s=%s,%s,%s,%s"\n' "$scid" \
-        "$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG")" \
-        "$(j ".graphql.swaps[] | select(.chain_id == $scid) | .pool")" \
-        "$(j ".graphql.swaps[] | select(.chain_id == $scid) | .from_block")" \
-        "$(cf "$scid" max_block_range)"
+      sp="$(j ".graphql.swaps[] | select(.chain_id == $scid) | .pool")"
+      if [[ "$scid" == "$(jr '.solana.chain_id')" && "$sp" != 0x* ]]; then
+        printf '      - "--swap"\n      - "%s=%s,%s"\n' "$scid" "$(j '.solana.rpc')" "$sp"
+      else
+        printf '      - "--swap"\n      - "%s=%s,%s,%s,%s"\n' "$scid" \
+          "$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG")" "$sp" \
+          "$(j ".graphql.swaps[] | select(.chain_id == $scid) | .from_block")" \
+          "$(cf "$scid" max_block_range)"
+      fi
     done
     # Read-only credential, and its only one: this is the service that faces the
     # internet, so it holds nothing that can write and no database URL at all.
@@ -705,6 +716,12 @@ if [[ "$(j '.graphql.enabled')" == "true" ]]; then
   for cid in "${CHAIN_IDS[@]}"; do
     args+=(--gate "$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG"),$(cf "$cid" gate)")
   done
+  # The Solana gate goes through the same flag; the API tells it apart by the
+  # base58 address form, so the UI can read a corridor's nonce and vault to
+  # build a `send` out of Solana.
+  if [[ "$SOLANA_ON" == "true" ]]; then
+    args+=(--gate "$SOL_CHAIN_ID=$(j '.solana.rpc'),$SOL_PROGRAM")
+  fi
   # One --swap per pool: `swaps` is the multi-chain form, `swap` the single-pool
   # one kept for existing configs.
   for scid in $(j '.graphql.swaps[]?.chain_id'); do
@@ -713,8 +730,15 @@ if [[ "$(j '.graphql.enabled')" == "true" ]]; then
     # That chain's own getLogs cap, not the global one: a fast chain throttled to
     # another endpoint's cap produces blocks faster than its pool's listing
     # history can be replayed, and the Swap view never fills.
-    srange="$(cf "$scid" max_block_range)"
-    args+=(--swap "$scid=$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG"),$sp,$sfb,${srange:-10}")
+    # A Solana pool is addressed by its base58 PROGRAM id and read from
+    # accounts, so it has no scan floor and no getLogs cap — send its RPC and
+    # program only.
+    if [[ "$scid" == "$(jr '.solana.chain_id')" && "$sp" != 0x* ]]; then
+      args+=(--swap "$scid=$(j '.solana.rpc'),$sp")
+    else
+      srange="$(cf "$scid" max_block_range)"
+      args+=(--swap "$scid=$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG"),$sp,$sfb,${srange:-10}")
+    fi
   done
   if [[ "$(j '.graphql.swap.enabled // false')" == "true" ]]; then
     scid="$(j '.graphql.swap.chain_id')"

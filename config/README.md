@@ -46,7 +46,7 @@ transaction. `--no-config-update` skips patching the runtime config.
 | `gate.owner` | multisig that receives ownership via two-step transfer (production) |
 | `chains[]` | `chain_id`, `name`, `rpc_url`; `deploy_gate: false` + `gate` reuses an existing one. The RPC's reported chain id is verified before anything is sent. `"enabled": false` parks a chain in the config — assets and pools that name it are skipped, so an unfunded chain can wait there instead of being deleted and re-added |
 | `assets[].symbol/name/decimals` | the bridgeable asset |
-| `assets[].deployments[]` | `chain_id` + `address`; `"auto"` deploys a fresh `TestToken` (local only). An existing address must have contract code on that chain |
+| `assets[].deployments[]` | `chain_id` + `address`; `"auto"` deploys a fresh `TestToken` (local only) **only if `output.file` has no address recorded for it** — a re-run reuses what the last one produced. Deploying a second token silently rewires the mesh to it and orphans the liquidity in the first, so replacing one is opt-in: `--redeploy`. An explicit address must have contract code on that chain |
 | `assets[].register_corridors` | wire the asset full-mesh with `setLocalToken` |
 | `assets[].test_liquidity` | mint whole-token amounts to the deployer and the gate (local only) |
 | `swap.pools[]` | one `SwapPool` per chain over the assets this config already deploys, so every bridged token is also swappable where it lands. `stable` names the pricing hub (listed at 1.0 by construction), `list[]` the tokens quoted against it (`price` in whole hub units), `seed` the reserves to fund, `mint_seed` whether to mint them first (test tokens only). A pool with no reserve of the OUT token quotes fine and then reverts on the swap |
@@ -93,7 +93,41 @@ submissionId computed on one side verify on the other.
 | `register_corridors` | register every EVM chain in `chains[]` as a destination. `send` refuses any `chain_id_to` governance has not registered; the instruction is idempotent |
 | `assets[].mint` / `.vault` | the SPL mint and the program-owned vault. **Supplied, never created here** — the vault must be an SPL account for that mint, owned by the program's `vault_authority` PDA, with no delegate and no close authority (the program rejects anything else) |
 | `assets[].from_chains` | which EVM chains this asset may arrive from (`"all"` or a list). One registration per source chain, exactly as the EVM side needs one `setLocalToken` per corridor — a claim commits only to the debridgeId, and that id differs per origin |
+| `assets[].swap_vault` | the SPL vault the SWAP pool uses for this mint — a different account from the bridge `vault`, owned by the swap program's own `vault_authority` PDA. The two programs share no liquidity |
+| `assets[].seed_from` | a token account holding balance to seed the swap pool's reserve from |
 | `assets[].debridge_id` | for a Solana-NATIVE asset, the id it is bridged under. It is registered on the program *and* mapped on every EVM gate that carries the symbol. Leave `null` for an EVM-native asset |
+
+### the Solana swap pool
+
+`solana.swap` deploys and configures `crates/solana-swap`, the Solana twin of
+`SwapPool.sol`, so bridged assets can be swapped on Solana and not only on the
+EVM chains.
+
+| field | meaning |
+| --- | --- |
+| `deploy` / `program_id` / `so_path` | deploy the pool program (build it with `bash scripts/testing/build-solana.sh swap`) or reuse a deployed one. It is a SEPARATE program from the gate — a pricing bug must not be able to reach bridge liquidity |
+| `hub` | which asset is the pool's unit of account. Its price is pinned at 1.0 forever and cannot be repriced |
+| `list[]` | the other tokens, priced in WHOLE hub units (scaled by 1e18 internally) |
+| `seed` | reserves to fund, in raw token units, taken from each asset's `seed_from` account |
+| `fee_bps` / `deviation_bps` / `min_price_interval` | the fee, the largest single price move, and the cooldown between two moves of the same token — the pair bounds a compromised oracle to one capped step per interval |
+
+Initialization is idempotent: an already-initialized pool and already-listed
+tokens are left alone, so re-running only adds what is missing. The resulting
+program id is written into the runtime config as another `graphql.swaps` entry —
+the API tells a Solana pool from an EVM one by the address form (base58 vs `0x`),
+so nothing else in the config has to declare which VM it is.
+
+Swapping from the **browser** needs a Solana wallet (Phantom): the Swap view
+switches to it automatically when the selected pool's address is a base58
+program id rather than an `0x` contract, offers no approve step (an SPL transfer
+is authorised by the signer), and builds the transaction locally — every account
+that decides where the output lands is derived in the browser, never taken from
+the API. See `frontend/src/wallet/solana.ts`.
+
+Set `solana.include_in_registry: true` in the runtime config if you want the UI
+to show it: an SPL mint carries no on-chain symbol (that lives in Metaplex
+metadata), so the API takes token names from the registry and otherwise shows a
+truncated address.
 
 The script refuses to touch a program whose on-chain `bridge_domain` differs from
 this deployment's: that program belongs to an earlier generation, its domain is

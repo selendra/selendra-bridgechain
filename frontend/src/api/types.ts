@@ -65,7 +65,9 @@ export interface SubmissionFilter {
 // --- swap (same-chain SwapPool read view) --------------------------------
 
 export interface PoolToken {
-  token: string; // 0x address (lowercase)
+  token: string; // 0x address (lowercase), or a base58 mint on Solana
+  /** The pool's vault for this token — Solana only; null on EVM. */
+  vault?: string | null;
   symbol: string;
   decimals: number;
   price: string; // 1e18-scaled USD, decimal string

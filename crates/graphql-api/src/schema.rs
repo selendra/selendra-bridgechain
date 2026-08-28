@@ -89,8 +89,13 @@ impl From<ChainInfo> for Chain {
 /// strings (uint256) to avoid JSON precision loss, like `Submission.amount`.
 #[derive(SimpleObject)]
 pub struct PoolTokenView {
-    /// `0x`-prefixed token address.
+    /// `0x`-prefixed token address (base58 mint on Solana).
     pub token: String,
+    /// The pool's vault for this token — Solana only, `null` on EVM where the
+    /// pool contract holds its own balances. A UI needs it to build the swap
+    /// instruction; a wrong one fails the transaction rather than misdirecting
+    /// it, since the program pins the vault in its own token record.
+    pub vault: Option<String>,
     /// ERC-20 symbol (empty if the token doesn't expose one).
     pub symbol: String,
     pub decimals: u8,
@@ -102,6 +107,27 @@ pub struct PoolTokenView {
     pub max_swap_usd: String,
     /// True for the pool's core-price stablecoin.
     pub is_stable: bool,
+}
+
+/// What a browser needs to build a Solana gate `send`. See the resolver for why
+/// none of it is trusted with the destination of the transfer.
+#[derive(SimpleObject)]
+pub struct SolanaGateContext {
+    /// Base58 gate program id.
+    pub program_id: String,
+    /// `0x` + 64 hex — the deployment generation, hashed into the submissionId.
+    pub bridge_domain: String,
+    /// The gate's own chain id (deBridge's id for Solana).
+    pub chain_id: u64,
+    /// Next nonce for this destination corridor.
+    pub nonce: u64,
+    pub debridge_id: String,
+    /// The registered vault the tokens are locked into.
+    pub vault: String,
+    /// The mint's decimals, for amount entry.
+    pub decimals: u8,
+    /// True when the gate's circuit breaker is tripped — a `send` would revert.
+    pub paused: bool,
 }
 
 /// A configured same-chain swap pool: its contract address, core stablecoin,
@@ -131,6 +157,7 @@ impl SwapPoolInfo {
 impl From<PoolToken> for PoolTokenView {
     fn from(p: PoolToken) -> Self {
         PoolTokenView {
+            vault: p.vault,
             token: p.token,
             symbol: p.symbol,
             decimals: p.decimals,
@@ -555,6 +582,88 @@ impl Query {
         amount_in: String,
     ) -> Option<String> {
         state(ctx).swaps.quote(chain_id, &token_in, &token_out, &amount_in).await
+    }
+
+    /// Everything a browser needs to build a `send` on the Solana gate for one
+    /// asset and destination: the deployment domain, the corridor's next nonce,
+    /// and the registered vault.
+    ///
+    /// None of it can redirect a transfer — the receiver, amount and destination
+    /// are packed into the instruction by the browser, and a wrong value here
+    /// yields a submissionId the program does not derive, so the transaction
+    /// fails rather than pays the wrong account.
+    async fn solana_gate_context(
+        &self,
+        ctx: &Context<'_>,
+        chain_id: u64,
+        // `symbol` is the asset as the registry lists it; the debridgeId is
+        // derived from the DESTINATION chain's token for that symbol.
+        symbol: String,
+        chain_id_to: u64,
+    ) -> Option<SolanaGateContext> {
+        let st = state(ctx);
+        let gate = st.chains.solana_gate(chain_id)?;
+        // The debridgeId is DERIVED, not configured: it is `keccak(chainId,
+        // token)` of the asset on the chain it is native to — here, the
+        // destination. Deriving it from the registry means one less value that
+        // can be stale, and the same value the destination gate will look up
+        // when it claims.
+        let dest = st.registry.iter().find(|c| c.chain_id == chain_id_to)?;
+        let token = dest
+            .tokens
+            .iter()
+            .find(|t| t.symbol.eq_ignore_ascii_case(&symbol))
+            .map(|t| t.address.clone())?;
+        let token: alloy_primitives::Address = token.parse().ok()?;
+        let id = bridge_core::debridge_id(alloy_primitives::U256::from(chain_id_to), token);
+        let debridge_id = format!("{id:#x}");
+        match gate.send_context(&debridge_id, chain_id_to).await {
+            Ok(c) => Some(SolanaGateContext {
+                program_id: c.program_id,
+                bridge_domain: c.bridge_domain,
+                chain_id: c.chain_id,
+                nonce: c.nonce,
+                debridge_id: c.debridge_id,
+                vault: c.vault,
+                decimals: c.decimals,
+                paused: c.paused,
+            }),
+            Err(e) => {
+                tracing::warn!(chain_id, error = %e, "solana gate context unavailable");
+                None
+            }
+        }
+    }
+
+    /// A recent blockhash for a Solana pool's cluster. The browser builds and
+    /// signs its own swap transaction — this is the one piece it cannot derive,
+    /// and passing it through here keeps the RPC credential server-side.
+    /// `null` for an EVM chain or an unconfigured one.
+    async fn solana_blockhash(&self, ctx: &Context<'_>, chain_id: u64) -> Option<String> {
+        state(ctx).swaps.solana_blockhash(chain_id).await
+    }
+
+    /// SPL balance of a token account, as a decimal string ("0" when the
+    /// account does not exist yet). The caller derives the address; this only
+    /// reads it.
+    async fn solana_token_balance(
+        &self,
+        ctx: &Context<'_>,
+        chain_id: u64,
+        account: String,
+    ) -> Option<String> {
+        state(ctx).swaps.solana_token_balance(chain_id, &account).await
+    }
+
+    /// Confirmation state of a Solana transaction: `pending`, `processed`,
+    /// `confirmed`, `finalized` or `failed`. `null` for an EVM chain.
+    async fn solana_signature_status(
+        &self,
+        ctx: &Context<'_>,
+        chain_id: u64,
+        signature: String,
+    ) -> Option<String> {
+        state(ctx).swaps.solana_signature_status(chain_id, &signature).await
     }
 
     /// Aggregate counts across the whole store.

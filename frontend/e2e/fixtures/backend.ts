@@ -61,6 +61,12 @@ export interface BackendOptions {
   submissionStatus?: Record<string, string>;
   swapPool?: Record<number, unknown>;
   swapQuote?: string | null;
+  /** The Solana-only reads: blockhash, SPL balance, signature status. */
+  solanaBlockhash?: string;
+  solanaTokenBalance?: string;
+  solanaSignatureStatus?: string;
+  /** The gate context for a bridge-out-of-Solana. */
+  solanaGateContext?: unknown;
   history?: unknown[];
   submissions?: unknown[];
   swapHistory?: unknown[];
@@ -144,6 +150,32 @@ export async function mockBackend(page: Page, options: BackendOptions = {}): Pro
     }
     if (q.includes("swapQuote(")) {
       return data({ swapQuote: o.swapQuote === undefined ? (body.variables?.amt as string) : o.swapQuote });
+    }
+    if (q.includes("solanaGateContext(")) {
+      return data({
+        solanaGateContext:
+          o.solanaGateContext === undefined
+            ? {
+                programId: "HvGQTWChe6bMpSYGNavDhGcG8YrJkubJQCDmBrxNR133",
+                bridgeDomain: "0x619244a655e7383c05da63e9d66080952fcfe4fc48b40c61f566996006848055",
+                chainId: 7565164,
+                nonce: 3,
+                debridgeId: "0x4b7347216b2c2ce2879cf0086a2bd0ad84a4df90c1d0d1e665041ba0bc157454",
+                vault: "33A9xPRuLjv8NBrp5XjjdU22yfXdNx6vGczW9XY3bpgb",
+                decimals: 6,
+                paused: false,
+              }
+            : o.solanaGateContext,
+      });
+    }
+    if (q.includes("solanaBlockhash(")) {
+      return data({ solanaBlockhash: o.solanaBlockhash ?? "11111111111111111111111111111111" });
+    }
+    if (q.includes("solanaTokenBalance(")) {
+      return data({ solanaTokenBalance: o.solanaTokenBalance ?? "1000000000000" });
+    }
+    if (q.includes("solanaSignatureStatus(")) {
+      return data({ solanaSignatureStatus: o.solanaSignatureStatus ?? "confirmed" });
     }
     if (q.includes("swapHistory(")) return data({ swapHistory: o.swapHistory ?? [] });
     if (q.includes("submission(submissionId")) {

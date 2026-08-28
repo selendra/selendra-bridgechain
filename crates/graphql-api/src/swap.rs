@@ -26,6 +26,11 @@ use crate::chain::{provider_for, split_spec};
 /// `Submission.amount` is carried.
 #[derive(Clone, Debug)]
 pub struct PoolToken {
+    /// The pool's vault for this token (Solana only; `None` on EVM, where the
+    /// pool contract holds its own balances). Passing a wrong one fails the
+    /// transaction — the program pins the vault in its token record — so this
+    /// is a convenience, not a trust anchor.
+    pub vault: Option<String>,
     /// `0x`-prefixed token address.
     pub token: String,
     /// ERC-20 symbol (best-effort; empty if the token doesn't expose one).
@@ -58,9 +63,9 @@ pub struct PoolInfo {
 /// `DynProvider` is an `Arc` internally); share freely across resolvers.
 #[derive(Clone)]
 pub struct Swaps {
-    /// chain_id -> (provider, pool address, first block worth scanning,
-    /// blocks per `eth_getLogs` for THIS chain)
-    pools: BTreeMap<u64, (DynProvider, Address, u64, u64)>,
+    /// chain_id -> the pool on that chain, EVM or Solana. Two VMs, one view:
+    /// the resolvers below are the only place that needs to know which.
+    pools: BTreeMap<u64, Backend>,
     /// Default blocks per `eth_getLogs`, used by pools that do not carry their
     /// own. Hosted RPCs cap this and reject anything wider (Alchemy's free tier:
     /// 10), so it must be configurable per deployment.
@@ -79,6 +84,22 @@ pub struct Swaps {
     /// rate-limit the API into returning intermittent nulls while the frontend
     /// polls every 10s.
     cache: Arc<Mutex<BTreeMap<u64, TokenListState>>>,
+}
+
+/// A configured pool. The EVM side reads through alloy; the Solana side reads
+/// accounts over JSON-RPC and prices with `swap-math` — the same crate its
+/// program links, so the quote and the payout cannot disagree.
+#[derive(Clone)]
+enum Backend {
+    Evm {
+        provider: DynProvider,
+        pool: Address,
+        /// First block worth scanning (the pool's deployment height).
+        from_block: u64,
+        /// Blocks per `eth_getLogs` for THIS endpoint.
+        max_range: u64,
+    },
+    Solana(crate::solana_pool::SolanaPool),
 }
 
 /// Replayed listing state plus how far it has been scanned.
@@ -150,9 +171,32 @@ impl Swaps {
             }
             None => self.max_range,
         };
+        // A `0x…` pool is an EVM contract; anything else is a base58 Solana
+        // PROGRAM id. Distinguishing on the address form keeps one flag out of
+        // the spec and cannot be got wrong by an operator.
+        if !pool_s.trim().starts_with("0x") {
+            let program = pool_s.trim().to_string();
+            anyhow::ensure!(
+                crate::solana_pool::from_b58(&program).is_some(),
+                "--swap {spec:?}: pool is neither an 0x address nor a base58 Solana program id"
+            );
+            self.pools.insert(
+                chain_id,
+                Backend::Solana(crate::solana_pool::SolanaPool::new(rpc.trim(), program)),
+            );
+            return Ok(chain_id);
+        }
         let (provider, pool) = provider_for(pool_s, rpc, &format!("--swap {spec:?}"))?;
-        self.pools.insert(chain_id, (provider, pool, from_block, max_range));
+        self.pools.insert(chain_id, Backend::Evm { provider, pool, from_block, max_range });
         Ok(chain_id)
+    }
+
+    /// Teach a Solana pool the symbols its mints are known by. SPL mints carry
+    /// no on-chain symbol, so without this the UI would show raw addresses.
+    pub fn set_symbols(&mut self, chain_id: u64, symbols: BTreeMap<String, String>) {
+        if let Some(Backend::Solana(p)) = self.pools.get_mut(&chain_id) {
+            p.symbols = symbols;
+        }
     }
 
     /// The chainIds this API can report pool state for.
@@ -318,7 +362,12 @@ impl Swaps {
     /// max-swap USD value. `None` when the chain isn't configured or the RPC
     /// read fails (never propagates an error into the GraphQL response).
     pub async fn pools(&self, chain_id: u64) -> Option<Vec<PoolToken>> {
-        let (provider, pool_addr, from_block, max_range) = self.pools.get(&chain_id)?;
+        let (provider, pool_addr, from_block, max_range) = match self.pools.get(&chain_id)? {
+            Backend::Solana(sol) => return self.solana_pools(chain_id, sol).await,
+            Backend::Evm { provider, pool, from_block, max_range } => {
+                (provider, pool, from_block, max_range)
+            }
+        };
         let pool = SwapPool::new(*pool_addr, provider);
 
         let stable = pool.stable().call().await.ok()?;
@@ -356,6 +405,7 @@ impl Swaps {
                 .unwrap_or_default();
 
             out.push(PoolToken {
+                vault: None,
                 token: format!("{token:#x}"),
                 symbol,
                 decimals,
@@ -368,11 +418,96 @@ impl Swaps {
         Some(out)
     }
 
+    /// A recent blockhash for the Solana chain's pool, so the browser can build
+    /// a transaction. `None` for an EVM chain (a wallet supplies its own nonce).
+    pub async fn solana_blockhash(&self, chain_id: u64) -> Option<String> {
+        match self.pools.get(&chain_id)? {
+            Backend::Solana(sol) => sol.latest_blockhash().await.ok(),
+            Backend::Evm { .. } => None,
+        }
+    }
+
+    /// SPL balance of a token account on the Solana chain.
+    pub async fn solana_token_balance(&self, chain_id: u64, account: &str) -> Option<String> {
+        match self.pools.get(&chain_id)? {
+            Backend::Solana(sol) => sol.token_balance(account).await.ok(),
+            Backend::Evm { .. } => None,
+        }
+    }
+
+    /// Confirmation state of a Solana signature.
+    pub async fn solana_signature_status(&self, chain_id: u64, signature: &str) -> Option<String> {
+        match self.pools.get(&chain_id)? {
+            Backend::Solana(sol) => sol.signature_status(signature).await.ok(),
+            Backend::Evm { .. } => None,
+        }
+    }
+
+    /// The Solana view of [`pools`](Self::pools): one `getProgramAccounts` and
+    /// the shared layouts, with no log replay — the pool's state IS its
+    /// accounts, so there is no history to walk and no scan floor to get wrong.
+    async fn solana_pools(
+        &self,
+        chain_id: u64,
+        sol: &crate::solana_pool::SolanaPool,
+    ) -> Option<Vec<PoolToken>> {
+        let snap = sol
+            .snapshot()
+            .await
+            .inspect_err(|e| tracing::warn!(chain_id, error = %e, "solana pool read failed"))
+            .ok()?;
+        let mut out = Vec::with_capacity(snap.tokens.len());
+        for t in &snap.tokens {
+            let mint = crate::solana_pool::b58(&t.mint);
+            // Same USD figure the EVM branch reports: reserve priced at the
+            // token's own decimals. `usd_value` is the shared implementation.
+            let max_swap_usd = swap_math::usd_value(t.reserve, t.price, t.decimals)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "0".into());
+            out.push(PoolToken {
+                vault: Some(crate::solana_pool::b58(&t.vault)),
+                symbol: sol.symbol_of(&mint),
+                token: mint,
+                decimals: t.decimals,
+                price: t.price.to_string(),
+                reserve: t.reserve.to_string(),
+                max_swap_usd,
+                is_stable: t.mint == snap.pool.hub_mint,
+            });
+        }
+        Some(out)
+    }
+
+    /// The Solana view of [`quote`](Self::quote). Computed here rather than
+    /// asked of the chain — there is no view instruction — with the same
+    /// `swap-math` the program executes, so the two agree by construction.
+    async fn solana_quote(
+        &self,
+        sol: &crate::solana_pool::SolanaPool,
+        token_in: &str,
+        token_out: &str,
+        amount_in: &str,
+    ) -> Option<String> {
+        let mint_in = crate::solana_pool::from_b58(token_in)?;
+        let mint_out = crate::solana_pool::from_b58(token_out)?;
+        let amount: u64 = amount_in.trim().parse().ok()?;
+        let snap = sol.snapshot().await.ok()?;
+        let ti = snap.tokens.iter().find(|t| t.mint == mint_in)?;
+        let to = snap.tokens.iter().find(|t| t.mint == mint_out)?;
+        swap_math::amount_out(amount, ti.price, ti.decimals, to.price, to.decimals, snap.pool.fee_bps)
+            .map(|v| v.to_string())
+    }
+
     /// Pool metadata (address + stable) alongside the full token snapshot, so a
     /// UI can build swap/approve transactions against a discovered pool. `None`
     /// on the same conditions as [`pools`](Self::pools).
     pub async fn pool_info(&self, chain_id: u64) -> Option<PoolInfo> {
-        let (_, pool_addr, _, _) = self.pools.get(&chain_id)?;
+        // On Solana the "pool address" a UI sends its instruction to is the
+        // PROGRAM id; the pool account itself is a PDA the program derives.
+        let address = match self.pools.get(&chain_id)? {
+            Backend::Evm { pool, .. } => format!("{pool:#x}"),
+            Backend::Solana(sol) => sol.program.clone(),
+        };
         let tokens = self.pools(chain_id).await?;
         // The stable is the (only) token flagged is_stable; derive it from the
         // snapshot rather than re-reading `stable()` off-chain.
@@ -381,7 +516,7 @@ impl Swaps {
             .find(|t| t.is_stable)
             .map(|t| t.token.clone())
             .unwrap_or_default();
-        Some(PoolInfo { address: format!("{pool_addr:#x}"), stable, tokens })
+        Some(PoolInfo { address, stable, tokens })
     }
 
     /// On-chain `quote(tokenIn, tokenOut, amountIn)` — the pegged output for a
@@ -396,7 +531,12 @@ impl Swaps {
         token_out: &str,
         amount_in: &str,
     ) -> Option<String> {
-        let (provider, pool_addr, _, _) = self.pools.get(&chain_id)?;
+        let (provider, pool_addr) = match self.pools.get(&chain_id)? {
+            Backend::Solana(sol) => {
+                return self.solana_quote(sol, token_in, token_out, amount_in).await
+            }
+            Backend::Evm { provider, pool, .. } => (provider, pool),
+        };
         let ti = Address::from_str(token_in.trim()).ok()?;
         let to = Address::from_str(token_out.trim()).ok()?;
         let amt = U256::from_str(amount_in.trim()).ok()?;

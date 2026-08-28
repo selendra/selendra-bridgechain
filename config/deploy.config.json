@@ -90,10 +90,43 @@
         "symbol": "TST",
         "mint": null,
         "vault": null,
+        "swap_vault": null,
+        "seed_from": null,
+        "from_chains": "all",
+        "debridge_id": null
+      },
+      {
+        "symbol": "WRAP",
+        "mint": null,
+        "vault": null,
+        "swap_vault": null,
+        "seed_from": null,
         "from_chains": "all",
         "debridge_id": null
       }
-    ]
+    ],
+    "swap": {
+      "enabled": false,
+      "deploy": true,
+      "program_id": null,
+      "so_path": "crates/solana-swap/target/deploy/solana_swap.so",
+      "use_rpc": true,
+      "swap_admin_bin": "crates/solana-relayer/target/debug/swap-admin",
+      "fee_bps": 0,
+      "deviation_bps": 1000,
+      "min_price_interval": 3600,
+      "hub": "TST",
+      "list": [
+        {
+          "symbol": "WRAP",
+          "price": "3180"
+        }
+      ],
+      "seed": {
+        "TST": "1000000000000",
+        "WRAP": "300000000000"
+      }
+    }
   },
   "output": {
     "file": "config/deployments/local-anvil.json",

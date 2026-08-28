@@ -144,6 +144,8 @@ services:
       - "10143=https://testnet-rpc.monad.xyz/,0x9bF5F365ad707dE1126385b48Db9EB82227F4F45,57492788,100"
       - "--swap"
       - "46630=https://robinhood-sepolia-rpc.publicnode.com,0x9bF5F365ad707dE1126385b48Db9EB82227F4F45,108485587,500"
+      - "--swap"
+      - "7565164=https://solana-devnet.g.alchemy.com/v2/alch_0yxW5Nx78Hp-2dZ-iJBSq,E28r29Hyky3UqVBcdSvFk6qNedbRN8X2z4R8hYGDUk88"
     environment:
       SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"
       GRAPHQL_MAX_BLOCK_RANGE: "10"

@@ -18,5 +18,17 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
+# The Solana pool's account layouts and pricing — the SAME crate the on-chain
+# program links, so a quote served here cannot drift from what the program pays.
+# Reached over plain JSON-RPC (reqwest), not solana-client: that pins zeroize
+# <1.4 and alloy needs ^1.5, so the two cannot share a binary.
+swap-math = { workspace = true, features = ["pda"] }
+# The gate's account layouts, decoded off-chain. `default-features = false`
+# drops k256 — not because it conflicts here, but because this binary has no
+# business carrying signature recovery.
+bridge-solana = { workspace = true, default-features = false }
+reqwest = { workspace = true }
+base64 = "0.22"
+bs58 = "0.5"
 async-graphql = "7"
 async-graphql-axum = "7"
