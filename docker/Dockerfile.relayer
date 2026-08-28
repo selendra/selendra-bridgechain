@@ -1,0 +1,27 @@
+# The Solana leg's relayer, as its own image — because it cannot share one with
+# the EVM services: solana-client pins zeroize <1.4 and alloy needs ^1.5, so the
+# two dependency trees cannot coexist in a single binary (or a single cargo
+# workspace, which is why crates/solana-relayer is its own project).
+#
+# Build:  docker build -f docker/Dockerfile.relayer -t bridge-solana-relayer .
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release --manifest-path crates/solana-relayer/Cargo.toml \
+      --bin solana-relayer --bin gate-admin
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 curl tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 bridge \
+ && useradd  --system --uid 10001 --gid bridge --home-dir /data --create-home bridge
+
+COPY --from=builder /build/crates/solana-relayer/target/release/solana-relayer /usr/local/bin/solana-relayer
+COPY --from=builder /build/crates/solana-relayer/target/release/gate-admin     /usr/local/bin/gate-admin
+
+ENV RUST_LOG=info
+USER bridge
+WORKDIR /data
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["solana-relayer", "/configs/solana-relayer.toml"]

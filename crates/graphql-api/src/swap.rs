@@ -58,10 +58,19 @@ pub struct PoolInfo {
 /// `DynProvider` is an `Arc` internally); share freely across resolvers.
 #[derive(Clone)]
 pub struct Swaps {
-    /// chain_id -> (provider, pool address, first block worth scanning)
-    pools: BTreeMap<u64, (DynProvider, Address, u64)>,
-    /// Blocks per `eth_getLogs`. Hosted RPCs cap this and reject anything wider
-    /// (Alchemy's free tier: 10), so it must be configurable per deployment.
+    /// chain_id -> (provider, pool address, first block worth scanning,
+    /// blocks per `eth_getLogs` for THIS chain)
+    pools: BTreeMap<u64, (DynProvider, Address, u64, u64)>,
+    /// Default blocks per `eth_getLogs`, used by pools that do not carry their
+    /// own. Hosted RPCs cap this and reject anything wider (Alchemy's free tier:
+    /// 10), so it must be configurable per deployment.
+    ///
+    /// One global value is not enough for a mesh: the cap is a property of the
+    /// ENDPOINT, and the strictest one would then throttle every other chain.
+    /// That is fatal, not merely slow, on a fast chain — a pool on a 0.2s-block
+    /// chain produces blocks faster than a 10-block chunk size can replay them,
+    /// so its token list never finishes backfilling and the Swap view stays
+    /// empty forever. Hence the per-pool override in [`Swaps::add_spec`].
     max_range: u64,
     /// Memoised token-list state per chain, so each query scans only the blocks
     /// produced since the last one. Without this, every `swapPool` query
@@ -108,7 +117,7 @@ impl Swaps {
         }
     }
 
-    /// Register a pool from a `CHAINID=RPC,POOL[,FROM_BLOCK]` spec, e.g.
+    /// Register a pool from a `CHAINID=RPC,POOL[,FROM_BLOCK[,MAX_RANGE]]` spec, e.g.
     /// `1337=http://127.0.0.1:8545,0xPool...` or
     /// `11155111=https://…,0xPool…,11456300`. The HTTP provider is built eagerly
     /// (no network I/O yet); the first query is what hits the chain.
@@ -116,19 +125,33 @@ impl Swaps {
     /// `FROM_BLOCK` should be the pool's deployment height. It defaults to 0,
     /// which is correct for a local chain but must be set on a live one — see
     /// [`Swaps::listed_tokens`] for why scanning from genesis fails outright.
+    ///
+    /// `MAX_RANGE` is this endpoint's `eth_getLogs` cap; omit it to use the
+    /// global default.
     pub fn add_spec(&mut self, spec: &str) -> anyhow::Result<u64> {
         let (chain_id, rpc, rest) = split_spec(spec, "--swap")?;
-        let (pool_s, from_block) = match rest.split_once(',') {
-            Some((addr, blk)) => (
-                addr,
-                blk.trim()
+        let mut parts = rest.splitn(3, ',');
+        let pool_s = parts.next().unwrap_or(rest);
+        let from_block = match parts.next() {
+            Some(blk) => blk
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("bad FROM_BLOCK in --swap {spec:?}"))?,
+            None => 0,
+        };
+        let max_range = match parts.next() {
+            Some(r) => {
+                let r = r
+                    .trim()
                     .parse::<u64>()
-                    .with_context(|| format!("bad FROM_BLOCK in --swap {spec:?}"))?,
-            ),
-            None => (rest, 0u64),
+                    .with_context(|| format!("bad MAX_RANGE in --swap {spec:?}"))?;
+                anyhow::ensure!(r > 0, "MAX_RANGE must be > 0 in --swap {spec:?}");
+                r
+            }
+            None => self.max_range,
         };
         let (provider, pool) = provider_for(pool_s, rpc, &format!("--swap {spec:?}"))?;
-        self.pools.insert(chain_id, (provider, pool, from_block));
+        self.pools.insert(chain_id, (provider, pool, from_block, max_range));
         Ok(chain_id)
     }
 
@@ -157,6 +180,7 @@ impl Swaps {
         provider: &DynProvider,
         pool: Address,
         from_block: u64,
+        max_range: u64,
     ) -> anyhow::Result<Vec<Address>> {
         let tip = provider.get_block_number().await?;
 
@@ -195,7 +219,7 @@ impl Swaps {
                 break;
             }
             chunks += 1;
-            let end = core::cmp::min(start.saturating_add(self.max_range - 1), tip);
+            let end = core::cmp::min(start.saturating_add(max_range - 1), tip);
             let listed_f = Filter::new()
                 .address(pool)
                 .event_signature(SwapPool::TokenListed::SIGNATURE_HASH)
@@ -294,12 +318,12 @@ impl Swaps {
     /// max-swap USD value. `None` when the chain isn't configured or the RPC
     /// read fails (never propagates an error into the GraphQL response).
     pub async fn pools(&self, chain_id: u64) -> Option<Vec<PoolToken>> {
-        let (provider, pool_addr, from_block) = self.pools.get(&chain_id)?;
+        let (provider, pool_addr, from_block, max_range) = self.pools.get(&chain_id)?;
         let pool = SwapPool::new(*pool_addr, provider);
 
         let stable = pool.stable().call().await.ok()?;
         let tokens = self
-            .listed_tokens(chain_id, provider, *pool_addr, *from_block)
+            .listed_tokens(chain_id, provider, *pool_addr, *from_block, *max_range)
             .await
             .inspect_err(|e| tracing::warn!(chain_id, error = %e, "pool token scan failed"))
             .ok()?;
@@ -348,7 +372,7 @@ impl Swaps {
     /// UI can build swap/approve transactions against a discovered pool. `None`
     /// on the same conditions as [`pools`](Self::pools).
     pub async fn pool_info(&self, chain_id: u64) -> Option<PoolInfo> {
-        let (_, pool_addr, _) = self.pools.get(&chain_id)?;
+        let (_, pool_addr, _, _) = self.pools.get(&chain_id)?;
         let tokens = self.pools(chain_id).await?;
         // The stable is the (only) token flagged is_stable; derive it from the
         // snapshot rather than re-reading `stable()` off-chain.
@@ -372,7 +396,7 @@ impl Swaps {
         token_out: &str,
         amount_in: &str,
     ) -> Option<String> {
-        let (provider, pool_addr, _) = self.pools.get(&chain_id)?;
+        let (provider, pool_addr, _, _) = self.pools.get(&chain_id)?;
         let ti = Address::from_str(token_in.trim()).ok()?;
         let to = Address::from_str(token_out.trim()).ok()?;
         let amt = U256::from_str(amount_in.trim()).ok()?;

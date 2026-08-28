@@ -6,6 +6,7 @@
 #   bash scripts/bridge-from-json.sh [config.json] --generate-only  # just write the TOMLs
 #   bash scripts/bridge-from-json.sh [config.json] --stop           # tear the stack down
 #   bash scripts/bridge-from-json.sh [config.json] --status         # what is alive
+#   bash scripts/bridge-from-json.sh [config.json] --compose        # emit a docker stack
 #
 # Default config: config/bridge.config.json (field reference: config/README.md).
 # Every chain listed bridges to every other one (full mesh, both directions);
@@ -23,6 +24,7 @@ MODE=start
 for arg in "$@"; do
   case "$arg" in
     --generate-only) MODE=generate ;;
+    --compose)       MODE=compose ;;
     --stop)          MODE=stop ;;
     --status)        MODE=status ;;
     -h|--help)       sed -n '2,18p' "$0"; exit 0 ;;
@@ -97,6 +99,8 @@ fi
 # ---------------------------------------------------------------------------
 # validate
 # ---------------------------------------------------------------------------
+rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
 say "validating $CONFIG"
 # per-chain field with fallback to .defaults
 cf() { # $1 chain_id, $2 field
@@ -130,7 +134,7 @@ emit_signer() { # $1 jq path
 }
 
 THRESHOLD="$(j '.threshold')"
-mapfile -t CHAIN_IDS < <(j '.chains[].chain_id')
+mapfile -t CHAIN_IDS < <(j '.chains[] | select(.enabled != false) | .chain_id')
 (( ${#CHAIN_IDS[@]} >= 1 )) || die ".chains is empty"
 (( ${#CHAIN_IDS[@]} >= 2 )) || warn "only one chain configured — nothing to bridge to"
 [[ "$(printf '%s\n' "${CHAIN_IDS[@]}" | sort | uniq -d)" == "" ]] || die "duplicate chain_id in .chains"
@@ -202,12 +206,24 @@ DATABASE_URL="$(jr '.database.url')"
 
 export RUST_LOG="$LOG_LEVEL"
 export DATABASE_URL
-mkdir -p "$RUN_DIR"
+
+# Where the generated TOMLs LAND (CFG_DIR) is not the same question as what the
+# paths INSIDE them point at (STATE_DIR, KEYS_DIR) — under compose the files are
+# written on the host and read from inside a container.
+CFG_DIR="$RUN_DIR"; STATE_DIR="$RUN_DIR"; KEYS_DIR=""
+if [[ "$MODE" == "compose" ]]; then
+  COMPOSE_DIR="$ROOT/docker/$NAME"
+  CFG_DIR="$COMPOSE_DIR/configs"; STATE_DIR="/data"; KEYS_DIR="/keys"
+  STORE_URL="http://sig-store:8080"
+  # The password stays in the compose .env, never in a generated config.
+  DATABASE_URL="postgres://$(j '.database.docker.user'):\${POSTGRES_PASSWORD}@postgres:5432/$(j '.database.docker.db')"
+fi
+mkdir -p "$CFG_DIR"
 
 # ---------------------------------------------------------------------------
 # generate configs
 # ---------------------------------------------------------------------------
-say "generating configs in $RUN_DIR"
+say "generating configs in $CFG_DIR"
 
 REFUND_ON="$(j '.refund.enabled')"
 mapfile -t REFUND_DESTS < <(select_chains '.refund.destinations' destination)
@@ -217,7 +233,7 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
   vpath=".validators[] | select(.enabled != false)"
   vname="$(jq -r "[$vpath] | .[$idx].name" "$CONFIG")"
   vjson=".validators[] | select(.name == \"$vname\")"
-  cfg="$RUN_DIR/validator-$vname.toml"
+  cfg="$CFG_DIR/validator-$vname.toml"
   {
     for cid in $(select_chains "$(printf '(%s).sources' "$vjson")" source); do
       rpcs="$(jq -c ".chains[] | select(.chain_id == $cid) | .rpcs" "$CONFIG")"
@@ -230,7 +246,7 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo "allow_zero_confirmation = $(cbool "$cid" allow_zero_confirmation)"
       echo "poll_interval_ms = $(cf "$cid" poll_interval_ms)"
       echo "max_block_range = $(cf "$cid" max_block_range)"
-      echo "state_file = \"$RUN_DIR/validator-$vname-$cid.json\""
+      echo "state_file = \"$STATE_DIR/validator-$vname-$cid.json\""
       echo
     done
     echo "[signer]"
@@ -273,7 +289,7 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
   kname="$(jq -r "[.keepers[] | select(.enabled != false)] | .[$idx].name" "$CONFIG")"
   kjson=".keepers[] | select(.name == \"$kname\")"
   poll="$(jq -r "($kjson).poll_interval_ms // 1000" "$CONFIG")"
-  cfg="$RUN_DIR/keeper-$kname.toml"
+  cfg="$CFG_DIR/keeper-$kname.toml"
   {
     for cid in $(select_chains "$(printf '(%s).targets' "$kjson")" destination); do
       echo "[[targets]]"
@@ -311,7 +327,7 @@ if [[ "$SOLANA_ON" == "true" ]]; then
   for idx in $(j '[.solana.relayers[] | select(.enabled != false)] | to_entries[].key'); do
     rname="$(jq -r "[.solana.relayers[] | select(.enabled != false)] | .[$idx].name" "$CONFIG")"
     rjson=".solana.relayers[] | select(.name == \"$rname\")"
-    cfg="$RUN_DIR/solana-relayer-$rname.toml"
+    cfg="$CFG_DIR/solana-relayer-$rname.toml"
     {
       echo "[source]"
       echo "chain_id = $SOL_CHAIN_ID"
@@ -323,7 +339,7 @@ if [[ "$SOLANA_ON" == "true" ]]; then
       echo "max_batch = $(j '.solana.max_batch')"
       # Its own cursor file: two relayers sharing one would resume from each
       # other's position and skip signatures neither has signed.
-      echo "state_file = \"$RUN_DIR/solana-relayer-$rname-state.json\""
+      echo "state_file = \"$STATE_DIR/solana-relayer-$rname-state.json\""
       echo
       echo "[signer]"
       # secp256k1, and the SAME key this validator uses on the EVM side: one
@@ -342,7 +358,8 @@ if [[ "$SOLANA_ON" == "true" ]]; then
         # The claim-submitting half (EVM -> Solana). Absent => this process only
         # SIGNS, which is a valid split: a validator need not be a keeper.
         kp="$(jq -r "($rjson).payer_keypair" "$CONFIG")"
-        [[ "$kp" = /* ]] || kp="$ROOT/$kp"
+        if [[ -n "$KEYS_DIR" ]]; then kp="$KEYS_DIR/$(basename "$kp")"
+        elif [[ "$kp" != /* ]]; then kp="$ROOT/$kp"; fi
         echo
         echo "[target]"
         echo "payer_keypair = \"$kp\""
@@ -356,9 +373,11 @@ fi
 
 IDX_CFG=""
 if [[ "$(j '.indexer.enabled')" == "true" ]]; then
-  IDX_CFG="$RUN_DIR/indexer.toml"
+  IDX_CFG="$CFG_DIR/indexer.toml"
   {
-    echo "database_url = \"$DATABASE_URL\""
+    # `database_url` in the file beats the DATABASE_URL env var, so under compose
+    # it is omitted deliberately: the credential belongs in the environment.
+    [[ "$MODE" == "compose" ]] || echo "database_url = \"$DATABASE_URL\""
     echo "refund_timeout_secs = $(j '.indexer.refund_timeout_secs')"
     echo "sweep_interval_secs = $(j '.indexer.sweep_interval_secs')"
     for cid in $(select_chains '.indexer.chains' source); do
@@ -380,8 +399,8 @@ if [[ "$(j '.indexer.enabled')" == "true" ]]; then
 fi
 
 # registry the graphql API serves to the UI
-REG_JSON="$RUN_DIR/chains.json"
-jq '[ .chains[] | {chain_id, name, rpc_url: .rpcs[0], gate,
+REG_JSON="$CFG_DIR/chains.json"
+jq '[ .chains[] | select(.enabled != false) | {chain_id, name, rpc_url: .rpcs[0], gate,
                    token: ((.tokens // [])[0].address // null),
                    tokens: (.tokens // []),
                    router} ]' "$CONFIG" > "$REG_JSON"
@@ -396,6 +415,176 @@ if [[ "$SOLANA_ON" == "true" && "$(j '.solana.include_in_registry')" == "true" ]
            router: null }]' "$REG_JSON" > "$tmp" && mv "$tmp" "$REG_JSON"
 fi
 info "registry -> $REG_JSON"
+
+if [[ "$MODE" == "compose" ]]; then
+  say "writing the docker stack to $COMPOSE_DIR"
+  yml="$COMPOSE_DIR/docker-compose.yml"
+
+  # The relayer's payer keypair is typically 0600 and owned by the operator,
+  # while the container runs as an unprivileged uid of its own — a direct bind
+  # mount is unreadable to it. Stage a copy the container CAN read, and protect
+  # it with the directory instead: 0700 here blocks other host users, and a bind
+  # mount is resolved by the daemon, so the container still reads the file.
+  # (The same reasoning covers configs/, which hold validator private keys.)
+  chmod 700 "$COMPOSE_DIR"
+  if (( ${#SOL_FILES[@]} )); then
+    # 0755 on the directory itself: a DIRECTORY bind mount keeps its own mode
+    # inside the container, so 0700 here would stop the container uid at the
+    # traversal even with a readable file inside. Other host users are still
+    # blocked — they cannot traverse the 0700 stack directory above it.
+    mkdir -p "$COMPOSE_DIR/keys"; chmod 755 "$COMPOSE_DIR/keys"
+    for kp in $(j '.solana.relayers[] | select(.enabled != false and .deliver == true) | .payer_keypair // empty'); do
+      [[ "$kp" = /* ]] || kp="$ROOT/$kp"
+      install -m 0644 "$kp" "$COMPOSE_DIR/keys/$(basename "$kp")"
+      info "staged $(basename "$kp") -> keys/ (readable by the container uid)"
+    done
+  fi
+  # Every service is built from the repo root, so the context is two levels up.
+  CTX="../.."
+
+  svc_deps=""    # accumulated depends_on for graphql (it must not start first)
+  {
+    printf '# GENERATED by scripts/bridge-from-json.sh --compose from %s\n' "$(basename "$CONFIG")"
+    printf '# Regenerate after any config change; hand edits are overwritten.\n#\n'
+    printf '#   cp .env.example .env && edit it   (tokens + Postgres password)\n'
+    printf '#   docker compose up -d --build\n#\n'
+    printf '# The configs in ./configs are generated too, and they carry the validator\n'
+    printf '# and keeper PRIVATE KEYS — treat this directory as secret material.\n\n'
+    printf 'x-restart: &restart\n  restart: unless-stopped\n\nservices:\n'
+
+    # --- postgres ---
+    printf '  postgres:\n    image: %s\n    <<: *restart\n' "$(j '.database.docker.image')"
+    printf '    environment:\n'
+    printf '      POSTGRES_USER: %s\n' "$(j '.database.docker.user')"
+    printf '      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"\n'
+    printf '      POSTGRES_DB: %s\n' "$(j '.database.docker.db')"
+    printf '    volumes: ["pgdata:/var/lib/postgresql/data"]\n'
+    printf '    healthcheck:\n      test: ["CMD-SHELL", "pg_isready -U %s -d %s"]\n' \
+      "$(j '.database.docker.user')" "$(j '.database.docker.db')"
+    printf '      interval: 3s\n      timeout: 3s\n      retries: 30\n\n'
+
+    # --- sig-store ---
+    printf '  sig-store:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$CTX"
+    printf '    command: ["sig-store", "--bind", "0.0.0.0:8080"]\n    environment:\n'
+    printf '      DATABASE_URL: "%s"\n' "$DATABASE_URL"
+    for role in VALIDATOR KEEPER READER ADMIN; do
+      printf '      SIG_STORE_%s_TOKEN: "${SIG_STORE_%s_TOKEN:?set SIG_STORE_%s_TOKEN}"\n' "$role" "$role" "$role"
+    done
+    printf '    depends_on:\n      postgres: { condition: service_healthy }\n'
+    printf '    healthcheck:\n      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]\n'
+    printf '      interval: 5s\n      timeout: 3s\n      retries: 30\n\n'
+
+    # --- validators ---
+    for n in "${VAL_NAMES[@]}"; do
+      printf '  validator-%s:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$n" "$CTX"
+      printf '    command: ["validator", "/configs/validator-%s.toml"]\n' "$n"
+      printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"\n'
+      # Its own volume: the cursor file is per validator, and sharing one would
+      # make each resume from the other's position.
+      printf '    volumes:\n      - ./configs:/configs:ro\n      - validator-%s-state:/data\n' "$n"
+      printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
+    done
+
+    # --- keepers ---
+    for n in "${KEEP_NAMES[@]}"; do
+      printf '  keeper-%s:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$n" "$CTX"
+      printf '    command: ["keeper", "/configs/keeper-%s.toml"]\n' "$n"
+      printf '    environment:\n      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN}"\n'
+      printf '    volumes: ["./configs:/configs:ro"]\n'
+      printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
+    done
+
+    # --- solana relayers ---
+    for i in "${!SOL_NAMES[@]}"; do
+      n="${SOL_NAMES[$i]}"
+      printf '  solana-relayer-%s:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$n" "$CTX"
+      printf '    command: ["solana-relayer", "/configs/solana-relayer-%s.toml"]\n' "$n"
+      printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"\n'
+      printf '    volumes:\n      - ./configs:/configs:ro\n      - ./keys:/keys:ro\n      - solana-%s-state:/data\n' "$n"
+      printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
+    done
+
+    # --- indexer ---
+    if [[ -n "$IDX_CFG" ]]; then
+      printf '  indexer:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$CTX"
+      printf '    command: ["indexer", "/configs/indexer.toml"]\n'
+      printf '    environment:\n      DATABASE_URL: "%s"\n' "$DATABASE_URL"
+      printf '    volumes: ["./configs:/configs:ro"]\n'
+      # Behind sig-store, not just postgres: both run the same idempotent
+      # migration, and two simultaneous first-creates race on pg_type.
+      printf '    depends_on:\n      sig-store: { condition: service_healthy }\n      postgres: { condition: service_healthy }\n\n'
+    fi
+
+    # --- graphql-api ---
+    printf '  graphql-api:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$CTX"
+    printf '    command:\n'
+    printf '      - "graphql-api"\n      - "--bind"\n      - "0.0.0.0:8088"\n'
+    printf '      - "--store-url"\n      - "http://sig-store:8080"\n'
+    printf '      - "--threshold"\n      - "%s"\n' "$THRESHOLD"
+    printf '      - "--chains-file"\n      - "/configs/chains.json"\n'
+    [[ "$(j '.graphql.allow_mutations')" == "true" ]] && printf '      - "--allow-mutations"\n'
+    for cid in "${CHAIN_IDS[@]}"; do
+      printf '      - "--gate"\n      - "%s=%s,%s"\n' "$cid" \
+        "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")" "$(cf "$cid" gate)"
+    done
+    for scid in $(j '.graphql.swaps[]?.chain_id'); do
+      printf '      - "--swap"\n      - "%s=%s,%s,%s,%s"\n' "$scid" \
+        "$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG")" \
+        "$(j ".graphql.swaps[] | select(.chain_id == $scid) | .pool")" \
+        "$(j ".graphql.swaps[] | select(.chain_id == $scid) | .from_block")" \
+        "$(cf "$scid" max_block_range)"
+    done
+    # Read-only credential, and its only one: this is the service that faces the
+    # internet, so it holds nothing that can write and no database URL at all.
+    printf '    environment:\n      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"\n'
+    printf '      GRAPHQL_MAX_BLOCK_RANGE: "%s"\n' "$(j '.defaults.max_block_range')"
+    printf '    volumes: ["./configs:/configs:ro"]\n'
+    printf '    depends_on:\n      sig-store: { condition: service_healthy }\n'
+    printf '    healthcheck:\n      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]\n'
+    printf '      interval: 5s\n      timeout: 3s\n      retries: 30\n\n'
+
+    # --- frontend ---
+    if [[ "$(j '.frontend.enabled // false')" == "true" ]]; then
+      printf '  frontend:\n    build: { context: %s, dockerfile: docker/Dockerfile.frontend }\n    <<: *restart\n' "$CTX"
+      # nginx proxies /graphql and /health to graphql-api, so the browser talks
+      # to the API same-origin and no API port needs publishing.
+      printf '    ports: ["%s:8080"]\n' "$(j '.frontend.port')"
+      printf '    depends_on:\n      graphql-api: { condition: service_healthy }\n\n'
+    fi
+
+    printf 'volumes:\n  pgdata:\n'
+    for n in "${VAL_NAMES[@]}"; do printf '  validator-%s-state:\n' "$n"; done
+    for n in "${SOL_NAMES[@]}"; do printf '  solana-%s-state:\n' "$n"; done
+  } > "$yml"
+
+  # Two files on purpose. `.env` carries REAL generated secrets and is gitignored;
+  # `.env.example` is the committable template and holds none, so a checked-in
+  # example can never become the credentials someone actually runs with.
+  {
+    echo "# Template. Every value must be a fresh random secret:"
+    echo "#   openssl rand -hex 32"
+    echo "# One token per role, so a leak from one component cannot act as another."
+    echo "POSTGRES_PASSWORD="
+    for role in VALIDATOR KEEPER READER ADMIN; do echo "SIG_STORE_${role}_TOKEN="; done
+  } > "$COMPOSE_DIR/.env.example"
+  if [[ -f "$COMPOSE_DIR/.env" ]]; then
+    info "secrets      : $COMPOSE_DIR/.env kept (existing values left alone)"
+  else
+    umask 077
+    {
+      echo "# Generated $(basename "$0") secrets — gitignored, do not commit."
+      echo "POSTGRES_PASSWORD=$(rand_token)"
+      for role in VALIDATOR KEEPER READER ADMIN; do echo "SIG_STORE_${role}_TOKEN=$(rand_token)"; done
+    } > "$COMPOSE_DIR/.env"
+    info "secrets      : $COMPOSE_DIR/.env written (fresh random values)"
+  fi
+
+  info "compose file : $yml"
+  info "configs      : $CFG_DIR ($(ls "$CFG_DIR" | wc -l) files, they hold PRIVATE KEYS)"
+  echo
+  info "  cd $COMPOSE_DIR && docker compose up -d --build"
+  exit 0
+fi
 
 [[ "$MODE" == "generate" ]] && { say "generated (not started)"; exit 0; }
 
@@ -448,7 +637,6 @@ fi
 # signatures, claim status and the allowlist all become writable by anything that
 # can reach the port. One token per role, so a leak from one component cannot act
 # as another.
-rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 gen_if_unset="$(j '.sig_store.tokens.generate_if_unset')"
 for role in VALIDATOR KEEPER READER ADMIN; do
   lower="$(tr 'A-Z' 'a-z' <<<"$role")"
@@ -517,7 +705,18 @@ if [[ "$(j '.graphql.enabled')" == "true" ]]; then
   for cid in "${CHAIN_IDS[@]}"; do
     args+=(--gate "$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG"),$(cf "$cid" gate)")
   done
-  if [[ "$(j '.graphql.swap.enabled')" == "true" ]]; then
+  # One --swap per pool: `swaps` is the multi-chain form, `swap` the single-pool
+  # one kept for existing configs.
+  for scid in $(j '.graphql.swaps[]?.chain_id'); do
+    sp="$(j ".graphql.swaps[] | select(.chain_id == $scid) | .pool")"
+    sfb="$(j ".graphql.swaps[] | select(.chain_id == $scid) | .from_block")"
+    # That chain's own getLogs cap, not the global one: a fast chain throttled to
+    # another endpoint's cap produces blocks faster than its pool's listing
+    # history can be replayed, and the Swap view never fills.
+    srange="$(cf "$scid" max_block_range)"
+    args+=(--swap "$scid=$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG"),$sp,$sfb,${srange:-10}")
+  done
+  if [[ "$(j '.graphql.swap.enabled // false')" == "true" ]]; then
     scid="$(j '.graphql.swap.chain_id')"
     args+=(--swap "$scid=$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG"),$(j '.graphql.swap.pool'),$(j '.graphql.swap.from_block')")
   fi

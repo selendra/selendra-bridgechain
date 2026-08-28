@@ -44,12 +44,13 @@ transaction. `--no-config-update` skips patching the runtime config.
 | `gate.bridge_domain` | the mesh-generation binding, `0x` + 64 hex. Every gate in one generation shares it; a **new** deployment needs a **new** one, or the previous deployment's validator signatures replay against the fresh gates. `"auto"` derives one (local only) |
 | `gate.guardian` | pause button, low trust, must differ from the owner (production) |
 | `gate.owner` | multisig that receives ownership via two-step transfer (production) |
-| `chains[]` | `chain_id`, `name`, `rpc_url`; `deploy_gate: false` + `gate` reuses an existing one. The RPC's reported chain id is verified before anything is sent |
+| `chains[]` | `chain_id`, `name`, `rpc_url`; `deploy_gate: false` + `gate` reuses an existing one. The RPC's reported chain id is verified before anything is sent. `"enabled": false` parks a chain in the config — assets and pools that name it are skipped, so an unfunded chain can wait there instead of being deleted and re-added |
 | `assets[].symbol/name/decimals` | the bridgeable asset |
 | `assets[].deployments[]` | `chain_id` + `address`; `"auto"` deploys a fresh `TestToken` (local only). An existing address must have contract code on that chain |
 | `assets[].register_corridors` | wire the asset full-mesh with `setLocalToken` |
 | `assets[].test_liquidity` | mint whole-token amounts to the deployer and the gate (local only) |
-| `swap` | optional same-chain `SwapPool` for the Swap view (`deploy: true` is local only — `DeploySwap` mints unrestricted test tokens) |
+| `swap.pools[]` | one `SwapPool` per chain over the assets this config already deploys, so every bridged token is also swappable where it lands. `stable` names the pricing hub (listed at 1.0 by construction), `list[]` the tokens quoted against it (`price` in whole hub units), `seed` the reserves to fund, `mint_seed` whether to mint them first (test tokens only). A pool with no reserve of the OUT token quotes fine and then reverts on the swap |
+| `swap.deploy` | the alternative shape: the demo `DeploySwap` script, which brings its own unrestricted-mint tokens. Local bring-up only |
 | `solana` | the Solana leg — see below; `enabled: false` skips it entirely |
 | `output.file` | where the produced addresses are written. Gitignored: the record repeats the RPC URLs it used, and a hosted endpoint's URL is a credential |
 | `output.update_bridge_config` | runtime config to patch with gate/token/pool addresses and each chain's deploy block; `null` to skip |
@@ -112,7 +113,7 @@ them).
 | field | meaning |
 | --- | --- |
 | `threshold` | signatures a claim needs; must match the deployed gates |
-| `runtime.run_dir` | generated configs, logs, pid file, validator cursors |
+| `runtime.run_dir` | generated configs, logs, pid file, validator cursors. Keep it OUT of `/tmp` for anything long-running: `systemd-tmpfiles-clean` sweeps `/tmp` daily, and losing a validator's cursor means it restarts from `start_block` — on a live chain that is a backlog it may take hours to crawl back through |
 | `runtime.bin_dir` | where the compiled services are (`target/debug`, `target/release`, …) |
 | `runtime.build` | `cargo build` the services first |
 | `database.url` | Postgres for the sig-store + indexer |
@@ -124,14 +125,16 @@ them).
 | `chains[].source` / `.destination` | which roles this chain plays. Both `true` = full mesh, which is the normal case |
 | `chains[].start_block` | scan floor. `0` re-scans a live chain's entire history; the deploy script sets each chain's deploy block for you |
 | `chains[].block_confirmation` | finality buffer — **security critical**. Signing an event at the chain tip lets a reorg erase the deposit *after* the destination paid out. It must exceed the chain's reorg depth. `0` is refused unless `allow_zero_confirmation` is set, which is only safe on an instant-final dev chain (anvil) |
-| `chains[].pool` / `.router` | SwapPool / SwapRouter to index, if any |
+| `chains[].enabled` | `false` parks a chain: it is not scanned, not served to the UI, and not counted anywhere |
+| `chains[].pool` / `.router` | SwapPool / SwapRouter to index, if any (the deploy script fills `pool` in) |
 | `chains[].tokens[]` | symbol + address, served to the UI; `tokens[0]` is the chain's primary |
 | `validators[]` | one entry per validator process: `name`, `signer` (same custody options as the deployer), `sources` (`"all"` or a chain-id list), optional operator `api` |
 | `refund` | the two-phase refund attestation loop. Disabled ⇒ no validator votes on cancels and stranded transfers stay stranded — the safe default, since a node that cannot read the destination must not have an opinion on delivery. Its own `block_confirmation` guards the destination read |
-| `keepers[]` | `name`, `signer`, `targets` (claims), `refund_sources` (refunds pay out where the funds were locked). Split into two keeper entries — one with only `targets`, one with only `refund_sources` — when you don't want both loops sharing an account's nonce |
+| `keepers[]` | `name`, `signer`, `targets` (claims), `refund_sources` (refunds pay out where the funds were locked). The keeper pays gas on **every** chain it targets, so fund its account on each one — a new chain in the mesh is a new chain the keeper needs native balance on, and without it claims simply never land. Split into two keeper entries — one with only `targets`, one with only `refund_sources` — when you don't want both loops sharing an account's nonce |
 | `solana` | the Solana relayers — see below; `enabled: false` skips them |
 | `indexer` | history + refund eligibility sweep; the only writer of `refund_status`. EVM chains only — it speaks EVM JSON-RPC, so a transfer **delivered on Solana** is recorded as `stuck` / `refund_status: eligible` forever: the `Sent` is on an EVM chain it watches, the `Claimed` is not. Nothing acts on that nomination (an EVM validator never attests for a destination outside its `refund.destinations`, and the relayer re-reads the Solana gate before attesting), but the UI will show those transfers as stuck |
 | `frontend` | the vite dev server for the UI. It reaches the API through vite's proxy (`VITE_PROXY_TARGET`), so the API needs no CORS and no public port. `node_bin` pins a toolchain when node is not on PATH — an nvm install usually isn't; leave it `null` to auto-detect the newest one |
+| `graphql.swaps[]` | one entry per pool (`chain_id`, `pool`, `from_block`), so a multi-chain mesh serves a Swap view on every chain. Each is passed to the API with that chain's own `max_block_range`: the `eth_getLogs` cap is a property of the endpoint, and on a fast chain the strictest cap in the mesh is not merely slow but fatal — a pool on 0.2s blocks produces them faster than a 10-block chunk can replay, so its token list never finishes backfilling. `graphql.swap` is the older single-pool form and still works |
 | `graphql` | the read API the frontend talks to. It holds no database credential — it reads history through the sig-store on its reader token, because it is the only service meant to face the internet |
 
 
@@ -177,3 +180,39 @@ services log a warning at startup). The sig-store tokens accept the same
 treatment via the environment. The shipped local configs use the well-known
 public anvil keys on purpose: they are worthless, and they must never appear in
 anything that touches a real network.
+
+## docker
+
+`bash scripts/bridge-from-json.sh <config> --compose` writes a complete stack to
+`docker/<name>/` from the same JSON: one generated TOML per process in
+`configs/`, a `docker-compose.yml` wiring postgres → sig-store → validators →
+keepers → relayers → indexer → graphql-api → frontend with health-gated
+ordering, a gitignored `.env` holding freshly generated secrets, and a
+committable `.env.example` holding none.
+
+```bash
+bash scripts/bridge-from-json.sh config/my.bridge.json --compose
+cd docker/my-mesh && docker compose up -d --build
+```
+
+Re-running keeps an existing `.env`, so regenerating after a config change does
+not rotate the Postgres password out from under a live volume.
+
+What differs from the host-run form, and why:
+
+- endpoints become service names (`http://sig-store:8080`, `postgres:5432`);
+- cursors and keypairs move to mounted paths (`/data`, `/keys`), each validator
+  and relayer getting **its own** state volume — a shared one would make each
+  resume from the other's position;
+- the indexer's `database_url` is left out of its config file on purpose. The
+  file value beats the `DATABASE_URL` environment variable, and the credential
+  belongs in the environment, not in a generated file;
+- the Solana relayer gets its own image (`docker/Dockerfile.relayer`), because
+  `solana-client` pins `zeroize <1.4` and alloy needs `^1.5` — the two cannot
+  share a binary;
+- only the frontend publishes a port. nginx proxies `/graphql` and `/health` to
+  the API, so the browser talks to it same-origin and the API needs no public
+  port and no CORS.
+
+The generated `configs/` hold validator and keeper **private keys**. The
+directory is gitignored; treat it as secret material.

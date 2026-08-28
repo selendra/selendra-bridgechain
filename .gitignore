@@ -86,3 +86,8 @@ heap_info.json
 config/*.local.json
 # Deploy records: generated, and they carry the RPC URLs (API keys) they used.
 config/deployments/*.json
+
+# Generated docker stacks: the configs inside carry validator/keeper keys.
+docker/*/configs/
+docker/*/.env
+docker/*/keys/

@@ -123,11 +123,18 @@ else
   die "no deployer key: set deployer.keystore (preferred), deployer.private_key_env, or deployer.private_key"
 fi
 
+mapfile -t CHAIN_IDS < <(j '.chains[] | select(.enabled != false) | .chain_id')
+(( ${#CHAIN_IDS[@]} >= 1 )) || die "no enabled chains in .chains"
+# `join` on numbers is a jq type error, and an `&&` tail here would be the
+# script's exit status under `set -e` when nothing is skipped.
+skipped="$(j '[.chains[] | select(.enabled == false) | .chain_id | tostring] | join(", ")')"
+if [[ -n "$skipped" ]]; then warn "skipping disabled chain(s): $skipped"; fi
+
 say "deploy plan: $NAME (profile=$PROFILE)"
 info "deployer : $DEPLOYER_ADDR"
 info "gate     : ${#VALIDATORS[@]} validators, threshold $THRESHOLD"
 info "domain   : $BRIDGE_DOMAIN"
-info "chains   : $(j '[.chains[].chain_id] | join(", ")')"
+info "chains   : $(IFS=,; echo "${CHAIN_IDS[*]}")"
 info "assets   : $(j '[.assets[]?.symbol] | join(", ") | if . == "" then "none" else . end')"
 $DRY_RUN && { echo; info "--dry-run: nothing was sent"; exit 0; }
 
@@ -147,7 +154,6 @@ say "building contracts"
 
 # --- chains: verify RPC, record floor block, deploy gates -------------------
 declare -A GATE IMPL FLOOR RPC CNAME
-mapfile -t CHAIN_IDS < <(j '.chains[].chain_id')
 for cid in "${CHAIN_IDS[@]}"; do
   RPC[$cid]="$(j ".chains[] | select(.chain_id == $cid) | .rpc_url")"
   CNAME[$cid]="$(j ".chains[] | select(.chain_id == $cid) | .name")"
@@ -204,7 +210,11 @@ if (( ${#SYMS[@]} )); then
   for sym in "${SYMS[@]}"; do
     tname="$(j ".assets[] | select(.symbol == \"$sym\") | .name")"
     for cid in $(j ".assets[] | select(.symbol == \"$sym\") | .deployments[].chain_id"); do
-      [[ -n "${RPC[$cid]:-}" ]] || die "asset $sym lists chain $cid, which is not in .chains"
+      if [[ -z "${RPC[$cid]:-}" ]]; then
+        jq -e --argjson c "$cid" '[.chains[] | select(.chain_id == $c and .enabled == false)] | length > 0' "$CONFIG" >/dev/null \
+          && { info "$sym on chain $cid skipped (chain disabled)"; continue; }
+        die "asset $sym lists chain $cid, which is not in .chains"
+      fi
       addr="$(j ".assets[] | select(.symbol == \"$sym\") | .deployments[] | select(.chain_id == $cid) | .address")"
       if [[ "$addr" == "auto" ]]; then
         addr="$(fc src/TestToken.sol:TestToken "${RPC[$cid]}" --constructor-args "$tname" "$sym")"
@@ -274,9 +284,81 @@ for sym in "${SYMS[@]:-}"; do
   done
 done
 
-# --- optional same-chain SwapPool ------------------------------------------
-SWAP_POOL="$(jr '.swap.pool')"; SWAP_CHAIN="$(jr '.swap.chain_id')"; SWAP_JSON='null'
-if [[ "$(j '.swap.enabled')" == "true" ]]; then
+# --- SwapPools ---------------------------------------------------------------
+#
+# Two shapes, because they answer different questions:
+#
+#   pools[]  ONE pool per chain over the assets this config already deploys, so
+#            every bridged token is also swappable on the chain it lands on. The
+#            pool's `stable` is its pricing hub (priced at 1.0 by construction);
+#            everything else is listed against it.
+#   deploy   the demo script (contracts/script/DeploySwap.s.sol), which brings its
+#            own unrestricted-mint tokens. Local bring-up only.
+SWAP_POOL=""; SWAP_JSON='null'; SWAP_POOLS='[]'
+DEV_BPS="$(jr '.swap.deviation_bps')"; DEV_BPS="${DEV_BPS:-1000}"
+if [[ "$(j '.swap.enabled')" == "true" ]] && [[ "$(j '[.swap.pools[]?] | length')" != "0" ]]; then
+  say "deploying SwapPools (one per chain, over the bridged assets)"
+  for cid in $(j '.swap.pools[].chain_id'); do
+    if [[ -z "${RPC[$cid]:-}" ]]; then
+      jq -e --argjson c "$cid" '[.chains[] | select(.chain_id == $c and .enabled == false)] | length > 0' "$CONFIG" >/dev/null \
+        && { info "pool on chain $cid skipped (chain disabled)"; continue; }
+      die "swap.pools lists chain $cid, which is not in .chains"
+    fi
+    pjson=".swap.pools[] | select(.chain_id == $cid)"
+    stable_sym="$(j "($pjson).stable")"
+    stable_tok="${TOKEN[$stable_sym|$cid]:-}"
+    [[ -n "$stable_tok" ]] || die "swap pool on chain $cid names stable '$stable_sym', which is not an asset on that chain"
+
+    existing="$(jq -r "($pjson).pool // empty" "$CONFIG")"
+    if [[ -n "$existing" ]]; then
+      pool="$existing"; from_block="$(jq -r "($pjson).from_block // 0" "$CONFIG")"
+      info "chain $cid reusing pool $pool"
+    else
+      from_block="${FLOOR[$cid]}"
+      pool="$(fc src/SwapPool.sol:SwapPool "${RPC[$cid]}" --constructor-args "$stable_tok" "$DEV_BPS")"
+      [[ "$pool" =~ ^0x ]] || die "SwapPool deploy failed on chain $cid"
+      info "chain $cid pool=$pool (hub $stable_sym $stable_tok)"
+    fi
+
+    listed="$(jq -c -n --arg s "$stable_sym" --arg a "$stable_tok" '[{symbol:$s, address:$a, price:"1"}]')"
+    for sym in $(j "($pjson).list[]?.symbol"); do
+      tok="${TOKEN[$sym|$cid]:-}"
+      [[ -n "$tok" ]] || die "swap pool on chain $cid lists '$sym', which is not an asset on that chain"
+      price="$(j "($pjson).list[] | select(.symbol == \"$sym\") | .price")"
+      # Prices are quoted in WHOLE units of the hub and scaled by PRICE_ONE
+      # (1e18) here — the pool's own fixed-point base, independent of either
+      # token's decimals.
+      price_wei="$(scaled "$price" 18)"
+      if [[ -n "$existing" ]]; then
+        info "  (reused pool) leaving $sym listing alone"
+      else
+        csend "$pool" 'listToken(address,uint256)' "$tok" "$price_wei" --rpc-url "${RPC[$cid]}"
+        info "  listed $sym at $price $stable_sym"
+      fi
+      listed="$(jq -c --arg s "$sym" --arg a "$tok" --arg p "$price" '. + [{symbol:$s, address:$a, price:$p}]' <<<"$listed")"
+    done
+
+    # Reserves. A pool with no reserve of the OUT token quotes fine and then
+    # reverts on the swap, which reads as a broken UI rather than an unfunded
+    # pool — so seed both sides.
+    for sym in $(j "($pjson).seed | keys[]?"); do
+      tok="${TOKEN[$sym|$cid]:-}"
+      [[ -n "$tok" ]] || die "swap pool on chain $cid seeds '$sym', which is not an asset on that chain"
+      whole="$(j "($pjson).seed.$sym")"
+      dec="$(j ".assets[] | select(.symbol == \"$sym\") | .decimals")"
+      amt="$(scaled "$whole" "$dec")"
+      [[ "$(j "($pjson).mint_seed // false")" == "true" ]] && \
+        csend "$tok" 'mint(address,uint256)' "$DEPLOYER_ADDR" "$amt" --rpc-url "${RPC[$cid]}"
+      csend "$tok" 'approve(address,uint256)' "$pool" "$amt" --rpc-url "${RPC[$cid]}"
+      csend "$pool" 'seedLiquidity(address,uint256)' "$tok" "$amt" --rpc-url "${RPC[$cid]}"
+      info "  seeded $whole $sym"
+    done
+
+    SWAP_POOLS="$(jq -c --argjson c "$cid" --arg p "$pool" --argjson fb "$from_block" --argjson t "$listed" \
+      '. + [{chain_id:$c, pool:$p, from_block:$fb, tokens:$t}]' <<<"$SWAP_POOLS")"
+  done
+elif [[ "$(j '.swap.enabled')" == "true" ]]; then
+  SWAP_POOL="$(jr '.swap.pool')"; SWAP_CHAIN="$(jr '.swap.chain_id')"
   [[ -n "${RPC[$SWAP_CHAIN]:-}" ]] || die "swap.chain_id=$SWAP_CHAIN is not in .chains"
   if [[ "$(j '.swap.deploy')" == "true" ]]; then
     [[ "$PROFILE" == "local" ]] || die "swap.deploy=true is local-only (DeploySwap mints unrestricted test tokens)"
@@ -289,12 +371,11 @@ if [[ "$(j '.swap.enabled')" == "true" ]]; then
     # The pool's token list is discovered by replaying its TokenListed logs, so a
     # scan floor AFTER those listings reports a pool with zero tokens — and a
     # floor of 0 is worse: on a live chain it is a genesis-to-tip filter that
-    # hosted RPCs reject outright. Pin it to the height captured before the
-    # deploy.
+    # hosted RPCs reject outright. Pin it to the height captured before the deploy.
     SWAP_JSON="$(jq -n --argjson c "$SWAP_CHAIN" --arg p "$SWAP_POOL" --arg s "$STABLE" --arg w "$WETH" --arg t "$TT" \
       --argjson fb "${FLOOR[$SWAP_CHAIN]}" '{chain_id:$c, pool:$p, from_block:$fb, stable:$s, weth:$w, tt:$t}')"
   else
-    [[ "$SWAP_POOL" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "swap.enabled with deploy=false needs swap.pool"
+    [[ "$SWAP_POOL" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "swap.enabled with deploy=false needs swap.pool (or swap.pools)"
     # Reusing a pool: its listings predate this run, so keep whatever floor the
     # runtime config already carries rather than inventing one.
     SWAP_JSON="$(jq -n --argjson c "$SWAP_CHAIN" --arg p "$SWAP_POOL" '{chain_id:$c, pool:$p, from_block:null}')"
@@ -492,10 +573,10 @@ jq -n --arg name "$NAME" --arg profile "$PROFILE" --arg domain "$BRIDGE_DOMAIN" 
       --arg deployer "$DEPLOYER_ADDR" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       --argjson vals "$(printf '%s\n' "${VALIDATORS[@]}" | jq -R . | jq -s .)" \
       --argjson th "$THRESHOLD" --argjson chains "$chains_json" --argjson swap "$SWAP_JSON" \
-      --argjson gov "$CORRIDOR_CALLS" --argjson solana "$SOLANA_JSON" \
+      --argjson gov "$CORRIDOR_CALLS" --argjson solana "$SOLANA_JSON" --argjson pools "$SWAP_POOLS" \
   '{name:$name, profile:$profile, deployed_at:$at, deployer:$deployer, bridge_domain:$domain,
-    validators:$vals, threshold:$th, chains:$chains, swap:$swap, solana:$solana,
-    governance_calls:$gov}' > "$OUT_FILE"
+    validators:$vals, threshold:$th, chains:$chains, swap:$swap, swap_pools:$pools,
+    solana:$solana, governance_calls:$gov}' > "$OUT_FILE"
 
 # --- patch the runtime config ----------------------------------------------
 if $UPDATE_CFG && [[ -n "$BRIDGE_CFG" ]]; then
@@ -517,7 +598,13 @@ if $UPDATE_CFG && [[ -n "$BRIDGE_CFG" ]]; then
                                           rpc: $dep.solana.rpc, program_id: $dep.solana.program_id })
          | .solana.tokens = [ $dep.solana.assets[] | {symbol, mint} ]
       else . end
-    | if $dep.swap != null
+    | if ($dep.swap_pools | length) > 0
+      then .graphql.swaps = [ $dep.swap_pools[] | {chain_id, pool, from_block} ]
+         | .graphql.swap = null
+         | .chains = [ .chains[] as $c
+             | ($dep.swap_pools[] | select(.chain_id == $c.chain_id)) as $sp
+             | if $sp == null then $c else $c + {pool: $sp.pool} end ]
+      elif $dep.swap != null
       then .graphql.swap = { enabled: true, chain_id: $dep.swap.chain_id, pool: $dep.swap.pool,
                              from_block: ($dep.swap.from_block // .graphql.swap.from_block // 0) }
          | .chains = [ .chains[] | if .chain_id == $dep.swap.chain_id then .pool = $dep.swap.pool else . end ]
