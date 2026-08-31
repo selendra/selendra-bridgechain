@@ -92,6 +92,7 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
 
     let retry = Duration::from_millis(chain.poll_interval_ms.max(1000));
     let mut cached_latest: Option<u64> = None;
+    let catchup_ms = chain.catchup_poll_interval_ms.unwrap_or(chain.poll_interval_ms);
     let provider = ProviderBuilder::new().connect_http(chain.rpc.parse()?);
 
     loop {
@@ -207,7 +208,7 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
                     // steady state. Mirrors the validator's scanner, which has
                     // the same arithmetic problem for the same reason.
                     if to_block < confirmed {
-                        tokio::time::sleep(Duration::from_millis(chain.poll_interval_ms.min(50))).await;
+                        tokio::time::sleep(Duration::from_millis(catchup_ms)).await;
                         continue;
                     }
                 }

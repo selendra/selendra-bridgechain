@@ -56,6 +56,11 @@ pub struct ChainCfg {
     pub allow_zero_confirmation: bool,
     #[serde(default = "default_interval")]
     pub poll_interval_ms: u64,
+    /// Delay between windows while catching up. Defaults to
+    /// `poll_interval_ms`; see the validator's field of the same name for why
+    /// reading back-to-back is opt-in per endpoint.
+    #[serde(default)]
+    pub catchup_poll_interval_ms: Option<u64>,
     #[serde(default = "default_range")]
     pub max_block_range: u64,
 }

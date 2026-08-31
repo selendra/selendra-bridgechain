@@ -138,6 +138,9 @@ async fn scan_source(
     let retry = Duration::from_millis(source.poll_interval_ms.max(1000));
     // Last observed chain head; see the refresh rule in the scan loop.
     let mut cached_latest: Option<u64> = None;
+    // How fast we may read while behind. Defaults to the steady-state interval:
+    // see `catchup_poll_interval_ms` for why aggression has to be opt-in.
+    let catchup_ms = source.catchup_poll_interval_ms.unwrap_or(source.poll_interval_ms);
 
     // Multi-RPC failover, with a chainId guard per endpoint. Connecting can fail
     // if every endpoint is momentarily down/wrong-chain; retry rather than kill
@@ -331,7 +334,7 @@ async fn scan_source(
             // hammered, and the configured interval still governs the steady
             // state — this path only runs when there is a real backlog.
             if behind && !paused && !batch_failed {
-                tokio::time::sleep(Duration::from_millis(source.poll_interval_ms.min(50))).await;
+                tokio::time::sleep(Duration::from_millis(catchup_ms)).await;
                 continue;
             }
         }

@@ -245,6 +245,8 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo "block_confirmation = $(cf "$cid" block_confirmation)"
       echo "allow_zero_confirmation = $(cbool "$cid" allow_zero_confirmation)"
       echo "poll_interval_ms = $(cf "$cid" poll_interval_ms)"
+      cu="$(cf "$cid" catchup_poll_interval_ms)"
+      [[ -n "$cu" ]] && echo "catchup_poll_interval_ms = $cu"
       echo "max_block_range = $(cf "$cid" max_block_range)"
       echo "state_file = \"$STATE_DIR/validator-$vname-$cid.json\""
       echo
@@ -392,6 +394,8 @@ if [[ "$(j '.indexer.enabled')" == "true" ]]; then
       echo "block_confirmation = $(cf "$cid" block_confirmation)"
       echo "allow_zero_confirmation = $(cbool "$cid" allow_zero_confirmation)"
       echo "poll_interval_ms = $(cf "$cid" poll_interval_ms)"
+      cu="$(cf "$cid" catchup_poll_interval_ms)"
+      [[ -n "$cu" ]] && echo "catchup_poll_interval_ms = $cu"
       echo "max_block_range = $(cf "$cid" max_block_range)"
     done
   } > "$IDX_CFG"

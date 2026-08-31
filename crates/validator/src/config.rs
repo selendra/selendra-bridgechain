@@ -139,6 +139,19 @@ pub struct SourceChain {
     pub allow_zero_confirmation: bool,
     #[serde(default = "default_interval")]
     pub poll_interval_ms: u64,
+    /// Delay between windows while CATCHING UP — i.e. when the last range was
+    /// capped by `max_block_range` and confirmed history is still unread.
+    ///
+    /// Defaults to `poll_interval_ms`, which is the conservative choice: how
+    /// fast a scanner may read is a property of the ENDPOINT, not of the
+    /// backlog. Reading back-to-back is what clears a fast chain's gap in
+    /// minutes instead of hours, but on a shared rate-limited endpoint it also
+    /// starves every other consumer of the same key — the API's pool reads and
+    /// the indexer included — which shows up as 429s, not as slowness. So lower
+    /// it only for an endpoint you know can take it (your own node, or a public
+    /// RPC with a generous cap).
+    #[serde(default)]
+    pub catchup_poll_interval_ms: Option<u64>,
     #[serde(default = "default_range")]
     pub max_block_range: u64,
     /// Where to persist the resumable cursor + per-chain nonce state.
