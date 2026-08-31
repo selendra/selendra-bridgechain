@@ -136,6 +136,8 @@ async fn scan_source(
 ) -> anyhow::Result<()> {
     let gate: Address = source.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(source.poll_interval_ms.max(1000));
+    // Last observed chain head; see the refresh rule in the scan loop.
+    let mut cached_latest: Option<u64> = None;
 
     // Multi-RPC failover, with a chainId guard per endpoint. Connecting can fail
     // if every endpoint is momentarily down/wrong-chain; retry rather than kill
@@ -202,20 +204,33 @@ async fn scan_source(
         }
 
         let from_block = runtime.lock().await.next_block();
-        // Transient RPC failures must not kill the loop (which, pre-fix, also took
-        // down every sibling chain). Log, back off, and try again next tick.
-        let latest = match failover.get_block_number().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(chain_id = source.chain_id, error = %e, "get_block_number failed; retrying");
-                tokio::time::sleep(retry).await;
-                continue;
+        // The head is re-read only when the scanner has caught up to what it last
+        // saw. A scanner a million blocks behind learns nothing from asking where
+        // the tip is between every 100-block window — and that extra round trip
+        // is half the round trips it makes, so skipping it doubles catch-up
+        // throughput. Once current, this reduces to the old behaviour: every
+        // tick reaches the cached head and re-reads it.
+        if cached_latest.is_none_or(|l| from_block + source.block_confirmation > l) {
+            // Transient RPC failures must not kill the loop (which, pre-fix, also
+            // took down every sibling chain). Log, back off, and try again.
+            match failover.get_block_number().await {
+                Ok(v) => cached_latest = Some(v),
+                Err(e) => {
+                    warn!(chain_id = source.chain_id, error = %e, "get_block_number failed; retrying");
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
             }
-        };
+        }
+        let latest = cached_latest.unwrap_or(0);
         let confirmed = latest.saturating_sub(source.block_confirmation);
 
         if confirmed >= from_block {
             let to_block = confirmed.min(from_block + source.max_block_range - 1);
+            // True when the window was capped by `max_block_range`, i.e. there is
+            // more ALREADY-CONFIRMED history waiting right now. See the catch-up
+            // note where this is consumed.
+            let behind = to_block < confirmed;
 
             let filter = Filter::new()
                 .address(gate)
@@ -300,6 +315,24 @@ async fn scan_source(
             }
             if let Err(e) = rt.save() {
                 warn!(chain_id = source.chain_id, error = %e, "failed to persist scanner state");
+            }
+
+            // Catch-up: when the range was capped there is confirmed history
+            // still unread, and sleeping a full poll interval before the next
+            // window is what makes recovery take hours.
+            //
+            // The arithmetic is unforgiving on a fast chain. Monad produces ~3.3
+            // blocks/s; a 100-block cap polled every 2s reads ~34/s, so it gains
+            // only ~31 blocks/s on the head — a day of downtime then takes ~6
+            // hours to work off, during which the validator signs nothing recent.
+            // Reading back-to-back while behind turns that into minutes.
+            //
+            // A small floor remains so a fast-answering endpoint cannot be
+            // hammered, and the configured interval still governs the steady
+            // state — this path only runs when there is a real backlog.
+            if behind && !paused && !batch_failed {
+                tokio::time::sleep(Duration::from_millis(source.poll_interval_ms.min(50))).await;
+                continue;
             }
         }
 

@@ -742,7 +742,13 @@ if $UPDATE_CFG && [[ -n "$BRIDGE_CFG" ]]; then
            else . end
       else . end
     | if ($dep.swap_pools | length) > 0
-      then .graphql.swaps = [ $dep.swap_pools[] | {chain_id, pool, from_block} ]
+      # Replace only the entries this deployment covers. A wholesale assignment
+      # drops pools it knows nothing about — notably the Solana one, which is
+      # registered by the solana branch above and would silently vanish here.
+      then .graphql.swaps =
+             ((.graphql.swaps // [])
+              | map(select(.chain_id as $c | ($dep.swap_pools | map(.chain_id) | index($c)) == null)))
+             + [ $dep.swap_pools[] | {chain_id, pool, from_block} ]
          | .graphql.swap = null
          | .chains = [ .chains[] as $c
              | ($dep.swap_pools[] | select(.chain_id == $c.chain_id)) as $sp

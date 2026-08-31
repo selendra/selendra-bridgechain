@@ -198,9 +198,15 @@ impl SolanaPool {
     /// destination account taken on trust from a server is a destination that
     /// can be swapped for someone else's.
     pub async fn latest_blockhash(&self) -> anyhow::Result<String> {
+        // FINALIZED, not confirmed. The wallet broadcasts through its OWN node,
+        // which may not have seen a blockhash this one only just confirmed —
+        // the transaction then fails with "Blockhash not found", and the user
+        // sees a rejection they cannot act on. A finalized hash is ~32 slots
+        // old, known everywhere, and still far inside the ~150-slot validity
+        // window, so it costs nothing to be safe here.
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
-            "params": [{"commitment": "confirmed"}],
+            "params": [{"commitment": "finalized"}],
         });
         let resp: serde_json::Value =
             reqwest::Client::new().post(&self.rpc).json(&body).send().await?.json().await?;

@@ -86,6 +86,9 @@ async function poolReserves(): Promise<Record<string, string>> {
 }
 
 test("swaps on Solana from the browser, end to end", async ({ page }) => {
+  // A real devnet round trip — quote, wallet, submit, confirm — outlives the
+  // default per-test budget several times over.
+  test.setTimeout(240_000);
   const wallet = await signer();
   await page.exposeFunction("__walletSignAndSend", (msg: string) => wallet.signAndSend(msg));
   await page.addInitScript((account: string) => {
@@ -120,9 +123,15 @@ test("swaps on Solana from the browser, end to end", async ({ page }) => {
   await page.getByRole("option", { name: /Solana/ }).click();
   await expect(page.locator(".card__subtitle")).toContainText("Solana", { timeout: 20_000 });
 
-  await page.locator(".review-btn").click(); // Connect Phantom
+  // Wait for the view to settle on the Solana pool before connecting: until the
+  // pool loads it is still offering the EVM wallet, and a click landing then
+  // connects nothing.
+  await expect(page.locator(".review-btn")).toHaveText("Connect Phantom", { timeout: 30_000 });
+  await page.locator(".review-btn").click();
+  await expect(page.locator(".review-btn")).not.toHaveText("Connect Phantom", { timeout: 20_000 });
+
   await page.locator(".amount-row").first().locator("input").fill("1");
-  await expect(page.locator(".review-btn")).toHaveText("Swap", { timeout: 25_000 });
+  await expect(page.locator(".review-btn")).toHaveText("Swap", { timeout: 30_000 });
   await page.locator(".review-btn").click();
 
   await expect(page.locator(".txbar--done")).toContainText(/Swapped for/i, { timeout: 90_000 });

@@ -91,6 +91,7 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
     );
 
     let retry = Duration::from_millis(chain.poll_interval_ms.max(1000));
+    let mut cached_latest: Option<u64> = None;
     let provider = ProviderBuilder::new().connect_http(chain.rpc.parse()?);
 
     loop {
@@ -145,14 +146,20 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
     );
 
     loop {
-        let latest = match provider.get_block_number().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(chain_id = chain.chain_id, error = %e, "get_block_number failed; retrying");
-                tokio::time::sleep(retry).await;
-                continue;
+        // Re-read the head only once the scanner reaches what it last saw: a
+        // cursor far behind gains nothing from asking for the tip between every
+        // window, and that round trip is half of them. Mirrors the validator.
+        if cached_latest.is_none_or(|l| from_block + chain.block_confirmation > l) {
+            match provider.get_block_number().await {
+                Ok(v) => cached_latest = Some(v),
+                Err(e) => {
+                    warn!(chain_id = chain.chain_id, error = %e, "get_block_number failed; retrying");
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
             }
-        };
+        }
+        let latest = cached_latest.unwrap_or(0);
         let confirmed = latest.saturating_sub(chain.block_confirmation);
 
         if confirmed >= from_block {
@@ -192,6 +199,17 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
                     warn!(chain_id = chain.chain_id, error = %e, "failed to persist cursor");
                 } else {
                     from_block = to_block + 1;
+                    // Catch-up: a range capped by `max_block_range` means more
+                    // confirmed history is already waiting, and sleeping a whole
+                    // poll interval before reading it is what turns a few hours
+                    // of downtime into a day of stale history. Read back-to-back
+                    // while behind; the configured interval still paces the
+                    // steady state. Mirrors the validator's scanner, which has
+                    // the same arithmetic problem for the same reason.
+                    if to_block < confirmed {
+                        tokio::time::sleep(Duration::from_millis(chain.poll_interval_ms.min(50))).await;
+                        continue;
+                    }
                 }
             }
         }
