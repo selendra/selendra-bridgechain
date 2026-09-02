@@ -1,0 +1,21 @@
+[
+  {
+    "chain_id": 1,
+    "name": "Ethereum",
+    "rpc_url": "https://your-node.example.com",
+    "gate": "0x0000000000000000000000000000000000000000",
+    "router": "0x0000000000000000000000000000000000000000",
+    "tokens": [
+      { "symbol": "TST", "address": "0x0000000000000000000000000000000000000000" }
+    ]
+  },
+  {
+    "chain_id": 56,
+    "name": "BNB Chain",
+    "rpc_url": "https://your-bsc-node.example.com",
+    "gate": "0x0000000000000000000000000000000000000000",
+    "tokens": [
+      { "symbol": "TST", "address": "0x0000000000000000000000000000000000000000" }
+    ]
+  }
+]

@@ -1,0 +1,83 @@
+# ─── MACHINE 2..N of 5: one validator ─────────────────────────────────────────
+#
+# Deploy this stack ONCE PER INDEPENDENT OPERATOR, on hardware that operator
+# controls. It is the only component holding signing authority and the only one
+# whose output the Gate contract will accept.
+#
+# VALIDATORS HAVE NO PEERS. There is nothing to configure between them: no
+# gossip, no P2P port, no peer list. Each one observes its chains alone and
+# posts its signature to the store; the store merges by signer. That is the
+# entire coordination mechanism (docs/architecture.md §4.7).
+#
+# THE THING THAT ACTUALLY MAKES THE THRESHOLD REAL
+# Three validators reading the same chain through the SAME RPC PROVIDER are not
+# three independent observers — they are one observer signing three times, and a
+# provider that serves a wrong log makes all three sign it. The threshold then
+# counts signatures, not independent confirmations. Every operator must use
+# their own endpoints, and run their own node where the corridor's value
+# justifies it. This is the single highest-value thing on this page.
+#
+#
+# BEFORE `up`: run ./preflight.sh
+# Docker compose file-secrets are bind-mounted with the HOST file's ownership,
+# and compose IGNORES the `uid`/`gid`/`mode` long syntax outside swarm mode.
+# This image runs as uid 10001, so a keystore left at your-user:0600 is
+# unreadable inside the container and the only symptom is a restart loop
+# logging "Permission denied (os error 13)". preflight.sh checks for it and
+# prints the fix.
+#
+#   cp .env.example .env && edit && chmod 600 .env
+#   cp configs/validator.toml.example configs/validator.toml && edit
+#   # put an encrypted keystore + its password in ./secrets (see README §4)
+#   ./preflight.sh && docker compose up -d
+#
+services:
+  validator:
+    image: "${BRIDGE_IMAGE:-selendra/bridge:local}"
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    command: ["validator", "/configs/validator.toml"]
+    environment:
+      # Sign scope: read + deposit signatures/attestations. It cannot mark a
+      # transfer claimed and cannot touch the allowlist.
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"
+      # Guards the STATE-CHANGING operator routes (pause/resume/rescan) below.
+      # `/status` stays open either way, which is what the healthcheck reads.
+      # Unset => anyone who reaches port 9090 can halt this validator.
+      VALIDATOR_API_TOKEN: "${VALIDATOR_API_TOKEN:?set VALIDATOR_API_TOKEN}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./configs:/configs:ro
+      - validator-state:/data
+    secrets:
+      - validator_keystore
+      - keystore_password
+    ports:
+      # Operator API, bound to LOOPBACK ON THE HOST. It exposes /pause, /resume
+      # and /rescan — reach it over SSH, never from the network.
+      - "127.0.0.1:${VALIDATOR_API_PORT:-9090}:9090"
+    # No depends_on: the store is on another machine. The validator retries its
+    # RPC connections and its store writes on its own, so starting before the
+    # store is reachable is safe — it will log warnings and catch up.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:9090/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  # The resumable block cursor, the per-corridor nonce cursors, AND the durable
+  # pause flag. Losing this volume makes the validator rescan from
+  # `start_block`; it also loses a safety stop that an operator has not yet
+  # cleared. Back it up, and never point two hosts at shared storage for it.
+  validator-state:
+
+secrets:
+  validator_keystore:
+    file: ./secrets/keystore.json
+  keystore_password:
+    file: ./secrets/keystore-password

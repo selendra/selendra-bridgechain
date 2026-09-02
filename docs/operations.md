@@ -24,6 +24,8 @@ The dependency that catches people out is the refund one.
 A refund needs the indexer running, because the keeper's refund loop only ever sees candidates the store has already nominated, and the sweep that nominates them (`bridge_db::Db::sweep_refund_eligible`) is called from the indexer and nowhere else.
 
 `Dockerfile` builds all five binaries and `docker-compose.yml` deploys all of them, so the shipped stack advances refunds and serves the frontend on its own.
+
+The processes coordinate only through the sig-store — there are no direct connections between them, and in particular validators have no peers. Section 5 covers spreading them across machines; `architecture.md` §4.7 covers why that topology is safe.
 Note that `graphql-api` is the one service with no `DATABASE_URL`: it reads the indexer's history over the sig-store's read scope, not from Postgres, so do not hand it a database URL when running it by hand either.
 
 ---
@@ -81,6 +83,8 @@ Override the shared sig-store secret, which defaults to `dev-local-bridge-token`
 SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
 ```
 
+`SIG_STORE_TOKEN` is the legacy all-scopes secret: whoever holds it can read, sign, relay and edit the allowlist, and the service logs a warning when it is set. It is fine for a throwaway local stack. For anything else, give each service the narrowest one instead — `SIG_STORE_VALIDATOR_TOKEN`, `SIG_STORE_KEEPER_TOKEN`, `SIG_STORE_READER_TOKEN`, `SIG_STORE_ADMIN_TOKEN` — so a leak from one component cannot write on behalf of the others. `scripts/bridge-from-json.sh` generates the four separately when `sig_store.tokens.generate_if_unset` is set.
+
 ### 2.3 Frontend
 
 ```bash
@@ -109,7 +113,7 @@ poll_interval_ms = 1000
 max_block_range  = 1000
 state_file       = "/data/val1-state.json"
 
-[signer]                           # see section 4
+[signer]                           # see section 6
 keystore = "/run/secrets/validator-keystore.json"
 keystore_password_file = "/run/secrets/keystore-password"
 
@@ -138,24 +142,30 @@ What `Config::load` rejects at startup, so you find out immediately rather than 
 - `[refund] block_confirmation = 0` without `allow_zero_confirmation = true`
 - a `[refund]` block with a file-backed `[store]`, because the unclaimed-timeout gate lives in the DB-backed sweep and the file store does not have one
 
-### 3.1 The two finality buffers, and which one is actually enforced
+### 3.1 The two finality buffers
 
-There are two `block_confirmation` settings and they are not equally protected.
+There are two `block_confirmation` settings. Both are now enforced the same way: `Config::load` refuses to start at `0` unless you set `allow_zero_confirmation = true` alongside it, and both structs carry `#[serde(deny_unknown_fields)]`, so a misspelled opt-in (`allow_zero_confirmations`, with the trailing `s`) is a startup error rather than a silently-ignored no-op that leaves the buffer at zero.
 
-**`[refund] block_confirmation`** is enforced.
-`Config::load` refuses to start at `0` unless you set `allow_zero_confirmation = true`, and the reason is spelled out in the source: a refund on the source chain is irreversible and is authorised solely on having read `cancelled == true` on the destination.
+**`[[sources]] block_confirmation`** bounds how close to the tip you will *sign*.
+Signing a `Sent` event at the chain tip lets a source reorg erase the deposit *after* validators have signed and the keeper has already released destination liquidity — a double-spend of bridge funds.
+Set it above the source chain's maximum reorg depth.
+
+**`[refund] block_confirmation`** bounds how close to the tip you will *attest a refund*.
+A refund on the source chain is irreversible and is authorised solely on having read `cancelled == true` on the destination.
 If that read is at the chain tip and the destination later reorgs the cancel away, the original claim signatures become live again, and the transfer is paid on the destination *and* refunded on the source.
-Set it above the destination chain's maximum reorg depth.
+Set it above the **destination** chain's maximum reorg depth.
 
-**`[[sources]] block_confirmation`** is **not** enforced.
-It defaults to `0`, nothing validates it, and `SourceChain` has no `allow_zero_confirmation` field at all.
-The shipped `docker/configs/*.toml` set one anyway, under `[source]`, with a comment warning never to set it on a real chain.
-Serde discards it in silence, so that line is decoration.
-The `[refund]` blocks in the same files set the same key where it *is* a real field and *is* honoured, which is exactly why the discarded one is easy to miss.
+`allow_zero_confirmation = true` is only ever correct on an instant-finality dev chain such as anvil. Never set it against a real network.
 
-Until `#[serde(deny_unknown_fields)]` lands (M4 in `report.md`), treat the source-chain buffer as unguarded and set it explicitly per chain.
+### 3.2 Catch-up pacing
 
-### 3.2 Operator API
+`catchup_poll_interval_ms` is optional and applies only while a scanner is **behind** — when the last range hit `max_block_range` and confirmed history is still unread. It defaults to `poll_interval_ms`, which is the conservative choice.
+
+The arithmetic that matters is `blocks/s = max_block_range ÷ poll_interval`. On a fast chain behind a capped `eth_getLogs`, recovering from a few hours of downtime can take longer than the downtime did, and reading back-to-back is what fixes that.
+
+But how fast a scanner *may* read is a property of the **endpoint**, not of the backlog. On a shared rate-limited provider, back-to-back reads consume the compute budget that the GraphQL API's pool reads and the indexer are also drawing on, and the symptom is 429s across unrelated services rather than a slow validator. Lower it only for an endpoint you know can take it — your own node, or a public RPC with a generous cap — and leave it unset everywhere else.
+
+### 3.3 Operator API
 
 ```
 GET  /status
@@ -164,16 +174,125 @@ POST /resume
 POST /rescan {"from_block": N}
 ```
 
-The scanner pauses itself on a nonce gap, a nonce replay, or a `submissionId` mismatch, which is the signal that an RPC is lying or that events were missed.
+Each optionally scoped to one chain. The token comes from `[api] token` or the `VALIDATOR_API_TOKEN` env var; with neither set the API is unauthenticated, which is a dev-only posture.
+
+The scanner pauses itself on a nonce gap, a nonce replay, or a `submissionId` mismatch — each of which means an RPC is lying or events were missed.
 A pause is a real safety stop and needs a human to look before `/resume`.
 
-Note that `paused` is runtime-only state.
-`state::load_or_init` hardcodes `paused: false`, so a validator that paused on an anomaly and was then restarted comes back up unpaused, having forgotten the anomaly.
-Do not restart a paused validator as a way of clearing the condition (M2 in `report.md`).
+**The pause survives a restart.** `Runtime.paused` and its reason are serialized to `state_file`, and a validator that comes up paused logs a warning naming the reason. Restarting is not a way to clear the condition — diagnose it, then `/resume`.
 
 ---
 
-## 4. Key custody
+## 4. Configuring a keeper
+
+Reference: `crates/keeper/src/config.rs`.
+
+```toml
+[[targets]]                        # repeatable; claims + cancels, on the DESTINATION
+chain_id         = 1338
+rpc              = "http://rpc-dst"
+gate             = "0x…"
+poll_interval_ms = 1000
+
+[[sources]]                        # repeatable; refunds, on the chain funds were locked on
+chain_id         = 1337
+rpc              = "http://rpc-src"
+gate             = "0x…"
+poll_interval_ms = 1000
+
+[keeper]                           # the funded gas-payer key; same shape as [signer], see section 6
+keystore = "/run/secrets/keeper-keystore.json"
+keystore_password_file = "/run/secrets/keystore-password"
+
+[store]
+url = "http://sig-store:8080"
+```
+
+What `Config::load` rejects at startup:
+
+- no `[[targets]]` at all (a legacy single `[target]` is folded into the list)
+- two `[[targets]]`, or two `[[sources]]`, naming the same `chain_id` — two loops on one chain would submit from the same account and contend on its nonce
+- any unknown field, in either block
+
+Three things to know when running one:
+
+- **Targets and sources are different lists.** Claims and cancels happen on the destination; refunds happen where the funds were locked. A keeper with only `[[targets]]` never submits a refund, and nothing warns you at runtime — the transfers simply sit in the candidate list.
+- **The key must stay funded on every listed chain.** A claim loop whose account is out of gas logs `claim failed` each tick and delivers nothing.
+- **A chain in both lists gets a startup warning.** The two loops share one account and can briefly contend on its nonce under load. It is self-healing, but for a busy bidirectional corridor run the two roles as separate processes, or give them separate accounts.
+
+Running more than one keeper is safe and is the normal way to get redundancy: each `try_*` re-reads on-chain state first, so the loser of a race sees `executed == true` and does nothing.
+
+---
+
+## 5. Running validators on separate machines
+
+A real deployment puts each validator on hardware its operator controls. Nothing about the process changes when you do — validators have no peer connections to configure, because they have no peers. See `architecture.md` §4.7 for why the topology is hub-and-spoke and why the hub is not trusted.
+
+**Ready-made stacks: [`docker/production/`](../docker/production/README.md)** — one compose file per machine role (store, indexer, validator, keeper, api, solana-relayer), with `.env` and config templates, TLS termination, and a `preflight.sh` for the keystore-permission trap. This section explains the requirements; that directory implements them, and [`RUNBOOK.md`](../docker/production/RUNBOOK.md) covers running and troubleshooting each stack individually.
+
+### 5.1 What actually changes
+
+On each validator host, point the store at the shared sig-store and hand it the sign-scope credential:
+
+```toml
+[store]
+url = "https://sig-store.internal.example.com"    # was http://127.0.0.1:8080
+```
+
+```bash
+export SIG_STORE_VALIDATOR_TOKEN=…                # read by StoreBackend::remote_for_role
+```
+
+On the sig-store host, bind publicly and open the port:
+
+```json
+"sig_store": {
+  "bind": "0.0.0.0:8080",
+  "url":  "https://sig-store.internal.example.com"
+}
+```
+
+HTTPS works without a code change — the workspace `reqwest` keeps its default features, so native-tls is compiled in. That is the whole configuration difference.
+
+### 5.2 What you must get right
+
+**The link must be encrypted.** `sig-store` is plain axum HTTP with bearer tokens; it terminates no TLS of its own. A token crossing the public internet in cleartext is a stolen sign credential. Put it behind nginx or Caddy with a certificate, or run the validators into it over WireGuard. Do not expose `0.0.0.0:8080` directly.
+
+**Each validator needs genuinely independent RPCs.** This is the one that quietly destroys the security model. Three validators reading Sepolia through the same provider key are not three independent observers — they are one observer signing three times, and a provider that serves a wrong log makes all three sign it. The threshold then counts signatures, not independent confirmations. Independent providers per operator is the point of separate machines at all; run your own node where the corridor's value justifies it.
+
+**Each needs its own key and its own `state_file`.** `Config::load` enforces uniqueness of `state_file` *within* one process, but nothing stops two hosts from mounting the same path off shared storage. Keep state local to the machine.
+
+**Set `block_confirmation` per chain, per operator.** It is not a fleet-wide constant. A validator on a slower or less trusted RPC should sit further from the tip; nothing forces operators to agree, and a more conservative one simply signs later.
+
+**Clock skew does not matter, and should not.** The refund loop derives transfer age from block timestamps read off the chain, never from the host's wall clock (`validator/src/refund.rs:117`). Do not add a wall-clock-based timeout on top of it.
+
+### 5.3 The credential gap to close first
+
+`crates/sig-store/src/main.rs` exposes a single `--validator-token` / `SIG_STORE_VALIDATOR_TOKEN`, so today every validator shares one sign credential. `Auth` itself is a `HashMap<String, HashSet<Scope>>` and already supports many tokens per scope — making the flag repeatable gives each operator a credential you can revoke individually.
+
+Until that lands, understand what one leaked token does and does not buy an attacker. It does **not** let them forge signatures: `Db::upsert_signature` ecrecovers every signature and `Gate._verifySignatures` counts only keys in the on-chain validator set. It does let them write to the store unattributably and spam it, and it means revoking one operator's access means rotating the token for everyone.
+
+### 5.4 Checking that a remote validator is actually working
+
+```bash
+curl -s https://sig-store.example.com/health                      # no auth required
+curl -s -H "Authorization: Bearer $SIG_STORE_READER_TOKEN" \
+     https://sig-store.example.com/submissions | jq '.[0].signatures'
+```
+
+The signer addresses in that array are the ground truth for who is participating. A validator that is running, unpaused, and caught up but whose address never appears is not reaching the store — check the token and the URL before suspecting the scanner.
+
+Then, on the validator host:
+
+```bash
+curl -s -H "Authorization: Bearer $VALIDATOR_API_TOKEN" http://127.0.0.1:9090/status
+```
+
+`paused` with a reason means a real safety stop that survived a restart, not a transient error. Read §3.3 before resuming it.
+
+---
+
+## 6. Key custody
 
 Reference: `crates/bridge-core/src/signer.rs`.
 The same `[signer]` / `[keeper]` shape applies to both node types.
@@ -215,7 +334,7 @@ The pattern is still the one to break before a real key goes anywhere near it.
 
 ---
 
-## 5. Deploy checklist
+## 7. Deploy checklist
 
 There is no reviewed production deploy script in this repository.
 `contracts/script/DeploySwap.s.sol` and `DeployXSwap.s.sol` are local demos: threshold-1 gates and unrestricted-mint tokens, with no `block.chainid` guard to stop them running against a real network (L13 in `report.md`).
@@ -264,7 +383,7 @@ The refund path is the one that is easiest to ship broken, because nothing about
 
 ---
 
-## 6. Incident response
+## 8. Incident response
 
 **Stop the bleeding.**
 `pause()` on the Gate, callable by owner or guardian.

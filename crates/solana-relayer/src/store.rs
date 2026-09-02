@@ -10,6 +10,8 @@
 //!
 //! Field names must stay byte-identical to `SubmissionRecord`'s serde names.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +135,83 @@ impl Store {
     }
 }
 
+/// One whitelisted asset, as the sig-store serves it at `/allowed/tokens`.
+///
+/// Another hand-maintained mirror of a `bridge_core::allow` type, for the same
+/// unavoidable reason as [`SubmissionRecord`]: this crate cannot link
+/// bridge-core at all. Only the fields this side actually reads are declared;
+/// unknown ones are ignored by serde, so the server may add fields freely.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllowedToken {
+    /// `0x`-prefixed `keccak256(abi.encodePacked(chain_id, token))`, lowercased.
+    pub debridge_id: String,
+}
+
+/// One whitelisted directed chain pair, as served at `/allowed/chains`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllowedChain {
+    pub chain_id_from: u64,
+    pub chain_id_to: u64,
+}
+
+/// Which assets and corridors this relayer will attest.
+///
+/// ## Semantics must match `bridge_core::allow::Allowlist` exactly
+///
+/// The lists are **opt-in**: an empty list means "no restriction configured" and
+/// allows everything; the first row flips that list to deny-by-default. The two
+/// lists are independent. Diverging from the EVM side here would be worse than
+/// having no check at all — operators would face a control that means one thing
+/// on one leg and something else on the other.
+#[derive(Clone, Debug, Default)]
+pub struct Allowlist {
+    debridge_ids: HashSet<String>,
+    chains: HashSet<(u64, u64)>,
+}
+
+impl Allowlist {
+    pub fn from_parts(tokens: &[AllowedToken], chains: &[AllowedChain]) -> Self {
+        Allowlist {
+            debridge_ids: tokens.iter().map(|t| t.debridge_id.to_ascii_lowercase()).collect(),
+            chains: chains.iter().map(|c| (c.chain_id_from, c.chain_id_to)).collect(),
+        }
+    }
+
+    /// Empty list => everything allowed; otherwise only listed ids, matched
+    /// case-insensitively (the store lowercases, we format with `hex::encode`,
+    /// but a hand-seeded row could be mixed case).
+    pub fn token_allowed(&self, debridge_id: &str) -> bool {
+        self.debridge_ids.is_empty()
+            || self.debridge_ids.contains(&debridge_id.to_ascii_lowercase())
+    }
+
+    /// Empty list => every pair allowed; otherwise only listed `(from, to)`.
+    pub fn chain_allowed(&self, from: u64, to: u64) -> bool {
+        self.chains.is_empty() || self.chains.contains(&(from, to))
+    }
+}
+
+impl Store {
+    /// The current allowlists, refetched per tick so an operator's change applies
+    /// without restarting every relayer in the fleet.
+    ///
+    /// Both lists are read at the `Read` scope, which the validator-scoped token
+    /// this process already carries includes.
+    pub async fn allowlist(&self) -> anyhow::Result<Allowlist> {
+        let tokens: Vec<AllowedToken> = self.get_json("/allowed/tokens").await?;
+        let chains: Vec<AllowedChain> = self.get_json("/allowed/chains").await?;
+        Ok(Allowlist::from_parts(&tokens, &chains))
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let res = self.client.get(format!("{}{path}", self.base)).send().await?;
+        if !res.status().is_success() {
+            anyhow::bail!("sig-store {path} failed ({})", res.status());
+        }
+        Ok(res.json().await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +269,69 @@ mod tests {
         ] {
             assert!(obj.contains_key(key), "the store requires `{key}`, and it is not on the wire");
         }
+    }
+
+    // --- allowlist ----------------------------------------------------------
+
+    fn tok(id: &str) -> AllowedToken {
+        AllowedToken { debridge_id: id.into() }
+    }
+
+    /// Opt-in semantics, and they MUST match `bridge_core::allow::Allowlist`.
+    /// An empty list allowing everything is what keeps a fleet that has never
+    /// seeded the lists working; the first row is what turns enforcement on.
+    #[test]
+    fn an_empty_allowlist_permits_everything() {
+        let a = Allowlist::from_parts(&[], &[]);
+        assert!(a.token_allowed("0xdeadbeef"));
+        assert!(a.chain_allowed(7_565_164, 11_155_111));
+    }
+
+    /// The first row flips that list to deny-by-default. This is the behaviour
+    /// an operator relies on when they de-list a token during an incident.
+    #[test]
+    fn one_token_row_denies_every_other_token() {
+        let a = Allowlist::from_parts(&[tok("0xaa")], &[]);
+        assert!(a.token_allowed("0xaa"));
+        assert!(!a.token_allowed("0xbb"));
+        // The chain list is independent and still empty, so it allows all pairs.
+        assert!(a.chain_allowed(1, 2));
+    }
+
+    #[test]
+    fn one_chain_row_denies_every_other_pair() {
+        let a = Allowlist::from_parts(&[], &[AllowedChain { chain_id_from: 1, chain_id_to: 2 }]);
+        assert!(a.chain_allowed(1, 2));
+        assert!(!a.chain_allowed(2, 1), "the pair is DIRECTED");
+        assert!(!a.chain_allowed(1, 3));
+    }
+
+    /// We format ids with `hex::encode` (lowercase) and the store lowercases its
+    /// rows, but a hand-seeded row could be mixed case. Matching case-sensitively
+    /// would silently de-list a token that IS listed.
+    #[test]
+    fn debridge_ids_match_case_insensitively() {
+        let a = Allowlist::from_parts(&[tok("0xAaBbCc")], &[]);
+        assert!(a.token_allowed("0xaabbcc"));
+        assert!(a.token_allowed("0xAABBCC"));
+    }
+
+    /// The wire shape the sig-store actually serves at `/allowed/*`. Pinned for
+    /// the same reason as the submission record above: this crate cannot link
+    /// bridge-core, so nothing else would catch a rename.
+    #[test]
+    fn the_allowlist_wire_format_matches_the_sig_store() {
+        let tokens: Vec<AllowedToken> = serde_json::from_str(
+            r#"[{"chain_id":1,"token":"0xabc","debridge_id":"0xdef","symbol":"TST"}]"#,
+        )
+        .expect("extra fields are ignored, debridge_id is read");
+        assert_eq!(tokens[0].debridge_id, "0xdef");
+
+        let chains: Vec<AllowedChain> =
+            serde_json::from_str(r#"[{"chain_id_from":7565164,"chain_id_to":11155111}]"#)
+                .expect("parses the served shape");
+        assert_eq!(chains[0].chain_id_from, 7_565_164);
+        assert_eq!(chains[0].chain_id_to, 11_155_111);
     }
 
     /// The store parses `bridge_domain` with `B256::from_str`, which accepts only

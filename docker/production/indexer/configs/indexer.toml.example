@@ -1,0 +1,43 @@
+# Indexer — one [[chains]] block per chain in the mesh.
+#
+# `database_url` is deliberately absent: DATABASE_URL from the environment wins
+# (Config::resolved_database_url), which keeps the credential out of this file.
+
+# How long a transfer may sit unclaimed before this sweep NOMINATES it as a
+# refund candidate. Nomination is not authorisation: each validator establishes
+# the age itself, on-chain, before attesting a cancel (docs/architecture.md
+# §4.3). Set it to match every validator's `[refund] timeout_secs` so the two
+# agree on intent — hours in production, and comfortably above real claim
+# latency on your slowest corridor.
+refund_timeout_secs = 3600
+sweep_interval_secs = 30
+
+[[chains]]
+chain_id = 1
+rpc = "https://your-node.example.com"
+gate = "0x0000000000000000000000000000000000000000"
+# Same-chain swap surfaces, if deployed. Omit either if not in use.
+# router = "0x…"
+# pool   = "0x…"
+start_block = 0
+# Must exceed this chain's maximum reorg depth. Startup FAILS at 0 unless you
+# also set allow_zero_confirmation — which is correct only on an instant-finality
+# dev chain such as anvil, never on a real network.
+block_confirmation = 64
+poll_interval_ms = 2000
+max_block_range = 1000
+# Optional, and off by default. Only while BEHIND. Reading back-to-back clears a
+# fast chain's backlog in minutes instead of hours, but on a shared rate-limited
+# endpoint it starves every other consumer of the same key — including the
+# GraphQL API's pool reads — and surfaces as 429s elsewhere, not as slowness
+# here. Set it only for an endpoint you know can take it. See operations.md §3.2.
+# catchup_poll_interval_ms = 50
+
+[[chains]]
+chain_id = 56
+rpc = "https://your-other-node.example.com"
+gate = "0x0000000000000000000000000000000000000000"
+start_block = 0
+block_confirmation = 30
+poll_interval_ms = 2000
+max_block_range = 1000

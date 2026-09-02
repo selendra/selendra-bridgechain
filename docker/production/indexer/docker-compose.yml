@@ -1,0 +1,53 @@
+# ─── MACHINE 1 (co-located) of 5: the indexer ─────────────────────────────────
+#
+# Runs: indexer. Read-only against every chain — it never signs and never sends
+# a transaction. It is nonetheless load-bearing:
+#
+#   * it is the SOLE WRITER of `refund_status`, so without it the refund
+#     candidate list never populates and stranded transfers stay stranded;
+#   * it is the sole writer of the `cancelled`/`refunded` lifecycle, which it
+#     sets ONLY from observed on-chain events. The sig-store deliberately
+#     exposes no HTTP route for those states, because a forged "refunded" would
+#     hide a stuck transfer from every relayer.
+#
+# WHY THIS DEFAULTS TO THE STORE MACHINE
+# It is the one component besides sig-store that needs a Postgres credential.
+# Moving it to its own box means shipping that credential off-host AND exposing
+# the database port, which is a worse trade than co-location. It runs as its own
+# stack (its own compose file, restart, and logs) so it is still operated
+# separately — it just shares the host. See "Remote mode" below to override.
+#
+#   # on the store machine, AFTER `store/` is up:
+#   cp .env.example .env && edit && cp configs/indexer.toml.example configs/indexer.toml && edit
+#   docker compose up -d
+#
+services:
+  indexer:
+    image: "${BRIDGE_IMAGE:-selendra/bridge:local}"
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    command: ["indexer", "/configs/indexer.toml"]
+    environment:
+      # Wins over `database_url` in the TOML (Config::resolved_database_url), so
+      # the credential lives in .env and never in a config file.
+      DATABASE_URL: "${DATABASE_URL:?set DATABASE_URL}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./configs:/configs:ro
+    networks: [bridge-core]
+
+networks:
+  # Co-located mode (default): attach to the network `store/` already created,
+  # so `postgres:5432` resolves without publishing a port on the host.
+  #
+  # Remote mode: if this really must run on its own machine, delete this block,
+  # let compose create its own network, and point DATABASE_URL at the store
+  # host — but then you MUST publish Postgres with TLS and connect with
+  # `?sslmode=verify-full`, or the DB password and every row cross the network
+  # in cleartext. `sslmode=disable` over a WAN is not an option.
+  bridge-core:
+    external: true
+    name: bridge-core

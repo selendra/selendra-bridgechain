@@ -1,0 +1,35 @@
+# Keeper — TWO DIFFERENT LISTS, and mixing them up is the classic mistake.
+#
+#   [[targets]] = where transfers are DELIVERED. Claims and cancels run here.
+#   [[sources]] = where funds were LOCKED.      Refunds run here.
+#
+# A keeper with no [[sources]] never submits a refund, and nothing warns you at
+# runtime — the transfers simply sit in the candidate list forever. For a full
+# mesh, every chain usually appears in both lists.
+
+[[targets]]
+chain_id = 56
+rpc = "https://your-bsc-node.example.com"
+gate = "0x0000000000000000000000000000000000000000"
+poll_interval_ms = 2000
+
+[[sources]]
+chain_id = 1
+rpc = "https://your-node.example.com"
+gate = "0x0000000000000000000000000000000000000000"
+poll_interval_ms = 2000
+
+# A chain listed in BOTH lists logs a warning at startup: the two loops submit
+# from one account on one chain and can briefly contend on its nonce under load.
+# It is self-healing (the provider fetches the pending nonce fresh for every tx),
+# but for a busy bidirectional corridor run the two roles as separate keeper
+# processes, or give them separate funded accounts.
+
+# The funded gas-payer key. Same custody options as a validator's [signer];
+# a keystore is the production choice. NEVER `private_key = "0x…"` here.
+[keeper]
+keystore = "/run/secrets/keeper_keystore"
+keystore_password_file = "/run/secrets/keystore_password"
+
+[store]
+url = "https://sig-store.example.com"

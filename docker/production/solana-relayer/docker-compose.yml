@@ -1,0 +1,76 @@
+# ─── The Solana leg ───────────────────────────────────────────────────────────
+#
+# Runs: solana-relayer. This is the Solana equivalent of `validator/`, and it is
+# a SEPARATE BINARY AND IMAGE — not a config variant of the EVM validator.
+# `solana-client` pins zeroize <1.4 and alloy needs ^1.5, so the two dependency
+# trees cannot coexist in one binary, let alone one cargo workspace.
+#
+# WHAT IS SHARED WITH THE EVM VALIDATOR
+#   * the secp256k1 SIGNING KEY — the same key, so one validator set signs for
+#     both VMs and the gates' on-chain validator set covers Solana too;
+#   * the sig-store and SIG_STORE_VALIDATOR_TOKEN — this process does exactly
+#     what a validator does: it signs.
+# Nothing else. Different config shape, different cursor, different finality
+# rule. See docs/architecture.md §7.
+#
+# TWO DEPLOYMENT SHAPES, and you should be deliberate about which you run:
+#
+#   sign-only (this file alone) — the VALIDATOR role. Scans the Solana gate,
+#     signs Solana->EVM transfers, attests refunds. Delivers nothing. This is
+#     what each independent operator runs, one per operator, alongside their
+#     EVM validator/ stack.
+#
+#         ./preflight.sh && docker compose up -d
+#
+#   deliver-too (+ docker-compose.deliver.yml) — adds the KEEPER role for the
+#     EVM->Solana direction by supplying a `[target]` block and a payer keypair.
+#     On the EVM side that job lives in a separate binary on a separate machine;
+#     here it can share the process. Run ONE of these for the whole mesh, on the
+#     keeper machine — not one per validator operator.
+#
+#         cp configs/solana-relayer.deliver.toml.example configs/solana-relayer.toml
+#         ./preflight.sh
+#         docker compose -f docker-compose.yml -f docker-compose.deliver.yml up -d
+#
+# BEFORE `up`: run ./preflight.sh — same uid-10001 secret-permission trap as the
+# EVM validator/ and keeper/ stacks.
+#
+services:
+  solana-relayer:
+    image: "${RELAYER_IMAGE:-selendra/bridge-relayer:local}"
+    build:
+      context: ../../..
+      dockerfile: docker/Dockerfile.relayer
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    command: ["solana-relayer", "/configs/solana-relayer.toml"]
+    environment:
+      # Sign scope, exactly as the EVM validator uses. The relayer's
+      # `[store] token_env` defaults to this variable.
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"
+      # The secp256k1 validator key, read via `[signer] private_key_env`.
+      #
+      # NOTE — this is weaker custody than the EVM side. `solana-relayer`'s
+      # Signer accepts only `private_key` / `private_key_env`; it has NO
+      # encrypted-keystore option, so there is no equivalent of the validator/
+      # and keeper/ stacks' /run/secrets keystore. An env var is the best
+      # available here: it keeps the key off the container filesystem, but it is
+      # visible to `docker inspect` and to anything that can read /proc. Keep
+      # .env at 0600 and treat this host accordingly.
+      SOLANA_VALIDATOR_KEY: "${SOLANA_VALIDATOR_KEY:?set SOLANA_VALIDATOR_KEY}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./configs:/configs:ro
+      - solana-relayer-state:/data
+    # No ports: it exposes no API and needs no inbound connectivity. There is
+    # also no operator API here — the EVM validator's /pause, /resume and
+    # /rescan have no counterpart, so a bad cursor is fixed by stopping the
+    # container and editing the state file on the volume.
+    #
+    # No depends_on: the store is on another machine.
+
+volumes:
+  # The resumable cursor is the LAST PROCESSED TRANSACTION SIGNATURE, not a
+  # block number. Losing this volume makes the relayer rescan from the gate
+  # program's current signature history.
+  solana-relayer-state:

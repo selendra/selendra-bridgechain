@@ -1,0 +1,75 @@
+# solana-relayer, DELIVER-TOO (validator + the EVM->Solana keeper role).
+#
+# Note the shape differences from the EVM validator, all deliberate:
+#   * `[source]` is singular — one relayer process per Solana cluster, where the
+#     EVM validator takes repeatable `[[sources]]`.
+#   * finality is a COMMITMENT, not a block count.
+#   * the cursor is a transaction signature, not a block number.
+#   * there is no `[refund]` block: the refund attester always runs (see below).
+#   * there is no `[api]` block: no /status, /pause, /resume, /rescan.
+
+[source]
+# deBridge's chain id for Solana. Bound into every submissionId, so a wrong
+# value silently produces ids no EVM gate will ever accept — the failure mode is
+# "nothing is ever claimed", not an error.
+chain_id = 7565164
+rpc = "https://your-solana-rpc.example.com"
+# The deployed gate program, base58.
+program_id = "00000000000000000000000000000000000000000000"
+
+# SECURITY CRITICAL — this is the analogue of the EVM side's block_confirmation.
+# Signing a `Sent` that a fork later discards lets the destination pay out
+# against a deposit that never settles. `finalized` is the only safe value on a
+# real cluster; Config::load REFUSES anything else unless allow_unfinalized is
+# also set, which is correct only against a local test validator.
+commitment = "finalized"
+# allow_unfinalized = true   # NEVER on a real cluster
+
+poll_interval_ms = 4000
+# Cap on transaction signatures fetched per tick.
+max_batch = 100
+# Must live on the `solana-relayer-state` volume.
+state_file = "/data/solana-relayer-state.json"
+
+# The SAME secp256k1 key this operator's EVM validator signs with.
+#
+# There is no keystore option here, unlike the EVM `[signer]`. Use the env var —
+# it at least keeps the key off the container filesystem. Never `private_key`
+# inline: this file is mounted read-only into the container and is far easier to
+# leak than an env var.
+[signer]
+private_key_env = "SOLANA_VALIDATOR_KEY"
+
+[store]
+url = "https://sig-store.example.com"
+# Defaults to SIG_STORE_VALIDATOR_TOKEN; stated here so it is obvious that this
+# process presents the validator credential, because it does a validator's job.
+token_env = "SIG_STORE_VALIDATOR_TOKEN"
+
+# ── EVM -> Solana delivery: the KEEPER role ───────────────────────────────────
+# Presence of this block is what turns the relayer into a claim submitter. On
+# the EVM side this job lives in a separate `keeper` binary on a separate
+# machine; here it shares the process, and the two loops are isolated so a dead
+# submitter can never stop this node from signing.
+#
+# Run ONE of these for the whole mesh, on the keeper machine. Running one per
+# validator operator is not dangerous — each submit re-reads the on-chain
+# `["executed", id]` marker first, so the loser of a race lands nothing — it just
+# wastes SOL on failed races.
+#
+# Requires the deliver overlay, which mounts the keypair as a docker secret:
+#     docker compose -f docker-compose.yml -f docker-compose.deliver.yml up -d
+[target]
+# Solana keypair paying fees and rent for claim transactions. It holds NO BRIDGE
+# AUTHORITY — the validators' secp256k1 signatures carry that — so it needs only
+# enough SOL for fees. Keep the balance small and monitor it: an empty payer
+# means EVM->Solana transfers silently stop being delivered.
+payer_keypair = "/run/secrets/solana_payer"
+poll_interval_ms = 4000
+
+# ── The refund attester runs regardless ───────────────────────────────────────
+# Unlike the EVM validator, where omitting [refund] disables attestation, the
+# Solana refund attester is spawned unconditionally (main.rs:59). It has to be:
+# the EVM validators cannot read Solana, so without it nobody votes on whether
+# an undeliverable EVM->Solana transfer may be burned, and such a transfer would
+# be refundable only by hand.

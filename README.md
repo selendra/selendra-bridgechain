@@ -77,19 +77,33 @@ Field reference: [`config/README.md`](config/README.md).
 ## Architecture in one paragraph
 
 `send()` locks an ERC-20 on the source gate and emits `Sent(submissionId, …)`. The
-**validator** scans the source chain, independently recomputes the `submissionId`
-(`bridge-core`, byte-identical to `BridgeHash.sol`), and — only on an exact match —
-signs the EIP-191 digest and writes the signature to the file-backed store. The
-**keeper** reads the store and, once ≥ threshold signatures exist, submits `claim()`
-to the target gate, which re-derives the `submissionId`, verifies the signatures
-against its validator set, guards against replay (`executed[]`), and releases funds.
+**validator** scans the source chain at `latest - block_confirmation`, independently
+recomputes the `submissionId` (`bridge-core`, byte-identical to `BridgeHash.sol`)
+under the `bridgeDomain` it reads from the gate itself, checks the nonce is
+sequential for that corridor, and — only on an exact match — signs the EIP-191
+digest and writes the signature to the store. The **keeper** reads the store,
+discards any signature whose signer is not in the gate's current validator set,
+and once ≥ threshold survive submits `claim()` to the target gate, which re-derives
+the `submissionId`, verifies the signatures against its validator set, guards
+against replay (`executed[]`), and releases funds.
+
+Validators never talk to each other — the store is the only thing they share, and
+it is untrusted infrastructure: it re-verifies everything it is handed, and the
+Gate verifies it all again on-chain. See [`docs/architecture.md`](docs/architecture.md)
+§4.2–4.4 for how the validator and keeper work, and §4.7 (with
+[`docs/operations.md`](docs/operations.md) §5) for running them on separate machines.
 
 ## The sacred hash
 
-`submissionId = keccak256(abi.encodePacked(SUBMISSION_PREFIX, debridgeId,
-chainIdFrom, chainIdTo, amount, receiver, nonce))` (with an auto-params tail when an
-execution payload is attached). It is defined once in `contracts/src/BridgeHash.sol`
-and reproduced in `crates/bridge-core/src/lib.rs`. Phase 3 locks the two together:
+`submissionId = keccak256(abi.encodePacked(SUBMISSION_PREFIX, bridgeDomain,
+debridgeId, chainIdFrom, chainIdTo, amount, receiver, nonce))` (with an auto-params
+tail when an execution payload is attached). `bridgeDomain` binds the id to one
+deployment generation: without it an id commits only to (asset, chain pair, amount,
+receiver, nonce) and never to the gates themselves, so a previous deployment's
+quorum signatures stay valid against a freshly deployed gate on the same chain pair
+— which also restarts `nonceTo` at 0. It is defined once in
+`contracts/src/BridgeHash.sol` and reproduced in `crates/bridge-core/src/lib.rs`.
+Phase 3 locks the two together:
 
 ```bash
 cd contracts && forge test --match-contract GenFixtures   # Solidity writes fixtures
@@ -168,6 +182,14 @@ the 1-of-3 safety case, and recovery:
 bash scripts/testing/phase7.sh
 ```
 
+## Docker
+
+For a **distributed production deployment** — each component on its own machine —
+see [`docker/production/`](docker/production/README.md): one compose stack per
+role, with the secret-distribution table and cross-machine wiring.
+
+The single-host stack below is for local development.
+
 ## Docker (Phase 7)
 
 The off-chain stack is dockerized — `sig-store` + 3 validators + 1 keeper, plus two
@@ -190,19 +212,29 @@ docker compose up -d validator1 validator2 validator3 keeper
 
 ```toml
 # validator.toml
-[source]   chain_id, gate, start_block, block_confirmation, poll_interval_ms, max_block_range
-           rpc = "http://…"                 # single endpoint (back-compat), OR
-           rpcs = ["http://…", "http://…"]  # ordered failover list
-           state_file = "validator-state.json"   # resumable cursor + nonce state
-[signer]   # how this node holds its signing key — see "Key custody" below
-[store]    dir = "…"   OR   url = "http://sig-store:8080"
-[api]      bind = "127.0.0.1:9090"   # optional operator API
+[[sources]]  chain_id, gate, start_block, block_confirmation, poll_interval_ms, max_block_range
+             rpc = "http://…"                 # single endpoint (back-compat), OR
+             rpcs = ["http://…", "http://…"]  # ordered failover list
+             state_file = "validator-state.json"   # resumable cursor + nonce state
+             catchup_poll_interval_ms = 50    # optional; only while behind — see ops §3.2
+[signer]     # how this node holds its signing key — see "Key custody" below
+[store]      dir = "…"   OR   url = "http://sig-store:8080"
+[api]        bind = "127.0.0.1:9090"   # optional operator API
+[refund]     timeout_secs, poll_interval_ms, block_confirmation
+             # + one [[refund.destinations]] per chain this node can verify.
+             # Omit the whole block and this validator never attests refunds.
 
 # keeper.toml
-[target]   chain_id, rpc, gate, poll_interval_ms
-[keeper]   # funded gas-payer key — same custody options as [signer]
-[store]    dir = "…"   OR   url = "http://sig-store:8080"
+[[targets]]  chain_id, rpc, gate, poll_interval_ms   # claims + cancels, on the DESTINATION
+[[sources]]  chain_id, rpc, gate, poll_interval_ms   # refunds, where funds were locked
+[keeper]     # funded gas-payer key — same custody options as [signer]
+[store]      dir = "…"   OR   url = "http://sig-store:8080"
 ```
+
+Both are repeatable: one validator process can watch several source chains, and one
+keeper can deliver to several destinations. The singular `[source]` / `[target]`
+forms still load and are folded into the lists. A keeper with no `[[sources]]` never
+submits a refund; a validator with no `[refund]` block never attests one.
 
 ### Key custody
 

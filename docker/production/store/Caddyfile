@@ -1,0 +1,45 @@
+# TLS in front of the sig-store, plus a network-layer allowlist.
+#
+# Two independent controls guard this endpoint, and you want both:
+#   1. the bearer token  — proves WHICH ROLE is calling (validator/keeper/reader)
+#   2. this IP allowlist — bounds WHO CAN TRY AT ALL, so a leaked token is not
+#      immediately usable from the open internet
+#
+# Neither is load-bearing for fund safety (the Gate re-verifies every signature
+# on-chain), but together they are what keeps a token leak from becoming a
+# censorship or spam incident.
+
+{
+	email {$ACME_EMAIL}
+	# Uncomment while testing so you do not burn Let's Encrypt rate limits:
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$SIG_STORE_DOMAIN} {
+	encode zstd gzip
+
+	# OPERATOR_CIDRS is space-separated, e.g. "203.0.113.7/32 198.51.100.0/24".
+	# Include every validator host, the keeper host, and the API host.
+	#
+	# NOTE: if this sits behind a cloud load balancer, `remote_ip` sees the
+	# balancer, not the client. Either put Caddy on a public IP directly, or
+	# switch this to `client_ip` and add a `servers { trusted_proxies ... }`
+	# block for the balancer's ranges — otherwise the allowlist matches
+	# everyone.
+	@allowed remote_ip {$OPERATOR_CIDRS}
+
+	handle @allowed {
+		reverse_proxy sig-store:8080 {
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	handle {
+		respond "forbidden" 403
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -1,0 +1,85 @@
+# Validator — one [[sources]] block per chain THIS operator watches.
+#
+# Everything here is per-operator. `block_confirmation` in particular is not a
+# fleet-wide constant: a validator on a slower or less-trusted endpoint should
+# sit further from the tip, and nothing requires operators to agree. A more
+# conservative one simply signs later.
+
+[[sources]]
+chain_id = 1
+# YOUR OWN endpoints — not the ones another validator uses. Ordered failover;
+# the validator moves to the next on error and guards chainId on each.
+rpcs = [
+  "https://your-node.example.com",
+  "https://your-backup-node.example.com",
+]
+gate = "0x0000000000000000000000000000000000000000"
+start_block = 0
+# SECURITY CRITICAL. Signing at the chain tip lets a source reorg erase the
+# deposit AFTER the keeper has already released destination liquidity — a
+# double-spend of bridge funds. Must exceed this chain's maximum reorg depth.
+# Startup FAILS at 0 unless allow_zero_confirmation is also set, which is
+# correct only on an instant-finality dev chain.
+block_confirmation = 64
+poll_interval_ms = 2000
+max_block_range = 1000
+# Must be on the `validator-state` volume, and unique per source chain.
+state_file = "/data/chain-1-state.json"
+# Optional; only while behind. See operations.md §3.2 before enabling — on a
+# shared rate-limited endpoint this starves other consumers of the same key.
+# catchup_poll_interval_ms = 50
+
+# [[sources]]
+# chain_id = 56
+# rpcs = ["https://your-bsc-node.example.com"]
+# gate = "0x…"
+# start_block = 0
+# block_confirmation = 30
+# poll_interval_ms = 2000
+# max_block_range = 1000
+# state_file = "/data/chain-56-state.json"
+
+# Key custody. Exactly one source may be set; a keystore is the production
+# choice. Both paths below are docker secrets, mounted read-only at /run/secrets
+# by the compose file. NEVER use `private_key = "0x…"` here.
+[signer]
+keystore = "/run/secrets/validator_keystore"
+keystore_password_file = "/run/secrets/keystore_password"
+
+# The shared store, over TLS. Plain http:// puts the bearer token on the wire in
+# cleartext, and a captured sign token is a stolen credential.
+[store]
+url = "https://sig-store.example.com"
+
+# Optional operator API. Published to host loopback only by the compose file.
+[api]
+bind = "0.0.0.0:9090"
+# token comes from VALIDATOR_API_TOKEN in .env
+
+# ── Refund attestation ────────────────────────────────────────────────────────
+# Omit this whole block and this validator never votes on whether a stranded
+# transfer may be cancelled or refunded. That is the SAFE default, not a
+# degraded one: a node that cannot independently read the destination chain must
+# not have an opinion on whether a transfer was delivered.
+#
+# If you do enable it, list every destination you can verify — and only those.
+# A transfer bound for a chain not listed here is never attested.
+[refund]
+# How long a transfer must sit unclaimed before this node will attest a cancel.
+# THIS value binds, not the indexer's: the validator establishes the age itself
+# by reading `sentBy(id)` at a block whose own timestamp is that far behind the
+# chain head. Set it to match the indexer's `refund_timeout_secs` so the two
+# agree on intent. Wall-clock skew on this host does not affect it.
+timeout_secs = 3600
+poll_interval_ms = 30000
+# SECURITY CRITICAL. A refund is irreversible and is authorised solely on having
+# read `cancelled == true` on the DESTINATION. Read that at the tip and a
+# destination reorg re-enables the original claim signatures — the transfer is
+# paid on the destination AND refunded on the source. Must exceed the
+# DESTINATION chain's maximum reorg depth.
+block_confirmation = 64
+
+[[refund.destinations]]
+chain_id = 56
+rpcs = ["https://your-bsc-node.example.com"]
+gate = "0x0000000000000000000000000000000000000000"

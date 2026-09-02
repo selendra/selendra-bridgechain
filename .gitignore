@@ -91,3 +91,12 @@ config/deployments/*.json
 docker/*/configs/
 docker/*/.env
 docker/*/keys/
+
+# Production stacks (docker/production/<role>/): the templates are tracked, the
+# filled-in copies never are. A real .env holds the sig-store tokens and the DB
+# password; a real config holds RPC URLs with API keys; secrets/ holds keystores.
+docker/production/*/.env
+docker/production/*/configs/*
+!docker/production/*/configs/*.example
+docker/production/*/secrets/*
+!docker/production/*/secrets/README.md

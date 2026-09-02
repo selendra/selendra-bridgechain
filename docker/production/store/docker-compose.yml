@@ -1,0 +1,99 @@
+# ─── MACHINE 1 of 5: the store ────────────────────────────────────────────────
+#
+# Runs: Postgres, sig-store, and a TLS terminator in front of it.
+#
+# This is the only machine every other role talks to, and it is a RENDEZVOUS
+# POINT, NOT AN AUTHORITY: the sig-store re-derives every submissionId from its
+# own parameters and ecrecovers every signature before storing it, and the Gate
+# contract verifies the whole quorum again on-chain at claim time. An operator
+# who owns this box can CENSOR (stall transfers, which the two-phase refund
+# recovers from). They cannot FORGE. See docs/architecture.md §4.7.
+#
+# What must NOT leave this machine:
+#   * the Postgres port — it is deliberately not published; only sig-store and
+#     the indexer touch it, and both are on this host's private network.
+#   * SIG_STORE_ADMIN_TOKEN — allowlist writes are themselves a security control.
+#
+#   cp .env.example .env && edit && docker compose up -d
+#
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-bridge}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-bridge}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No `ports:`. On purpose — see the header. The indexer reaches it over the
+    # shared `bridge-core` network below, not over the host's interfaces.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bridge} -d ${POSTGRES_DB:-bridge}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [bridge-core]
+
+  sig-store:
+    image: "${BRIDGE_IMAGE:-selendra/bridge:local}"
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    command: ["sig-store", "--bind", "0.0.0.0:8080"]
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-bridge}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bridge}"
+      # One token per role. A leak from any single component must not let the
+      # holder act as another — that is the whole point of the split, and it is
+      # enforced server-side per route (bridge-core/src/auth.rs).
+      #
+      # Do NOT set SIG_STORE_TOKEN here: it is the legacy all-scopes secret and
+      # grants read+sign+relay+admin to whoever holds it.
+      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"
+      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN}"
+      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"
+      SIG_STORE_ADMIN_TOKEN: "${SIG_STORE_ADMIN_TOKEN:?set SIG_STORE_ADMIN_TOKEN}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    depends_on:
+      postgres: { condition: service_healthy }
+    # Also unpublished: every external caller arrives through the TLS terminator.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [bridge-core]
+
+  # TLS termination. sig-store speaks plain HTTP and terminates nothing itself,
+  # so without this the bearer tokens cross the network in cleartext — and a
+  # captured SIG_STORE_VALIDATOR_TOKEN is a stolen sign credential.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"     # ACME HTTP-01 challenge + redirect to 443
+      - "443:443"
+    environment:
+      SIG_STORE_DOMAIN: "${SIG_STORE_DOMAIN:?set SIG_STORE_DOMAIN}"
+      ACME_EMAIL: "${ACME_EMAIL:?set ACME_EMAIL}"
+      OPERATOR_CIDRS: "${OPERATOR_CIDRS:?set OPERATOR_CIDRS}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      sig-store: { condition: service_healthy }
+    networks: [bridge-core]
+
+volumes:
+  pgdata:
+  caddy-data:
+  caddy-config:
+
+networks:
+  bridge-core:
+    # Named explicitly so the indexer stack on this same host can attach to it
+    # as an external network without needing a DB port on the host interface.
+    name: bridge-core

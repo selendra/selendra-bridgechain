@@ -1,0 +1,25 @@
+# Public TLS front for the SPA. No IP allowlist here — this one is meant to be
+# reachable. Everything behind it is read-only (see the compose header).
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy frontend:8080
+
+	log {
+		output stdout
+		format console
+	}
+}

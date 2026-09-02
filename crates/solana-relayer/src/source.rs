@@ -6,12 +6,32 @@
 //! signature. It signs with the same secp256k1 key the validator uses on the EVM
 //! side, so one validator set attests for both chains.
 //!
-//! The two safety rules carried over from the EVM scanner:
+//! The three safety rules carried over from the EVM scanner:
 //!   * **finality** — read only at `finalized`, so a fork cannot discard a `Sent`
 //!     after the destination has paid out (enforced in [`crate::config`]);
 //!   * **never sign what you cannot reproduce** — a mismatch between the emitted
 //!     and recomputed id means a lying RPC or a divergent program, and is a hard
-//!     stop rather than a skip.
+//!     stop rather than a skip;
+//!   * **the allowlist gates signing, not just claiming** — see below.
+//!
+//! ## Why the allowlist has to be enforced HERE
+//!
+//! This scanner used to sign every `Sent` it could authenticate, leaving the
+//! allowlist to the EVM keeper's pre-claim check. That made the control
+//! asymmetric in a way nothing surfaced: on an EVM→EVM corridor a de-listed
+//! token never reaches quorum, because each validator withholds its signature;
+//! on Solana→EVM it reached quorum anyway, and `Gate.claim` is `external` with
+//! no access control and no notion of an off-chain list — it checks validator
+//! signatures and `tokenOf[debridgeId] != 0`, nothing more. The signatures are
+//! public (the GraphQL API serves the raw 65 bytes so a user can self-claim), so
+//! *anyone* could complete a transfer the operator had just de-listed. The
+//! keeper's check only ever bound the keeper.
+//!
+//! Not a fund-loss bug — the gate still releases only registered assets against
+//! a real quorum — but an operational kill-switch that silently did nothing in
+//! one direction, which is worse than no kill-switch, because it is reached for
+//! during an incident. Withholding the signature is the only thing that actually
+//! stops the transfer, so it happens here.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -32,7 +52,7 @@ use tracing::{info, warn};
 use crate::config::SourceChain;
 use crate::gate::{commitment, decode_config_view, evm_address, sign};
 use crate::state::Cursor;
-use crate::store::{SignerSig, Store, SubmissionRecord};
+use crate::store::{Allowlist, SignerSig, Store, SubmissionRecord};
 
 /// One entry from `getSignaturesForAddress`.
 type SignatureEntry = solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
@@ -107,6 +127,26 @@ fn recompute(sent: &Sent, bridge_domain: &[u8; 32]) -> [u8; 32] {
     }
 }
 
+/// Whether the allowlist permits attesting this transfer.
+///
+/// Split out from the I/O so the opt-in semantics are unit-testable, exactly as
+/// the refund loop splits `decide` from its chain reads.
+///
+/// `None` means enforcement is off — reserved for the case where no allowlist
+/// could be established at all. It is deliberately NOT what a failed fetch
+/// produces: see the fail-closed skip in `tick`.
+fn allowlist_permits(
+    allowlist: Option<&Allowlist>,
+    debridge_id: &str,
+    chain_from: u64,
+    chain_to: u64,
+) -> bool {
+    match allowlist {
+        None => true,
+        Some(a) => a.token_allowed(debridge_id) && a.chain_allowed(chain_from, chain_to),
+    }
+}
+
 pub struct Scanner {
     rpc: RpcClient,
     program_id: Pubkey,
@@ -119,6 +159,9 @@ pub struct Scanner {
     signer_address: String,
     store: Store,
     cursor: Cursor,
+    /// Refetched every tick, so an operator de-listing a token takes effect
+    /// across the fleet without restarting anything.
+    allowlist: Option<Allowlist>,
 }
 
 impl Scanner {
@@ -142,6 +185,7 @@ impl Scanner {
             signer_address,
             store,
             cursor,
+            allowlist: None,
         })
     }
 
@@ -284,6 +328,19 @@ impl Scanner {
     }
 
     async fn tick(&mut self) -> anyhow::Result<usize> {
+        // Allowlist for this tick, refetched so a de-listing propagates without a
+        // restart. FAIL-CLOSED, mirroring the EVM validator: a fetch failure ends
+        // the tick with the cursor untouched, so we never sign against a stale
+        // view of what is permitted. Falling behind is recoverable; signing a
+        // transfer the operator has just de-listed is not — the signature is
+        // public the moment it lands, and anyone can then claim on it.
+        self.allowlist = Some(
+            self.store
+                .allowlist()
+                .await
+                .context("fetching the allowlist; skipping tick rather than signing on a stale view")?,
+        );
+
         // Oldest-first, so the nonce sequence and the cursor advance monotonically.
         let entries = self.collect_since_cursor().await?;
         if entries.is_empty() {
@@ -379,6 +436,29 @@ impl Scanner {
         // `process_send` can write, so it is the thing that actually distinguishes
         // "the gate locked these funds" from "someone printed a convincing line".
         if !self.origin_proof_holds(event, sent, tx).await? {
+            return Ok(false);
+        }
+
+        // Allowlist gate. Withhold the signature so the transfer can never reach
+        // quorum — the only thing that actually stops it, since `Gate.claim` is
+        // permissionless and the collected signatures are public. Skip rather
+        // than error: the transfer really happened on-chain and there is nothing
+        // to retry, so the cursor moves past it exactly as the EVM validator
+        // consumes the nonce of a blocked transfer.
+        let debridge_hex = format!("0x{}", hex::encode(sent.debridge_id));
+        if !allowlist_permits(
+            self.allowlist.as_ref(),
+            &debridge_hex,
+            sent.chain_id_from,
+            sent.chain_id_to,
+        ) {
+            warn!(
+                submission_id = %format!("0x{}", hex::encode(sent.submission_id)),
+                debridge_id = %debridge_hex,
+                chain_from = sent.chain_id_from,
+                chain_to = sent.chain_id_to,
+                "BLOCKED by allowlist — withholding signature"
+            );
             return Ok(false);
         }
 
@@ -482,6 +562,81 @@ mod tests {
 
     use super::*;
     use bridge_solana::relayer::{sent_event_to_program_data_line, SentEvent};
+    use crate::store::{AllowedChain, AllowedToken};
+
+    // --- allowlist enforcement ----------------------------------------------
+    //
+    // THE FINDING these pin: this scanner signed every authentic `Sent`,
+    // regardless of the allowlist, leaving the check to the EVM keeper. But
+    // `Gate.claim` is `external` with no access control and no notion of the
+    // off-chain list, and the collected signatures are served publicly by the
+    // GraphQL API — so a quorum reached here is claimable by anyone, and the
+    // keeper's check bound only the keeper. On EVM→EVM the same de-listing DOES
+    // stop the transfer, because each validator withholds. The asymmetry was
+    // silent, which is what made it dangerous: an operator reaching for the
+    // kill-switch mid-incident would believe it had fired.
+
+    const SOL: u64 = 7_565_164;
+    const SEPOLIA: u64 = 11_155_111;
+
+    fn allowing(tokens: &[&str], chains: &[(u64, u64)]) -> Allowlist {
+        Allowlist::from_parts(
+            &tokens.iter().map(|t| AllowedToken { debridge_id: (*t).into() }).collect::<Vec<_>>(),
+            &chains
+                .iter()
+                .map(|(f, t)| AllowedChain { chain_id_from: *f, chain_id_to: *t })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn a_delisted_token_is_not_attested() {
+        let list = allowing(&["0xaa"], &[]);
+        assert!(
+            !allowlist_permits(Some(&list), "0xbb", SOL, SEPOLIA),
+            "a token absent from a non-empty list must never be signed for"
+        );
+    }
+
+    #[test]
+    fn a_delisted_corridor_is_not_attested() {
+        let list = allowing(&[], &[(SEPOLIA, SOL)]);
+        assert!(
+            !allowlist_permits(Some(&list), "0xaa", SOL, SEPOLIA),
+            "the pair is directed: allowing EVM->Solana must not allow Solana->EVM"
+        );
+    }
+
+    #[test]
+    fn an_allowed_transfer_is_attested() {
+        let list = allowing(&["0xaa"], &[(SOL, SEPOLIA)]);
+        assert!(allowlist_permits(Some(&list), "0xAA", SOL, SEPOLIA));
+    }
+
+    /// Both lists must pass, not either. A listed token on an unlisted corridor
+    /// is still blocked.
+    #[test]
+    fn both_lists_must_pass() {
+        let list = allowing(&["0xaa"], &[(SEPOLIA, SOL)]);
+        assert!(!allowlist_permits(Some(&list), "0xaa", SOL, SEPOLIA));
+    }
+
+    /// Opt-in: a fleet that has never seeded the lists keeps working, exactly as
+    /// on the EVM side. Enforcement turns on with the first row, not with a
+    /// deploy.
+    #[test]
+    fn an_empty_allowlist_still_permits_everything() {
+        let list = allowing(&[], &[]);
+        assert!(allowlist_permits(Some(&list), "0xanything", SOL, SEPOLIA));
+    }
+
+    /// `None` means "no allowlist established", which after this change can only
+    /// happen before the first successful fetch — `tick` fails closed rather
+    /// than proceeding with `None` on a fetch error.
+    #[test]
+    fn no_allowlist_means_no_enforcement() {
+        assert!(allowlist_permits(None, "0xanything", SOL, SEPOLIA));
+    }
 
     fn sample() -> Sent {
         let mut s = Sent {

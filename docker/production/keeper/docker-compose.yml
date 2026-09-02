@@ -1,0 +1,62 @@
+# ─── MACHINE 4 of 5: the keeper ───────────────────────────────────────────────
+#
+# Runs: keeper. It holds a funded gas-payer key and NO OTHER AUTHORITY. Every
+# transaction it sends is re-verified on-chain by Gate._verifySignatures before
+# anything moves, so a hostile keeper can waste its own gas, delay delivery, or
+# reorder ready transfers — it cannot move funds the validators did not already
+# authorise. That is why running one is permissionless, and why RUNNING MORE
+# THAN ONE IS SAFE and is the normal way to get redundancy: each try_* re-reads
+# on-chain state first, so the loser of a race sees `executed == true` and does
+# nothing.
+#
+# THE KEY HERE IS A HOT WALLET. It must stay funded on every chain in
+# [[targets]] and [[sources]] or delivery silently stops (the loop logs
+# "claim failed" each tick and moves on). Fund it, monitor its balance, and keep
+# no more on it than a few days of gas.
+#
+#
+# BEFORE `up`: run ./preflight.sh
+# Docker compose file-secrets are bind-mounted with the HOST file's ownership,
+# and compose IGNORES the `uid`/`gid`/`mode` long syntax outside swarm mode.
+# This image runs as uid 10001, so a keystore left at your-user:0600 is
+# unreadable inside the container and the only symptom is a restart loop
+# logging "Permission denied (os error 13)". preflight.sh checks for it and
+# prints the fix.
+#
+#   cp .env.example .env && edit && chmod 600 .env
+#   cp configs/keeper.toml.example configs/keeper.toml && edit
+#   # put an encrypted keystore + its password in ./secrets (see README §4)
+#   ./preflight.sh && docker compose up -d
+#
+services:
+  keeper:
+    image: "${BRIDGE_IMAGE:-selendra/bridge:local}"
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    command: ["keeper", "/configs/keeper.toml"]
+    environment:
+      # Relay scope: read + record a claim tx. It CANNOT deposit signatures —
+      # which is the point of the split. A compromised keeper cannot forge a
+      # quorum, only spend its own gas.
+      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./configs:/configs:ro
+    secrets:
+      - keeper_keystore
+      - keystore_password
+    # No ports. The keeper exposes no API and needs no inbound connectivity —
+    # it only makes outbound calls to the store and to its chains' RPCs.
+    #
+    # No depends_on either: the store is on another machine. If it is
+    # unreachable the allowlist fetch fails and the keeper SKIPS THE TICK rather
+    # than submitting against a stale view — fail-closed by design.
+
+secrets:
+  keeper_keystore:
+    file: ./secrets/keystore.json
+  keystore_password:
+    file: ./secrets/keystore-password

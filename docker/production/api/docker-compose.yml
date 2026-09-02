@@ -1,0 +1,99 @@
+# ─── MACHINE 5 of 5: the public surface ───────────────────────────────────────
+#
+# Runs: graphql-api + the frontend SPA + a TLS terminator.
+#
+# This is the ONLY machine exposed to the open internet, so it is the one most
+# likely to be compromised — and it is deliberately the least privileged:
+#
+#   * it holds SIG_STORE_READER_TOKEN and nothing else. That grants Read scope:
+#     no signature deposits, no mark-claimed, no allowlist writes. Whoever takes
+#     this box can read bridge history and nothing more.
+#   * graphql-api holds NO DATABASE CREDENTIAL. It reads history through the
+#     sig-store's read scope, not from Postgres. Do not hand it a DATABASE_URL
+#     even when running it by hand.
+#   * mutations are OFF. `--allow-mutations` would expose `submitSignature`,
+#     letting anyone who reaches this box push signatures into the store. The
+#     Gate would still reject non-validator keys on-chain, but there is no
+#     reason to open it. Leave it off.
+#
+#   cp .env.example .env && edit && cp configs/chains.json.example configs/chains.json && edit
+#   docker compose up -d
+#
+services:
+  graphql-api:
+    image: "${BRIDGE_IMAGE:-selendra/bridge:local}"
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    # `--gate` and `--swap` are REPEATABLE flags, which compose cannot template
+    # from a single variable — so the command runs through a shell and the two
+    # variables are word-split deliberately. Keep them space-separated with no
+    # quoting inside; see .env.example for the exact shape.
+    entrypoint: ["/usr/bin/tini", "--", "/bin/sh", "-c"]
+    command:
+      - >-
+        exec graphql-api
+        --bind 0.0.0.0:8088
+        --store-url "$${SIG_STORE_URL}"
+        --threshold "$${BRIDGE_THRESHOLD}"
+        --chains-file /configs/chains.json
+        $${GRAPHQL_GATES}
+        $${GRAPHQL_SWAPS}
+    environment:
+      SIG_STORE_URL: "${SIG_STORE_URL:?set SIG_STORE_URL}"
+      BRIDGE_THRESHOLD: "${BRIDGE_THRESHOLD:?set BRIDGE_THRESHOLD}"
+      GRAPHQL_GATES: "${GRAPHQL_GATES:-}"
+      GRAPHQL_SWAPS: "${GRAPHQL_SWAPS:-}"
+      # Read scope only. This is the most exposed component in the system.
+      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"
+      # Caps the span of a single eth_getLogs the API issues for pool reads.
+      # Match your RPC provider's limit (Alchemy free tier: 10).
+      GRAPHQL_MAX_BLOCK_RANGE: "${GRAPHQL_MAX_BLOCK_RANGE:-1000}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./configs:/configs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+    networks: [bridge-api]
+
+  frontend:
+    image: "${FRONTEND_IMAGE:-selendra/bridge-frontend:local}"
+    build:
+      context: ../../..
+      dockerfile: docker/Dockerfile.frontend
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    # nginx serves the SPA and proxies /graphql + /health to graphql-api over
+    # this stack's private network, so the browser talks to the backend
+    # same-origin and no CORS config is needed. graphql-api is never published.
+    depends_on:
+      graphql-api: { condition: service_healthy }
+    networks: [bridge-api]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      APP_DOMAIN: "${APP_DOMAIN:?set APP_DOMAIN}"
+      ACME_EMAIL: "${ACME_EMAIL:?set ACME_EMAIL}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [frontend]
+    networks: [bridge-api]
+
+volumes:
+  caddy-data:
+  caddy-config:
+
+networks:
+  bridge-api:
