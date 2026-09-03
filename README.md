@@ -110,6 +110,21 @@ cd contracts && forge test --match-contract GenFixtures   # Solidity writes fixt
 cd ..        && cargo test -p bridge-core                  # Rust must reproduce them
 ```
 
+## Governance is delayed, in both directions that grant power
+
+The Gate is UUPS behind a proxy, and an implementation swap waits out
+`UPGRADE_DELAY` (48 h) after `scheduleUpgrade`. The same delay covers the two
+changes that buy the same power without touching the code — **adding a
+validator** and **lowering the threshold** — because an owner who could do those
+in one transaction could sign a claim for every corridor and empty the gate with
+no notice at all, which made the upgrade timelock decorative.
+
+Removing a validator, raising the threshold, `pause()` and cancelling a queued
+action all stay immediate: every direction that shrinks an attacker's reach is
+what incident response needs, and only granting power waits. See
+[`docs/operations.md`](docs/operations.md) §9 for the rotation runbook and the one
+case (`validatorCount == threshold`) that needs planning.
+
 ## Run the tests
 
 ```bash

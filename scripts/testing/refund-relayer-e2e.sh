@@ -122,7 +122,9 @@ done
 echo "✅ Postgres ready"
 
 echo "=== starting sig-store ($STORE_URL) ==="
-SIG_STORE_BIND=127.0.0.1:8087 DATABASE_URL="$DATABASE_URL" "$ROOT/target/debug/sig-store" >"$LOGS/refund-relayer-sig-store.log" 2>&1 & track $!
+# --allow-unauthenticated: local demo on 127.0.0.1, no tokens to distribute.
+# The binary now refuses to serve an open store without being told to.
+SIG_STORE_BIND=127.0.0.1:8087 DATABASE_URL="$DATABASE_URL" "$ROOT/target/debug/sig-store" --allow-unauthenticated >"$LOGS/refund-relayer-sig-store.log" 2>&1 & track $!
 for _ in $(seq 1 60); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -s "$STORE_URL/health" | grep -q ok || fail "sig-store did not come up"
 echo "✅ sig-store healthy"

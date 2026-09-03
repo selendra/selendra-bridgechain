@@ -72,8 +72,59 @@ contract SwapRouter is ReentrancyGuard {
     ///         second leg. Set by the owner per corridor.
     mapping(uint256 chainIdTo => bytes remoteRouter) public remoteRouter;
 
-    /// @notice per-submission idempotency guard for the destination leg.
+    /// @notice per-submission idempotency guard for the destination leg. Set only
+    ///         when the delivery actually REACHES a terminal outcome — the swap ran,
+    ///         or the grace period below expired and the stable went out instead.
     mapping(bytes32 submissionId => bool) public finalized;
+
+    /// @notice When this router first found the destination swap impossible for a
+    ///         submission. Zero until that happens. See {FALLBACK_GRACE}.
+    mapping(bytes32 submissionId => uint256 since) public deferredSince;
+
+    /// @notice Stable this router is holding for transfers that were claimed out
+    ///         of the Gate but have not been delivered yet (see {FALLBACK_GRACE}).
+    ///
+    /// @dev    {rescue} exists for stranded dust, and the router really is only a
+    ///         transient custodian — but it could not tell dust from a delivery
+    ///         still in flight. Sweeping the stable in that window makes `finalize`
+    ///         revert for the transfer while `executed` is already set on the Gate,
+    ///         so the two-phase refund cannot recover it either: the funds are gone
+    ///         from both ends. The owner can still sweep everything ELSE, which is
+    ///         all `rescue` was ever for.
+    uint256 public owedStable;
+
+    /// @notice How long a blocked destination swap is retried before the router
+    ///         gives up and delivers the carrier stable instead.
+    ///
+    /// @dev    THE FALLBACK USED TO BE INSTANT, AND THAT WAS THE BUG.
+    ///
+    ///         `_deliver` wraps `pool.swap` in try/catch so funds are never
+    ///         stranded. But the catch could not tell "this swap is impossible"
+    ///         from "this swap is impossible *right now*": a paused pool, a token
+    ///         delisted for an hour, or a `finalToken` reserve momentarily below
+    ///         the required output all landed in the same branch — and because
+    ///         `finalized` was set before the attempt, there was never a second
+    ///         one after the condition cleared.
+    ///
+    ///         Two consequences, both bad. Pausing the pool during an incident
+    ///         silently converted every in-flight cross-chain swap into a stable
+    ///         payout, which is the opposite of what a circuit breaker is for. And
+    ///         since `finalize` is PERMISSIONLESS, anyone could manufacture the
+    ///         condition — swap the `finalToken` reserve below the required output,
+    ///         then call `finalize` — and force the user to take the carrier asset
+    ///         instead of the token they signed for, ignoring their signed
+    ///         `finalMinOut` entirely. One transaction, no cost beyond the swap.
+    ///
+    ///         So a blocked swap now DEFERS: the router records when it first saw
+    ///         the blockage and returns without settling anything. Any later call
+    ///         completes the real swap the moment the condition clears. Only once
+    ///         the whole window has passed does the stable go out, which is what
+    ///         still guarantees funds are never stranded.
+    ///
+    ///         The griefing attack is not free any more: it now costs holding the
+    ///         reserve suppressed for the entire window against every honest
+    ///         `finalize` in it, instead of a single well-timed transaction.
+    uint256 public constant FALLBACK_GRACE = 6 hours;
 
     // --- events ---
     event SwapBridged(
@@ -95,8 +146,18 @@ contract SwapRouter is ReentrancyGuard {
         bool swapped
     );
     /// @dev the destination swap could not complete (e.g. output over the pool
-    ///      lock, or token unlisted); the stable was delivered instead.
+    ///      lock, or token unlisted) for the whole {FALLBACK_GRACE} window; the
+    ///      stable was delivered instead.
     event FinalizeFallback(bytes32 indexed submissionId, address indexed finalReceiver, uint256 stableAmount);
+    /// @dev the destination swap is blocked but the grace window has not expired,
+    ///      so nothing was settled and the transfer stays finalizable. `retryAfter`
+    ///      is when the stable fallback becomes available.
+    event FinalizeDeferred(
+        bytes32 indexed submissionId,
+        address indexed finalReceiver,
+        address finalToken,
+        uint256 retryAfter
+    );
     event RemoteRouterSet(uint256 indexed chainIdTo, bytes remoteRouter);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
@@ -114,6 +175,9 @@ contract SwapRouter is ReentrancyGuard {
     /// @dev the caller did not forward enough gas for the destination swap to be
     ///      attempted honestly. See {MIN_DELIVER_GAS}.
     error InsufficientGas(uint256 have, uint256 need);
+    /// @dev {rescue} would have taken stable that a claimed-but-undelivered
+    ///      transfer is owed. See {owedStable}.
+    error RescueWouldTakeOwedFunds(uint256 requested, uint256 free);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -289,13 +353,29 @@ contract SwapRouter is ReentrancyGuard {
         if (_toAddress(receiver) != address(this)) revert NotForThisRouter();
         if (gate.tokenOf(debridgeId) != stable) revert UnexpectedAsset();
 
-        finalized[submissionId] = true; // effects before interactions (idempotent)
-
         (address finalToken, address finalReceiver, uint256 finalMinOut) =
             _decodeIntent(autoParams);
         if (finalReceiver == address(0)) revert ZeroAddress();
 
-        _deliver(submissionId, amount, finalToken, finalReceiver, finalMinOut);
+        // The guard is set only when `_deliver` actually settles — see
+        // {FALLBACK_GRACE}. Setting it before the attempt is what turned a
+        // momentary blockage into a permanent downgrade to the carrier stable.
+        //
+        // Reentrancy is still covered: both entry points are `nonReentrant`, so
+        // nothing can re-enter `_settle` while `_deliver`'s external calls are in
+        // flight, and every path that moves funds sets the guard before returning.
+        //
+        // `deferredSince` doubles as "this submission's stable is already counted
+        // in `owedStable`", which is why it is read BEFORE the call: `_deliver`
+        // sets it on the first deferral, so reading after would lose the
+        // distinction between an existing debt and a new one.
+        uint256 owedAlready = deferredSince[submissionId];
+        if (_deliver(submissionId, amount, finalToken, finalReceiver, finalMinOut)) {
+            finalized[submissionId] = true;
+            if (owedAlready != 0) owedStable -= amount;
+        } else if (owedAlready == 0) {
+            owedStable += amount;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -306,8 +386,16 @@ contract SwapRouter is ReentrancyGuard {
     ///         with a malformed intent that can never `finalize`). The router is
     ///         only ever a transient custodian, so any resting balance is either
     ///         dust or stuck funds — same trust model as the Gate/pool owner.
+    /// @dev    The stable is capped at what is NOT owed to a pending delivery; see
+    ///         {owedStable}. Every other token sweeps freely, since only the stable
+    ///         is ever held on a user's behalf between `claim` and `finalize`.
     function rescue(address token, uint256 amount, address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
+        if (token == stable) {
+            uint256 balance = IERC20(stable).balanceOf(address(this));
+            uint256 free = balance > owedStable ? balance - owedStable : 0;
+            if (amount > free) revert RescueWouldTakeOwedFunds(amount, free);
+        }
         IERC20(token).safeTransfer(to, amount);
     }
 
@@ -315,21 +403,47 @@ contract SwapRouter is ReentrancyGuard {
     // Internal
     // ---------------------------------------------------------------------
 
-    /// @dev Swap the delivered stable into `finalToken` for `finalReceiver`. If
-    ///      the swap cannot complete (output over the pool lock, token unlisted,
-    ///      slippage), deliver the stable itself so the funds are never stranded.
+    /// @dev Swap the delivered stable into `finalToken` for `finalReceiver`.
+    ///
+    ///      Returns TRUE when the delivery reached a terminal outcome (the swap
+    ///      ran, or the stable went out because {FALLBACK_GRACE} expired) and the
+    ///      caller should mark the submission finalized. Returns FALSE when the
+    ///      swap is only *currently* impossible: nothing is settled, the stable
+    ///      stays at the router, and any later `finalize` completes it properly.
     function _deliver(
         bytes32 submissionId,
         uint256 amount,
         address finalToken,
         address finalReceiver,
         uint256 finalMinOut
-    ) internal {
+    ) internal returns (bool settled) {
         // Degenerate intent: the caller wanted the stable itself on this chain.
         if (finalToken == stable) {
             IERC20(stable).safeTransfer(finalReceiver, amount);
             emit Finalized(submissionId, finalReceiver, finalToken, amount, amount, false);
-            return;
+            return true;
+        }
+
+        // Is the swap blocked *at this instant*? Every condition tested there can
+        // clear on its own, so a blockage is a reason to come back, not a reason to
+        // hand the user a different asset than the one they signed for.
+        if (_swapBlocked(finalToken, amount, finalMinOut)) {
+            uint256 since = deferredSince[submissionId];
+            if (since == 0) {
+                since = block.timestamp;
+                deferredSince[submissionId] = since;
+            }
+            uint256 retryAfter = since + FALLBACK_GRACE;
+            if (block.timestamp < retryAfter) {
+                emit FinalizeDeferred(submissionId, finalReceiver, finalToken, retryAfter);
+                return false;
+            }
+            // The window has passed and the swap is still impossible. Deliver the
+            // stable rather than strand the funds — the original guarantee, now
+            // reached only after the condition proved durable.
+            IERC20(stable).safeTransfer(finalReceiver, amount);
+            emit FinalizeFallback(submissionId, finalReceiver, amount);
+            return true;
         }
 
         // Refuse to *attempt* the swap without enough gas to complete it, so the
@@ -341,11 +455,44 @@ contract SwapRouter is ReentrancyGuard {
         IERC20(stable).forceApprove(address(pool), amount);
         try pool.swap(stable, finalToken, amount, finalMinOut, finalReceiver) returns (uint256 out) {
             emit Finalized(submissionId, finalReceiver, finalToken, amount, out, true);
+            return true;
         } catch {
-            // Roll back the unused allowance and refund the stable to the user.
+            // `_swapBlocked` said this should work, so a revert here is something
+            // it does not model (a hostile token, an unexpected pool state). Not a
+            // condition to wait out — deliver the stable and settle.
             IERC20(stable).forceApprove(address(pool), 0);
             IERC20(stable).safeTransfer(finalReceiver, amount);
             emit FinalizeFallback(submissionId, finalReceiver, amount);
+            return true;
+        }
+    }
+
+    /// @dev Would `pool.swap` fail right now for a reason that can clear later?
+    ///
+    ///      All four are recoverable states, which is exactly why they must not
+    ///      trigger the stable fallback on sight:
+    ///        * the pool is paused (an incident ends);
+    ///        * `finalToken` is not listed (a delisting can be reversed);
+    ///        * the output would exceed the pool's lock for `finalToken` (the
+    ///          reserve is refilled, or another swap stops draining it) — and this
+    ///          is the one an attacker can manufacture on demand;
+    ///        * the output is under the user's own signed `finalMinOut` (prices
+    ///          move, and honouring that floor is the entire point of signing it).
+    ///
+    ///      `quote` reverts for an unlisted token, so the try/catch also covers the
+    ///      stable itself being somehow unquotable.
+    function _swapBlocked(address finalToken, uint256 amount, uint256 finalMinOut)
+        internal
+        view
+        returns (bool)
+    {
+        if (pool.paused()) return true;
+        (bool listed,,, uint256 reserve) = pool.tokens(finalToken);
+        if (!listed) return true;
+        try pool.quote(stable, finalToken, amount) returns (uint256 out) {
+            return out == 0 || out < finalMinOut || out > reserve;
+        } catch {
+            return true;
         }
     }
 

@@ -11,6 +11,11 @@
 #   * graphql-api holds NO DATABASE CREDENTIAL. It reads history through the
 #     sig-store's read scope, not from Postgres. Do not hand it a DATABASE_URL
 #     even when running it by hand.
+#   * `--production` is set: no GraphiQL playground, no introspection. The depth
+#     and complexity caps bound what one QUERY can cost; they do nothing about a
+#     stranger reading the whole schema off the one box facing the internet.
+#     Note the `chains` query still returns each network's rpc_url verbatim, so
+#     never put a provider API key in configs/chains.json.
 #   * mutations are OFF. `--allow-mutations` would expose `submitSignature`,
 #     letting anyone who reaches this box push signatures into the store. The
 #     Gate would still reject non-validator keys on-chain, but there is no
@@ -39,6 +44,7 @@ services:
         --store-url "$${SIG_STORE_URL}"
         --threshold "$${BRIDGE_THRESHOLD}"
         --chains-file /configs/chains.json
+        --production
         $${GRAPHQL_GATES}
         $${GRAPHQL_SWAPS}
     environment:

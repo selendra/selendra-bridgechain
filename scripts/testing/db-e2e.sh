@@ -131,7 +131,9 @@ cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DID_BAD"  "$TOKEN_BAD_D
 
 echo "=== starting Postgres-backed sig-store ($STORE_URL) ==="
 SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" \
-  "$ROOT/target/debug/sig-store" >"$LOGS/db-sig-store.log" 2>&1 & track $!
+# --allow-unauthenticated: local demo on 127.0.0.1, no tokens to distribute.
+# The binary now refuses to serve an open store without being told to.
+  "$ROOT/target/debug/sig-store" --allow-unauthenticated >"$LOGS/db-sig-store.log" 2>&1 & track $!
 for i in $(seq 1 60); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -s "$STORE_URL/health" | grep -q ok || fail "sig-store did not come up (check DATABASE_URL / migrations)"
 echo "✅ sig-store healthy (connected to Postgres, schema applied)"

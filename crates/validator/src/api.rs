@@ -36,8 +36,11 @@ pub struct ApiState {
     pub sources: Arc<BTreeMap<u64, Arc<Mutex<Runtime>>>>,
     pub validator: String,
     /// Shared secret required as `Authorization: Bearer <token>` on the state-
-    /// changing routes (pause/resume/rescan). `None` => unauthenticated (dev).
+    /// changing routes (pause/resume/rescan). `None` => no credential configured.
     pub token: Option<String>,
+    /// Mount the control routes anyway when `token` is `None`. Dev only — see
+    /// [`router`] for why the default is to leave them off entirely.
+    pub allow_unauthenticated: bool,
 }
 
 #[derive(Serialize)]
@@ -78,10 +81,23 @@ pub fn router(state: ApiState) -> Router {
             control = control
                 .route_layer(middleware::from_fn_with_state(Arc::new(token), require_auth));
         }
-        None => warn!(
-            "VALIDATOR_API_TOKEN is unset — operator API pause/resume/rescan are \
-             UNAUTHENTICATED (anyone who can reach it can halt this validator)."
+        None if state.allow_unauthenticated => warn!(
+            "allow_unauthenticated: operator API pause/resume/rescan are UNAUTHENTICATED \
+             (anyone who can reach it can halt this validator). Dev only."
         ),
+        // FAIL CLOSED: with no credential the control routes are not mounted at
+        // all, so an unset VALIDATOR_API_TOKEN costs monitoring nothing and costs
+        // an attacker the ability to halt this validator out of quorum. Warning
+        // and serving them anyway made a missing secret indistinguishable from a
+        // correct deployment except in the log.
+        None => {
+            warn!(
+                "no operator API token configured — pause/resume/rescan are NOT mounted \
+                 (read-only /status still is). Set VALIDATOR_API_TOKEN, or \
+                 `allow_unauthenticated = true` in the [api] block for local dev."
+            );
+            return status.with_state(state);
+        }
     }
 
     status.merge(control).with_state(state)
@@ -247,14 +263,77 @@ mod tests {
     }
 
     fn app(path: &std::path::Path) -> Router {
+        app_with(path, None, true)
+    }
+
+    fn app_with(path: &std::path::Path, token: Option<&str>, allow_unauthenticated: bool) -> Router {
         let runtime = Runtime::load_or_init(path, 0).unwrap();
         let mut sources = BTreeMap::new();
         sources.insert(CHAIN, Arc::new(Mutex::new(runtime)));
         router(ApiState {
             sources: Arc::new(sources),
             validator: "0xtest".into(),
-            token: None, // unauthenticated: this exercises the handlers, not auth
+            token: token.map(str::to_string),
+            allow_unauthenticated,
         })
+    }
+
+    async fn post_with(app: Router, uri: &str, bearer: Option<&str>) -> StatusCode {
+        let mut b = Request::builder().method("POST").uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap().status()
+    }
+
+    // --- M-1: no credential, no halt button --------------------------------
+
+    /// THE regression. `pause` takes this validator out of quorum and persists
+    /// across a restart, so an open operator API is a one-request denial of
+    /// service against the signer set. Warning about a missing
+    /// `VALIDATOR_API_TOKEN` and mounting the routes anyway meant a lost secret
+    /// was indistinguishable from a correct deployment.
+    #[tokio::test]
+    async fn control_routes_are_not_mounted_without_a_credential() {
+        let p = temp_state_path("no-token");
+        for uri in ["/pause", "/resume", "/rescan"] {
+            assert_eq!(
+                post_with(app_with(&p, None, false), uri, None).await,
+                StatusCode::NOT_FOUND,
+                "{uri} must not exist without a token"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Monitoring must survive the lockdown: losing the halt button must not cost
+    /// an operator the ability to see whether this validator is stuck.
+    #[tokio::test]
+    async fn status_stays_readable_without_a_credential() {
+        let p = temp_state_path("no-token-status");
+        let req = Request::builder().method("GET").uri("/status").body(Body::empty()).unwrap();
+        let res = app_with(&p, None, false).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// With a token the routes exist and demand it.
+    #[tokio::test]
+    async fn control_routes_demand_the_token_when_one_is_set() {
+        let p = temp_state_path("with-token");
+        assert_eq!(
+            post_with(app_with(&p, Some("s3cret"), false), "/pause", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(app_with(&p, Some("s3cret"), false), "/pause", Some("wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(app_with(&p, Some("s3cret"), false), "/pause", Some("s3cret")).await,
+            StatusCode::OK
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     async fn post(app: Router, uri: &str) -> StatusCode {

@@ -120,6 +120,29 @@ impl StoreBackend {
         }
     }
 
+    /// The keeper's work queue for claims/cancels on one destination chain.
+    ///
+    /// In file mode there is no server-side lifecycle, so every stored record is
+    /// offered and the caller's own on-chain checks do all the filtering — the
+    /// pre-existing behaviour, kept for the dev path.
+    pub async fn pending_claims(&self, chain_id_to: u64) -> anyhow::Result<Vec<SubmissionRecord>> {
+        match self {
+            StoreBackend::File { dir, .. } => Ok(store::load_all(dir)?),
+            StoreBackend::Remote(remote) => Ok(remote.pending_claims(chain_id_to).await?),
+        }
+    }
+
+    /// The keeper's work queue for refunds on one source chain. File mode as above.
+    pub async fn pending_refunds(
+        &self,
+        chain_id_from: u64,
+    ) -> anyhow::Result<Vec<SubmissionRecord>> {
+        match self {
+            StoreBackend::File { dir, .. } => Ok(store::load_all(dir)?),
+            StoreBackend::Remote(remote) => Ok(remote.pending_refunds(chain_id_from).await?),
+        }
+    }
+
     /// Submissions a refund loop should examine.
     ///
     /// In file mode there is no server-side lifecycle, so every stored record is

@@ -238,6 +238,21 @@ where
     let filter = Filter::new().address(address).from_block(from_block).to_block(to_block);
     let mut logs = provider.get_logs(&filter).await.context("get_logs")?;
     logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
+
+    // An orphaned log means the reorg was deeper than `block_confirmation`, which
+    // this scanner reads behind precisely to avoid. Mirroring it into history
+    // would record a transfer the chain has retracted, so drop it and make the
+    // misconfiguration visible — see the validator's copy of this guard.
+    let before = logs.len();
+    logs.retain(|l| !l.removed);
+    if logs.len() != before {
+        warn!(
+            chain_id,
+            dropped = before - logs.len(),
+            "REORG DEEPER THAN block_confirmation — dropped orphaned logs; raise \
+             block_confirmation for this chain"
+        );
+    }
     for log in logs {
         // Propagate handler failures instead of swallowing them. A transient
         // DB/store error must fail the whole batch so the caller leaves the
@@ -358,6 +373,21 @@ async fn handle_router_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()
         let tx = tx_hash(&log);
         db.record_finalized(&id, &tx, &ev.amountOut.to_string(), false).await?;
         info!(chain_id, submission_id = %id, "observed Finalized");
+        return Ok(());
+    }
+    if let Ok(decoded) = SwapRouter::FinalizeDeferred::decode_log(&log.inner) {
+        // Not a lifecycle transition — nothing settled — so no DB write. Logged
+        // because a deferred delivery is otherwise indistinguishable from one
+        // nobody has finalized yet, and an operator watching a stuck corridor
+        // needs to see that the router is waiting on the pool rather than idle.
+        let ev = &decoded.data;
+        info!(
+            chain_id,
+            submission_id = %format!("{:#x}", ev.submissionId),
+            final_token = %ev.finalToken,
+            retry_after = %ev.retryAfter,
+            "observed FinalizeDeferred (destination swap blocked; delivery still pending)"
+        );
         return Ok(());
     }
     if let Ok(decoded) = SwapRouter::FinalizeFallback::decode_log(&log.inner) {

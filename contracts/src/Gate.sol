@@ -151,10 +151,39 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         transaction. Upgrades are for fixes, not for emergencies.
     uint256 public constant UPGRADE_DELAY = 48 hours;
 
+    // --- governance timelock (validator set / threshold) ---
+
+    /// @notice Earliest timestamp at which a scheduled governance action may run.
+    ///         Zero means "not scheduled", and {_consumeGovernance} treats zero as
+    ///         a refusal — so a delayed action can never run without first sitting
+    ///         out {GOVERNANCE_DELAY} in public view.
+    /// @dev    Keyed by the action ids {addValidatorActionId} /
+    ///         {lowerThresholdActionId} derive, so a schedule authorises exactly
+    ///         one concrete change (this validator, that threshold) rather than a
+    ///         blanket right to change the set.
+    mapping(bytes32 actionId => uint256 readyAt) public governanceReadyAt;
+
+    /// @notice How long a validator ADDITION or a threshold DECREASE must wait.
+    ///
+    /// @dev    THIS IS THE SAME DEFENCE AS {UPGRADE_DELAY}, and it exists because
+    ///         without it the upgrade timelock was decorative.
+    ///
+    ///         An owner who can add a validator and lower the threshold in one
+    ///         transaction can sign a claim for every registered corridor and
+    ///         empty the gate — the exact outcome a malicious upgrade buys, with
+    ///         none of the 48-hour notice the upgrade path forces. Delaying the
+    ///         implementation swap while leaving that door open protected nothing,
+    ///         and was worse than no timelock at all, because operators and users
+    ///         plan around a window they were told they had.
+    ///
+    ///         Constant, not owner-settable, for the reason {UPGRADE_DELAY} is.
+    uint256 public constant GOVERNANCE_DELAY = 48 hours;
+
     /// @dev Reserved so a future version can append state without colliding with
     ///      anything a child contract or a later gap-consuming field occupies.
     ///      Adding N slots of new state means shrinking this by exactly N.
-    uint256[50] private __gap;
+    ///      (`governanceReadyAt` took one; 50 -> 49.)
+    uint256[49] private __gap;
 
     /// @param token the ERC-20 locked on THIS chain. Not part of the submissionId
     ///        (which commits to `debridgeId`, a one-way hash of it), so it is
@@ -210,6 +239,10 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         becomes installable — the public warning users act on.
     event UpgradeScheduled(address indexed implementation, uint256 readyAt);
     event UpgradeCancelled(address indexed implementation);
+    /// @notice A validator addition or threshold decrease entered the queue.
+    ///         `readyAt` is when it becomes executable — the public warning.
+    event GovernanceScheduled(bytes32 indexed actionId, uint256 readyAt);
+    event GovernanceCancelled(bytes32 indexed actionId);
 
     error NotOwner();
     error ZeroAmount();
@@ -250,6 +283,11 @@ contract Gate is Initializable, UUPSUpgradeable {
     error UpgradeNotScheduled(address implementation);
     /// @dev the scheduled implementation is still inside its {UPGRADE_DELAY}
     error UpgradeNotReady(address implementation, uint256 readyAt);
+    /// @dev a validator addition / threshold decrease was attempted without first
+    ///      going through {scheduleGovernance}
+    error GovernanceNotScheduled(bytes32 actionId);
+    /// @dev the scheduled governance action is still inside its {GOVERNANCE_DELAY}
+    error GovernanceNotReady(bytes32 actionId, uint256 readyAt);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -372,9 +410,70 @@ contract Gate is Initializable, UUPSUpgradeable {
         pendingOwner = address(0);
     }
 
+    /// @notice The action id for adding `v` to the validator set.
+    function addValidatorActionId(address v) public pure returns (bytes32) {
+        return keccak256(abi.encode("addValidator", v));
+    }
+
+    /// @notice The action id for lowering the threshold to `t`.
+    function lowerThresholdActionId(uint256 t) public pure returns (bytes32) {
+        return keccak256(abi.encode("lowerThreshold", t));
+    }
+
+    /// @notice Queue a validator addition or threshold decrease for execution once
+    ///         {GOVERNANCE_DELAY} has elapsed. Build `actionId` with
+    ///         {addValidatorActionId} / {lowerThresholdActionId}.
+    /// @dev    Re-scheduling RESTARTS the delay, for the same reason
+    ///         {scheduleUpgrade} does: otherwise one matured schedule would be an
+    ///         indefinitely re-usable instant-change right against that action.
+    function scheduleGovernance(bytes32 actionId) external onlyOwner {
+        uint256 readyAt = block.timestamp + GOVERNANCE_DELAY;
+        governanceReadyAt[actionId] = readyAt;
+        emit GovernanceScheduled(actionId, readyAt);
+    }
+
+    /// @notice Drop a queued governance action. Guardian as well as owner, exactly
+    ///         as {cancelScheduledUpgrade}: spotting a bad pending validator
+    ///         addition is incident response, and neither party can *execute*
+    ///         anything this way, so the worst case is a delay.
+    function cancelScheduledGovernance(bytes32 actionId) external {
+        if (msg.sender != owner && msg.sender != guardian) revert NotAuthorizedToPause();
+        delete governanceReadyAt[actionId];
+        emit GovernanceCancelled(actionId);
+    }
+
+    /// @dev Require a matured schedule for `actionId`, then BURN it, so one
+    ///      approval authorises exactly one change. Mirrors {_authorizeUpgrade}.
+    function _consumeGovernance(bytes32 actionId) internal {
+        uint256 readyAt = governanceReadyAt[actionId];
+        if (readyAt == 0) revert GovernanceNotScheduled(actionId);
+        if (block.timestamp < readyAt) revert GovernanceNotReady(actionId, readyAt);
+        delete governanceReadyAt[actionId];
+    }
+
+    /// @notice Add or remove a validator.
+    ///
+    /// @dev    ASYMMETRIC BY DESIGN. Adding a validator hands out signing power and
+    ///         waits out {GOVERNANCE_DELAY}; REMOVING one takes it away and is
+    ///         immediate.
+    ///
+    ///         Delaying a removal would be the wrong direction entirely: the moment
+    ///         you learn a validator key is compromised is the moment you want it
+    ///         out of the set, and every rule here that shrinks the attacker's
+    ///         reach — this, {pause}, {cancelScheduledUpgrade} — is instant for
+    ///         that reason. Only the directions that grant power wait.
+    ///
+    ///         OPERATOR NOTE. A removal still cannot drop `validatorCount` below
+    ///         `threshold` (that would freeze the gate). So evicting a validator
+    ///         from a set already at `validatorCount == threshold` means lowering
+    ///         the threshold first, which DOES wait out the delay. That is the
+    ///         intended trade and it costs nothing in an incident: a minority
+    ///         validator cannot move funds on its own, and {pause} is immediate if
+    ///         you want everything stopped meanwhile.
     function setValidator(address v, bool active) external onlyOwner {
         if (v == address(0)) revert ZeroValidator();
         if (active && !isValidator[v]) {
+            _consumeGovernance(addValidatorActionId(v));
             isValidator[v] = true;
             validatorCount++;
         } else if (!active && isValidator[v]) {
@@ -388,8 +487,18 @@ contract Gate is Initializable, UUPSUpgradeable {
         emit ValidatorSet(v, active);
     }
 
+    /// @notice Change how many validator signatures a claim needs.
+    ///
+    /// @dev    Same asymmetry as {setValidator}, for the same reason: RAISING the
+    ///         threshold makes the gate harder to move and takes effect at once;
+    ///         LOWERING it is the other half of the owner-drain path
+    ///         ({GOVERNANCE_DELAY} explains it) and waits.
+    ///
+    ///         The schedule commits to the exact value, not to "may lower", so a
+    ///         matured approval for `t = 2` cannot be spent on `t = 1`.
     function setThreshold(uint256 t) external onlyOwner {
         if (t == 0 || t > validatorCount) revert InvalidThreshold(t, validatorCount);
+        if (t < threshold) _consumeGovernance(lowerThresholdActionId(t));
         threshold = t;
         emit ThresholdSet(t);
     }
@@ -704,6 +813,24 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes memory autoParams,
         bytes memory nativeSender
     ) internal view returns (bytes32) {
+        // Pin the receiver width HERE, where the ambiguity it prevents actually
+        // lives, not only in `send`.
+        //
+        // `packedSubmission` ends `…, receiver, nonce` with `receiver` a dynamic
+        // field carrying no length prefix, and the auto-params variant appends a
+        // further 160 fixed bytes. A no-auto preimage with a 180-byte receiver
+        // therefore has the same length AND layout as an auto preimage with a
+        // 20-byte one — the two forms are distinguishable only by a length
+        // invariant. That invariant was enforced in `send` alone, while `claim`,
+        // `cancel` and `refund` all hashed a caller-supplied `receiver` of any
+        // length before their own width checks ran.
+        //
+        // Not exploitable as it stood (no signed id could have a long receiver,
+        // because `send` refused to emit one), but the safety of the construction
+        // rested on a restriction two functions away from the hash. One comparison
+        // makes it local.
+        if (receiver.length != 20 && receiver.length != 32) revert BadReceiver();
+
         // `view`, not `pure`, only because of `bridgeDomain` — every id this gate
         // computes is scoped to this deployment generation.
         if (autoParams.length == 0) {

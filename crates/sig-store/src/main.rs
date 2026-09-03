@@ -36,7 +36,7 @@
 //!   POST   /allowed/chains               -> add (body: {"chain_id_from":..,"chain_id_to":..})
 //!   DELETE /allowed/chains/:from/:to     -> remove
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{delete, get, post};
@@ -46,6 +46,7 @@ use bridge_core::allow::{
     SubmissionHistory, SwapRecord,
 };
 use bridge_core::auth::{require_scope, Auth, Scope};
+use bridge_core::ratelimit::{enforce as rate_limit, RateLimit};
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
 use bridge_db::{Db, DbError};
 use clap::Parser;
@@ -79,6 +80,25 @@ struct Args {
     /// Operators: allowlist mutations, itself a security control.
     #[arg(long, env = "SIG_STORE_ADMIN_TOKEN")]
     admin_token: Option<String>,
+    /// Sustained write requests per second, per bearer token (L-1).
+    #[arg(long, env = "SIG_STORE_RATE_PER_SECOND", default_value_t = 50.0)]
+    rate_per_second: f64,
+    /// How many write requests one credential may send back to back (L-1).
+    #[arg(long, env = "SIG_STORE_RATE_BURST", default_value_t = 200)]
+    rate_burst: u32,
+    /// Largest accepted request body, in bytes.
+    #[arg(long, env = "SIG_STORE_MAX_BODY_BYTES", default_value_t = 256 * 1024)]
+    max_body_bytes: usize,
+    /// Serve with NO authentication when no token is configured. Dev only.
+    ///
+    /// Without this the process refuses to bind rather than exposing an open
+    /// store, because "no token" is far more often a lost secret mount than a
+    /// deliberate choice — and the open failure mode is world-writable
+    /// signatures, claim status, and the allowlist that IS the incident
+    /// kill-switch. Requiring the operator to say it out loud makes the
+    /// dangerous configuration the one that takes an extra argument.
+    #[arg(long, env = "SIG_STORE_ALLOW_UNAUTHENTICATED", default_value_t = false)]
+    allow_unauthenticated: bool,
 }
 
 impl Args {
@@ -149,16 +169,34 @@ async fn main() -> anyhow::Result<()> {
         .route("/allowed/chains", get(list_chains))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Read), require_scope));
 
+    // L-1: a per-credential token bucket on every route that WRITES.
+    //
+    // The binding rules make a forged record impossible, but they do not require a
+    // record to describe a transfer that ever happened on a chain — so a holder of
+    // a `Sign`-scoped token could mint well-formed junk at line rate and grow the
+    // table without limit. Keyed on the bearer token, because the thing worth
+    // bounding is what ONE credential can do; every writer here is a service
+    // holding a scoped token, and several of them may share an ingress address.
+    let writes = RateLimit::new(args.rate_burst, args.rate_per_second);
+    info!(
+        burst = args.rate_burst,
+        per_second = args.rate_per_second,
+        max_body_bytes = args.max_body_bytes,
+        "write rate limit active (per bearer token)"
+    );
+
     // Validators deposit signatures and cancel/refund attestations.
     let sign = Router::new()
         .route("/submissions", post(post_submission))
         .route("/submissions/:id/attestations", post(post_attestation))
+        .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Sign), require_scope));
 
     // The keeper records a claim tx. Note this is NOT authoritative for the
     // lifecycle the indexer owns — it only annotates the row.
     let relay = Router::new()
         .route("/submissions/:id/claimed", post(post_claimed))
+        .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Relay), require_scope));
 
     // The allowlists are a security control, so they get their own scope.
@@ -167,18 +205,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/allowed/tokens/:chain/:token", delete(remove_token))
         .route("/allowed/chains", post(add_chain))
         .route("/allowed/chains/:from/:to", delete(remove_chain))
+        .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Admin), require_scope));
 
-    if auth.is_enforced() {
-        info!(tokens = auth.token_count(), "auth enabled: scoped bearer tokens required");
-    } else {
-        warn!(
-            "no tokens configured — the API is UNAUTHENTICATED (signatures, claim \
-             status and the allowlist are all world-writable). Set at least \
-             SIG_STORE_VALIDATOR_TOKEN / _KEEPER_TOKEN / _READER_TOKEN / _ADMIN_TOKEN \
-             for any networked deployment."
-        );
-    }
+    // FAIL CLOSED. `Auth::new` drops empty tokens, so an unset (or wiped) secret
+    // leaves nothing configured — and an unconfigured `Auth` grants every scope to
+    // everyone. Warning about that and serving anyway meant one lost env var
+    // silently opened the whole store; the log line was the only difference
+    // between a correct deployment and an open one.
+    require_credentials(&auth, args.allow_unauthenticated)?;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -186,6 +221,9 @@ async fn main() -> anyhow::Result<()> {
         .merge(sign)
         .merge(relay)
         .merge(admin)
+        // A submission with its signatures is a few kB; the default 2 MB let a
+        // caller make the server allocate far more than any real request needs.
+        .layer(DefaultBodyLimit::max(args.max_body_bytes))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
@@ -196,6 +234,40 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// FAIL CLOSED: refuse to serve an unauthenticated store unless told to.
+///
+/// [`Auth::new`] drops empty tokens, so an unset — or wiped — secret leaves
+/// nothing configured, and an unconfigured `Auth` grants EVERY scope to everyone.
+/// This used to warn and serve anyway, which made one lost env var
+/// indistinguishable from a correct deployment except in the log, with
+/// world-writable signatures, claim status and the allowlist (the incident
+/// kill-switch) as the result.
+///
+/// Compose passes the tokens as `${VAR:?}` so it could never reach this state; a
+/// systemd unit, a bare binary or a Kubernetes manifest that loses a secret mount
+/// absolutely could.
+fn require_credentials(auth: &Auth, allow_unauthenticated: bool) -> anyhow::Result<()> {
+    if auth.is_enforced() {
+        info!(tokens = auth.token_count(), "auth enabled: scoped bearer tokens required");
+        return Ok(());
+    }
+    if allow_unauthenticated {
+        warn!(
+            "--allow-unauthenticated: serving with NO authentication (signatures, claim \
+             status and the allowlist are all world-writable). Never do this on a \
+             networked deployment."
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to start: no bearer token is configured, which would leave signatures, \
+         claim status and the allowlist world-writable. Set at least one of \
+         SIG_STORE_VALIDATOR_TOKEN / _KEEPER_TOKEN / _READER_TOKEN / _ADMIN_TOKEN (or the \
+         legacy SIG_STORE_TOKEN), or pass --allow-unauthenticated to accept an open store \
+         on a trusted local network."
+    )
 }
 
 /// Map a DbError to an HTTP error, distinguishing caller faults (4xx) from
@@ -237,10 +309,39 @@ async fn post_submission(
     Ok(Json(merged))
 }
 
+/// Query for [`list_submissions`].
+///
+/// With no parameters this returns the whole table, which is what the GraphQL API
+/// and the operator tooling want. `pending` narrows it to a keeper's work queue,
+/// filtered in SQL on the lifecycle the indexer maintains — see
+/// `Db::pending_claims` for why polling the whole table every tick did not scale.
+#[derive(serde::Deserialize)]
+struct SubmissionQuery {
+    /// `"claims"` (needs `chain_id_to`) or `"refunds"` (needs `chain_id_from`).
+    pending: Option<String>,
+    chain_id_to: Option<u64>,
+    chain_id_from: Option<u64>,
+}
+
 async fn list_submissions(
     State(s): State<AppState>,
+    Query(q): Query<SubmissionQuery>,
 ) -> Result<Json<Vec<SubmissionRecord>>, (StatusCode, String)> {
-    Ok(Json(s.db.load_all().await.map_err(db_err)?))
+    let records = match (q.pending.as_deref(), q.chain_id_to, q.chain_id_from) {
+        (None, _, _) => s.db.load_all().await,
+        (Some("claims"), Some(to), _) => s.db.pending_claims(to).await,
+        (Some("refunds"), _, Some(from)) => s.db.pending_refunds(from).await,
+        (Some(kind), _, _) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "pending={kind:?} needs its chain filter: \
+                     pending=claims&chain_id_to=N, or pending=refunds&chain_id_from=N"
+                ),
+            ))
+        }
+    };
+    Ok(Json(records.map_err(db_err)?))
 }
 
 async fn get_submission(
@@ -411,6 +512,10 @@ mod tests {
     /// The same scope layering main() uses, with stub handlers so the test
     /// exercises the AUTH wiring rather than the database.
     fn app() -> Router {
+        app_limited(RateLimit::new(1_000, 1_000.0))
+    }
+
+    fn app_limited(writes: RateLimit) -> Router {
         let auth = test_auth();
         let read = Router::new()
             .route("/submissions", get(|| async { "list" }))
@@ -421,6 +526,7 @@ mod tests {
             ));
         let sign = Router::new()
             .route("/submissions", post(|| async { "signed" }))
+            .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
             .route_layer(middleware::from_fn_with_state(
                 (auth.clone(), Scope::Sign),
                 require_scope,
@@ -446,11 +552,63 @@ mod tests {
     }
 
     async fn status(method: &str, uri: &str, bearer: Option<&str>) -> StatusCode {
+        status_on(app(), method, uri, bearer).await
+    }
+
+    async fn status_on(app: Router, method: &str, uri: &str, bearer: Option<&str>) -> StatusCode {
         let mut b = Request::builder().method(method).uri(uri);
         if let Some(t) = bearer {
             b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
-        app().oneshot(b.body(Body::empty()).unwrap()).await.unwrap().status()
+        app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap().status()
+    }
+
+    // --- L-1: a credential cannot write at line rate --------------------------
+
+    /// The binding rules stop a FORGED record, not a well-formed useless one: an
+    /// id must hash its own params and a signature must recover to its signer, but
+    /// nothing requires the transfer to have happened on any chain. Without a rate
+    /// limit a `Sign`-scoped token could grow the table without bound.
+    #[tokio::test]
+    async fn writes_are_rate_limited_per_credential() {
+        let limit = RateLimit::new(2, 0.001); // two, then effectively none
+        let app = app_limited(limit);
+
+        assert_eq!(status_on(app.clone(), "POST", "/submissions", Some(VAL)).await, StatusCode::OK);
+        assert_eq!(status_on(app.clone(), "POST", "/submissions", Some(VAL)).await, StatusCode::OK);
+        assert_eq!(
+            status_on(app.clone(), "POST", "/submissions", Some(VAL)).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a credential over its budget must be refused"
+        );
+    }
+
+    /// Reads are not limited — the GraphQL API polls them and a read cannot grow
+    /// the table.
+    #[tokio::test]
+    async fn reads_are_not_rate_limited() {
+        let app = app_limited(RateLimit::new(1, 0.001));
+        for _ in 0..5 {
+            assert_eq!(status_on(app.clone(), "GET", "/submissions", Some(READ)).await, StatusCode::OK);
+        }
+    }
+
+    /// The limiter sits INSIDE the auth layer, so an unauthenticated flood is
+    /// rejected as 401 without consuming a legitimate credential's budget.
+    #[tokio::test]
+    async fn an_unauthenticated_flood_does_not_consume_a_real_budget() {
+        let app = app_limited(RateLimit::new(2, 0.001));
+        for _ in 0..10 {
+            assert_eq!(
+                status_on(app.clone(), "POST", "/submissions", Some("bogus")).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            status_on(app.clone(), "POST", "/submissions", Some(VAL)).await,
+            StatusCode::OK,
+            "the real credential must still have its full budget"
+        );
     }
 
     #[tokio::test]
@@ -514,6 +672,37 @@ mod tests {
         for t in [VAL, KEEP, READ, ADMIN] {
             assert_eq!(status("GET", "/submissions", Some(t)).await, StatusCode::OK, "{t}");
         }
+    }
+
+    // --- M-1: the store must not come up open by accident ------------------
+
+    /// THE regression. An unset (or wiped) token variable leaves `Auth`
+    /// unenforced, and an unenforced `Auth` grants every scope to everyone. The
+    /// process used to log a warning and serve, so a lost secret mount looked
+    /// exactly like a healthy deployment.
+    #[test]
+    fn refuses_to_start_with_no_credentials() {
+        let err = require_credentials(&Auth::new([]), false).unwrap_err().to_string();
+        assert!(err.contains("refusing to start"), "{err}");
+    }
+
+    /// An unset variable must not become a usable empty credential either — that
+    /// is the same open store by a different route.
+    #[test]
+    fn an_empty_token_is_not_a_credential() {
+        let empty = Auth::new([(String::new(), Scope::all())]);
+        assert!(require_credentials(&empty, false).is_err());
+    }
+
+    /// The dangerous configuration is the one that takes an extra argument.
+    #[test]
+    fn an_open_store_requires_saying_so_explicitly() {
+        assert!(require_credentials(&Auth::new([]), true).is_ok());
+    }
+
+    #[test]
+    fn a_configured_token_starts_normally() {
+        assert!(require_credentials(&test_auth(), false).is_ok());
     }
 
     // `ct_eq` and the scope table itself are covered by bridge_core::auth's tests.

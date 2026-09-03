@@ -174,7 +174,9 @@ POST /resume
 POST /rescan {"from_block": N}
 ```
 
-Each optionally scoped to one chain. The token comes from `[api] token` or the `VALIDATOR_API_TOKEN` env var; with neither set the API is unauthenticated, which is a dev-only posture.
+Each optionally scoped to one chain. The token comes from `[api] token` or the `VALIDATOR_API_TOKEN` env var.
+
+**With neither set, `/pause`, `/resume` and `/rescan` are not mounted at all** — the process serves read-only `/status` and logs why. `pause` takes a validator out of quorum and survives a restart, so an open halt button is a one-request denial of service against the signer set; a missing secret mount used to be indistinguishable from a correct deployment except in the log. For local dev, `allow_unauthenticated = true` in the `[api]` block restores the old behaviour explicitly.
 
 The scanner pauses itself on a nonce gap, a nonce replay, or a `submissionId` mismatch — each of which means an RPC is lying or events were missed.
 A pause is a real safety stop and needs a human to look before `/resume`.
@@ -390,9 +392,11 @@ The refund path is the one that is easiest to ship broken, because nothing about
 `unpause()` is owner-only, deliberately, so a compromised guardian can cause a denial of service and nothing worse.
 
 Know what pausing stops.
-`whenNotPaused` guards `send`, `claim`, `cancel`, **and** `refund`, so a pause freezes recovery as well as traffic.
-Transfers already in flight sit locked on the source chain with no path out until you unpause.
-That is the correct trade in an active incident, and it is not a state to leave the bridge in while you investigate at leisure.
+`whenNotPaused` guards `send`, `claim` and `cancel` — but **not** `refund`.
+A refund only returns already-locked funds to the address that locked them, and only after validators have attested a destination burn, so it can create no new exposure and stays open during a pause.
+A `cancel` is frozen, though, so a transfer that is not already burned on the destination cannot begin recovery until you unpause.
+
+Pausing the **SwapPool** is a separate decision with its own consequence: cross-chain swaps in flight cannot complete their destination leg, so `SwapRouter.finalize` defers them (see §9) rather than settling. If the pause outlasts `FALLBACK_GRACE`, those users receive the carrier stable instead of the token they asked for.
 
 **Stop a validator signing.**
 `POST /pause` on its operator API, or stop the process.
@@ -405,5 +409,42 @@ Find out which before resuming, and use `POST /rescan {"from_block": N}` rather 
 
 **A transfer is stuck.**
 Check `status` in the DB.
-Note that a `claim()` that reverted on-chain is currently recorded as `claimed` anyway, which permanently excludes it from the refund sweep (H1).
-Until that is fixed, a stuck transfer whose status says `claimed` may need the row corrected by hand before the refund path will see it.
+A reverted `claim()` is *not* recorded as claimed — the keeper's `confirm` helper refuses to report a mined-but-reverted transaction as success, precisely so a failed claim cannot exclude the transfer from the refund sweep.
+
+If a transfer has a full quorum and still will not claim, check the signature encodings. The store now stores every signature in the low-`s` / `v ∈ {27,28}` form the Gate accepts, and the keeper re-normalises anything older on the way out, but a store restored from a pre-fix backup that is read by a pre-fix keeper will produce `ECDSAInvalidSignatureS` on every attempt.
+
+---
+
+## 9. Security parameters and their delays
+
+These are the knobs whose values *are* security properties. None of them is a latency setting.
+
+| Parameter | Where | Default | What it bounds |
+|---|---|---|---|
+| `UPGRADE_DELAY` | `Gate` (constant) | 48 h | Notice before a new implementation can be installed |
+| `GOVERNANCE_DELAY` | `Gate` (constant) | 48 h | Notice before a validator is ADDED or the threshold is LOWERED |
+| `maxPriceAge` | `SwapPool` (owner) | 1 day | How stale a price may be before the pool refuses to trade it |
+| `maxPriceDeviationBps` + `minPriceUpdateInterval` | `SwapPool` (owner) | 10 % / 1 h | How fast the oracle may move a price |
+| `FALLBACK_GRACE` | `SwapRouter` (constant) | 6 h | How long a blocked destination swap is retried before the carrier stable is delivered instead |
+| `block_confirmation` | validator / indexer | per chain | Reorg depth the scanner is safe against |
+| rate limit / body cap | `sig-store`, `graphql-api` | 50 rps, 256 kB | What one credential can cost the service |
+
+### 9.1 Rotating a validator
+
+Adding a validator and lowering the threshold both grant signing power, so both wait out `GOVERNANCE_DELAY`. Removing one and raising the threshold both take power away, so both are immediate — that asymmetry is what keeps incident response fast.
+
+```bash
+# 1. queue it (emits GovernanceScheduled with the readyAt timestamp)
+cast send $GATE "scheduleGovernance(bytes32)" \
+  $(cast call $GATE "addValidatorActionId(address)(bytes32)" $NEW_VALIDATOR)
+# 2. wait 48h, then
+cast send $GATE "setValidator(address,bool)" $NEW_VALIDATOR true
+```
+
+`cancelScheduledGovernance(bytes32)` drops a queued action, and the guardian may call it as well as the owner.
+
+**The one case that needs planning.** A removal cannot drop `validatorCount` below `threshold`. So evicting a validator from a set where `validatorCount == threshold` (a 3-of-3, say) means lowering the threshold first, which does wait out the delay. Size the set with headroom — a 2-of-3 can evict immediately — and use `pause()` if you want everything stopped in the meantime. A minority validator cannot move funds on its own, so the wait costs safety nothing.
+
+### 9.2 Deploying the store
+
+`sig-store` refuses to bind with no bearer token configured, rather than serving an open store. Set at least one of `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN}_TOKEN`; `--allow-unauthenticated` is the explicit dev opt-out. `graphql-api` takes `--production` to drop GraphiQL and introspection — and note the `chains` query returns each network's `rpc_url` verbatim, so never put a provider API key in the chains registry.

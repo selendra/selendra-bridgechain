@@ -7,7 +7,8 @@ license.workspace = true
 [dependencies]
 # `abi` lets a dir-backed mutation reuse the store trust boundary (id<->params +
 # signature auth); `http` lets us front the remote sig-store instead of a dir.
-bridge-core = { workspace = true, features = ["abi", "http"] }
+# `axum-auth` brings the shared rate-limit layer (same one the sig-store uses).
+bridge-core = { workspace = true, features = ["abi", "http", "axum-auth"] }
 alloy = { workspace = true }
 alloy-primitives = { workspace = true }
 tokio = { workspace = true }

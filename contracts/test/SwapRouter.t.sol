@@ -277,11 +277,10 @@ contract SwapRouterTest is Test {
     // ------------------------------------------------------------------
     // Fallback: if the destination swap can't complete, deliver the stable
     // ------------------------------------------------------------------
-    function test_Finalize_Fallback_DeliversStable() public {
-        // Ask for more TT than the pool's reserve can pay -> pool reverts
-        // ExceedsLock inside finalize -> fallback refunds the stable instead.
-        // Bridge a big amount so the TT output would exceed a tiny TT reserve.
-        // First, shrink poolB's TT reserve to force the lock.
+    function test_Finalize_Fallback_DeliversStable_OnlyAfterTheGraceWindow() public {
+        // Ask for more TT than the pool's reserve can pay. That used to hand the
+        // user the stable on the spot; it is a recoverable condition, so the router
+        // now waits out FALLBACK_GRACE first and only then gives up.
         vm.chainId(CHAIN_B);
         poolB.withdrawLiquidity(address(tt), 1_000_000e18 - 1e18, address(this)); // leave 1 TT
 
@@ -293,11 +292,112 @@ contract SwapRouterTest is Test {
             leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
         );
 
-        // no TT paid; the stable was refunded to the final receiver instead
+        // Deferred, not settled: the stable is still at the router and the transfer
+        // is still finalizable, so a refill can still deliver the real token.
+        assertEq(usdB.balanceOf(finalReceiver), 0, "must not downgrade inside the window");
+        assertEq(usdB.balanceOf(address(routerB)), leg.amount, "stable should still be held");
+        assertFalse(routerB.finalized(leg.id), "must stay finalizable");
+        assertEq(routerB.deferredSince(leg.id), block.timestamp, "grace clock not started");
+
+        vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+
+        // The window proved the condition durable: no TT paid, stable refunded.
         assertEq(tt.balanceOf(finalReceiver), 0, "should not have paid TT");
         assertEq(usdB.balanceOf(finalReceiver), leg.amount, "stable fallback not delivered");
         assertEq(usdB.balanceOf(address(routerB)), 0, "stable stranded after fallback");
-        assertTrue(routerB.finalized(leg.id), "finalize should be recorded even on fallback");
+        assertTrue(routerB.finalized(leg.id), "finalize should be recorded on fallback");
+    }
+
+    /// THE regression. `finalize` is permissionless, so the pre-fix router let
+    /// anyone manufacture the fallback condition — swap the `finalToken` reserve
+    /// below the required output, call `finalize` — and force the user to take the
+    /// carrier stable instead of the token they signed for. One transaction, and
+    /// the idempotency guard meant there was no second attempt after the reserve
+    /// recovered. The user's signed `finalMinOut` was never consulted.
+    function test_Finalize_AGriefedReserveDoesNotDowngradeTheUser() public {
+        vm.chainId(CHAIN_B);
+        poolB.withdrawLiquidity(address(tt), 1_000_000e18 - 1e18, address(this)); // grief
+
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+
+        // The attacker's finalize achieves nothing.
+        vm.prank(address(0xBAD));
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertFalse(routerB.finalized(leg.id), "attacker must not settle the transfer");
+        assertEq(usdB.balanceOf(finalReceiver), 0, "attacker must not force the stable out");
+
+        // The reserve is refilled inside the window, and the user gets the token
+        // they actually asked for.
+        _seed(poolB, tt, 1_000_000e18);
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertGt(tt.balanceOf(finalReceiver), 0, "the real swap must complete once possible");
+        assertEq(usdB.balanceOf(finalReceiver), 0, "no stable downgrade");
+        assertTrue(routerB.finalized(leg.id));
+    }
+
+    /// Pausing the pool during an incident used to convert every in-flight
+    /// cross-chain swap into a stable payout — the opposite of what a circuit
+    /// breaker is for, and irreversible because `finalized` was already set.
+    function test_Finalize_APausedPoolDefersRatherThanDowngrades() public {
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+
+        poolB.pause();
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertFalse(routerB.finalized(leg.id), "a pause must not settle anything");
+        assertEq(usdB.balanceOf(finalReceiver), 0, "a pause must not force the stable out");
+
+        poolB.unpause();
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertGt(tt.balanceOf(finalReceiver), 0, "the swap must complete after the incident");
+        assertTrue(routerB.finalized(leg.id));
+    }
+
+    /// The user's own signed floor is a first-class reason to wait, not a reason
+    /// to hand them a different asset.
+    function test_Finalize_SlippageFloorDefersRatherThanDowngrades() public {
+        // A floor far above what the pegged pool can pay for this input.
+        Leg memory leg = _sourceLeg(1e18, address(tt), 1_000_000e18);
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertFalse(routerB.finalized(leg.id), "must not settle under the signed floor");
+        assertEq(usdB.balanceOf(finalReceiver), 0, "must not downgrade under the signed floor");
+
+        // Still unreachable when the window expires, so the funds come back as the
+        // stable rather than stranding at the router forever.
+        vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertEq(usdB.balanceOf(finalReceiver), leg.amount, "funds must never strand");
+        assertTrue(routerB.finalized(leg.id));
     }
 
     // ------------------------------------------------------------------
@@ -407,6 +507,15 @@ contract SwapRouterTest is Test {
         );
 
         uint256 usdBefore = usdB.balanceOf(finalReceiver);
+
+        // A delisting can be reversed, so the first attempt only starts the clock.
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertFalse(routerB.finalized(leg.id), "must not settle inside the window");
+
+        vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
         routerB.finalize(
             leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender
@@ -416,5 +525,86 @@ contract SwapRouterTest is Test {
             usdBefore + leg.amount,
             "an impossible swap must still deliver the stable rather than strand it"
         );
+        assertTrue(routerB.finalized(leg.id));
     }
+
+    // ------------------------------------------------------------------
+    // L-5: rescue must not take funds a pending delivery is owed
+    // ------------------------------------------------------------------
+
+    /// `rescue` is for stranded dust, but it could not tell dust from a delivery
+    /// still in flight. Sweeping the stable between `claim` and `finalize` makes
+    /// `finalize` revert while `executed` is already set on the Gate — so the
+    /// two-phase refund cannot recover it either, and the funds are gone from both
+    /// ends.
+    function test_Rescue_CannotTakeStableOwedToAPendingDelivery() public {
+        vm.chainId(CHAIN_B);
+        poolB.withdrawLiquidity(address(tt), 1_000_000e18 - 1e18, address(this));
+
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+        // Defer it: the stable is now held on the user's behalf.
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertEq(routerB.owedStable(), leg.amount, "owed not tracked");
+
+        vm.expectRevert(
+            abi.encodeWithSelector(SwapRouter.RescueWouldTakeOwedFunds.selector, leg.amount, 0)
+        );
+        routerB.rescue(address(usdB), leg.amount, address(this));
+
+        // Genuine dust on top of the owed balance is still sweepable.
+        usdB.mint(address(routerB), 5e6);
+        routerB.rescue(address(usdB), 5e6, address(this));
+
+        // And the delivery still completes once the reserve is back.
+        _seed(poolB, tt, 1_000_000e18);
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertGt(tt.balanceOf(finalReceiver), 0, "delivery must still complete");
+        assertEq(routerB.owedStable(), 0, "owed not cleared on settlement");
+    }
+
+    /// A transfer that settles on the first attempt never becomes "owed" at all.
+    function test_Rescue_AStraightThroughDeliveryOwesNothing() public {
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        vm.chainId(CHAIN_B);
+        routerB.claimAndFinalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+        assertEq(routerB.owedStable(), 0, "a straight-through delivery owes nothing");
+        assertTrue(routerB.finalized(leg.id));
+    }
+
+    /// ...and the stable fallback clears the debt the deferral created, so a
+    /// long-dead corridor does not permanently shrink what `rescue` can reach.
+    function test_Rescue_TheStableFallbackClearsTheDebt() public {
+        vm.chainId(CHAIN_B);
+        (uint256 ttReserve,) = poolB.maxSwapOut(address(tt));
+        poolB.withdrawLiquidity(address(tt), ttReserve, address(this));
+
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        vm.chainId(CHAIN_B);
+        routerB.claimAndFinalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+        assertEq(routerB.owedStable(), leg.amount, "deferred delivery must be owed");
+
+        vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertEq(routerB.owedStable(), 0, "fallback must clear the debt");
+        assertEq(usdB.balanceOf(finalReceiver), leg.amount, "fallback must pay out");
+    }
+
 }

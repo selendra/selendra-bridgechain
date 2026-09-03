@@ -299,6 +299,11 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
 /// Verify a signature genuinely recovers to its claimed signer over the EIP-191
 /// digest of `submission_id` (the same digest the validator signs and the Gate
 /// verifies). Returns the recovered address on success.
+///
+/// Authentication only — it deliberately accepts a non-canonical ENCODING, because
+/// rejecting one would drop a signature the signer really did produce. Every write
+/// path pairs this with [`canonical_signature`], which is what makes the accepted
+/// bytes safe to hand to the Gate. See that function for why.
 #[cfg(feature = "abi")]
 pub fn verify_signature(
     submission_id: alloy_primitives::B256,
@@ -320,6 +325,47 @@ pub fn verify_signature(
         });
     }
     Ok(recovered)
+}
+
+/// Re-encode a signature in the ONE form every Gate entry point accepts: low-`s`,
+/// with `v` in {27,28}.
+///
+/// ## Why this exists
+///
+/// The off-chain verifier and the on-chain one disagreed about what a valid
+/// signature *encoding* is, and the disagreement was a one-validator kill switch.
+///
+/// [`verify_signature`] authenticates through alloy's `recover_address_from_msg`,
+/// which silently calls `normalized_s()` first and passes `v` through
+/// `normalize_v`. So a high-`s` signature — or one with `v` in {0,1} — recovers to
+/// the right validator and used to be stored verbatim. `Gate._verifySignatures`
+/// uses OpenZeppelin's `ECDSA.recover`, which REVERTS on both
+/// (`ECDSAInvalidSignatureS` / `ECDSAInvalidSignature`).
+///
+/// The keeper submits every member signature in one array, so a single such entry
+/// reverted the whole `claim` — and the same array-building code serves `cancel`
+/// and `refund`, so the transfer could not be recovered either. One validator out
+/// of N could freeze the bridge, which is exactly what a threshold is supposed to
+/// make impossible. An honest third-party validator whose ECDSA library does not
+/// normalise `s` would have done it by accident.
+///
+/// Canonicalising rather than rejecting is deliberate: the signature is genuine,
+/// so dropping it would cost a real quorum vote. `s` and `n - s` verify to the same
+/// signer, and flipping the parity alongside keeps the recovery id correct — the
+/// re-encoded bytes are the same attestation, in the form the Gate reads.
+#[cfg(feature = "abi")]
+pub fn canonical_signature(sig: &SignerSig) -> Result<SignerSig, StoreError> {
+    use alloy_primitives::Signature;
+
+    let raw = hex_bytes("signature", &sig.signature)?;
+    let parsed = Signature::try_from(raw.as_slice()).map_err(|_| StoreError::BadSignature)?;
+    // `normalized_s` flips `y_parity` when it lowers `s`, and `as_bytes` always
+    // emits `27 + y_parity` — so this fixes both non-canonical forms at once.
+    let bytes = parsed.normalized_s().as_bytes();
+    Ok(SignerSig {
+        signer: sig.signer.clone(),
+        signature: format!("0x{}", hex::encode(bytes)),
+    })
 }
 
 /// Pin a record's `token` to its `debridge_id`.
@@ -378,7 +424,7 @@ pub fn verify_attestation(
 pub fn upsert_signature(
     dir: &Path,
     mut record: SubmissionRecord,
-    sig: SignerSig,
+    #[allow(unused_mut)] mut sig: SignerSig,
 ) -> Result<SubmissionRecord, StoreError> {
     // Guard the id BEFORE it becomes a file path (path-traversal defense). With
     // the `abi` feature the canonical-id check below would also catch a non-hash
@@ -402,6 +448,9 @@ pub fn upsert_signature(
             });
         }
         verify_signature(computed, &sig)?;
+        // Store the form the Gate accepts, never the caller's encoding — see
+        // `canonical_signature`. A high-`s` entry here reverts every claim.
+        sig = canonical_signature(&sig)?;
         // (4) `token` isn't covered by the submissionId, so pin it separately.
         verify_token_binding(&record)?;
     }
@@ -449,7 +498,7 @@ pub fn upsert_attestation(
     dir: &Path,
     submission_id: &str,
     kind: SigKind,
-    sig: SignerSig,
+    #[allow(unused_mut)] mut sig: SignerSig,
 ) -> Result<SubmissionRecord, StoreError> {
     if !is_valid_submission_id(submission_id) {
         return Err(StoreError::BadField("submission_id"));
@@ -468,6 +517,10 @@ pub fn upsert_attestation(
         let id = alloy_primitives::B256::from_str(&record.submission_id)
             .map_err(|_| StoreError::BadField("submission_id"))?;
         verify_attestation(id, kind, &sig)?;
+        // Cancel and refund reach the same `ECDSA.recover` a claim does, so they
+        // need the same canonical encoding — otherwise a poisoned attestation
+        // takes out the recovery path too.
+        sig = canonical_signature(&sig)?;
     }
 
     let bucket = match kind {
@@ -748,5 +801,161 @@ mod tests {
             "got {err:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------------
+    // Signature canonicalisation (the one-validator halt)
+    // ---------------------------------------------------------------------
+
+    /// secp256k1 group order, for building the malleated `n - s` twin.
+    const SECP256K1_N: U256 = U256::from_limbs([
+        0xBFD25E8CD0364141,
+        0xBAAEDCE6AF48A03B,
+        0xFFFFFFFFFFFFFFFE,
+        0xFFFFFFFFFFFFFFFF,
+    ]);
+    /// OpenZeppelin `ECDSA.sol`'s rejection threshold: `s > n/2` reverts.
+    const SECP256K1_HALF_N: U256 = U256::from_limbs([
+        0xDFE92F46681B20A0,
+        0x5D576E7357A4501D,
+        0xFFFFFFFFFFFFFFFF,
+        0x7FFFFFFFFFFFFFFF,
+    ]);
+
+    /// Re-encode `sig` in a form that recovers to the same signer but that the
+    /// Gate's `ECDSA.recover` refuses: high `s` with the parity flipped to match.
+    fn malleate(sig: &SignerSig) -> SignerSig {
+        let raw = hex::decode(sig.signature.trim_start_matches("0x")).unwrap();
+        let s_low = U256::from_be_slice(&raw[32..64]);
+        let s_high = SECP256K1_N - s_low;
+        let mut out = raw.clone();
+        out[32..64].copy_from_slice(&s_high.to_be_bytes::<32>());
+        out[64] = if raw[64] == 27 { 28 } else { 27 };
+        SignerSig { signer: sig.signer.clone(), signature: format!("0x{}", hex::encode(out)) }
+    }
+
+    /// Re-encode `sig` with `v` in {0,1} — the other form alloy accepts off-chain
+    /// and `ECDSA.recover` rejects on-chain.
+    fn v_zero_one(sig: &SignerSig) -> SignerSig {
+        let mut raw = hex::decode(sig.signature.trim_start_matches("0x")).unwrap();
+        raw[64] -= 27;
+        SignerSig { signer: sig.signer.clone(), signature: format!("0x{}", hex::encode(raw)) }
+    }
+
+    fn s_word(sig: &SignerSig) -> U256 {
+        let raw = hex::decode(sig.signature.trim_start_matches("0x")).unwrap();
+        U256::from_be_slice(&raw[32..64])
+    }
+
+    fn v_byte(sig: &SignerSig) -> u8 {
+        let raw = hex::decode(sig.signature.trim_start_matches("0x")).unwrap();
+        raw[64]
+    }
+
+    /// The premise: both malformed encodings still AUTHENTICATE. That is why the
+    /// defect existed at all — `verify_signature` never had a reason to complain.
+    #[test]
+    fn non_canonical_encodings_still_authenticate() {
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+        let id = B256::from_str(&rec.submission_id).unwrap();
+        let good = sign(&v1, &rec.submission_id);
+
+        for variant in [malleate(&good), v_zero_one(&good)] {
+            assert!(
+                verify_signature(id, &variant).is_ok(),
+                "alloy normalises before recovering, so this authenticates"
+            );
+        }
+    }
+
+    /// THE regression. A high-`s` signature recovers to its signer off-chain and
+    /// reverts `ECDSAInvalidSignatureS` on-chain, and the keeper submits every
+    /// member signature in ONE array — so one such entry used to make `claim`,
+    /// `cancel` and `refund` revert forever. One validator out of N could freeze
+    /// the bridge, which is precisely what a threshold exists to prevent.
+    #[test]
+    fn a_high_s_signature_is_stored_in_the_form_the_gate_accepts() {
+        let dir = tmp_dir("canon-high-s");
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+
+        let good = sign(&v1, &rec.submission_id);
+        let poisoned = malleate(&good);
+        assert!(s_word(&poisoned) > SECP256K1_HALF_N, "premise: the Gate would revert on this");
+
+        let stored = upsert_signature(&dir, rec.clone(), poisoned).unwrap();
+        let kept = &stored.signatures[0];
+
+        assert!(s_word(kept) <= SECP256K1_HALF_N, "stored signature must be low-`s`");
+        assert!(matches!(v_byte(kept), 27 | 28), "stored `v` must be 27/28");
+        assert_eq!(kept.signature, good.signature, "and it is the signer's own canonical form");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `v ∈ {0,1}` twin of the above, rejected on-chain as
+    /// `ECDSAInvalidSignature` rather than `...SignatureS`, same consequence.
+    #[test]
+    fn a_v_zero_one_signature_is_stored_in_the_form_the_gate_accepts() {
+        let dir = tmp_dir("canon-v01");
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+
+        let good = sign(&v1, &rec.submission_id);
+        let stored = upsert_signature(&dir, rec.clone(), v_zero_one(&good)).unwrap();
+
+        assert_eq!(stored.signatures[0].signature, good.signature);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cancel and refund reach the same on-chain verifier, so a poisoned
+    /// attestation would take out the recovery path the claim halt is supposed to
+    /// leave open. Both domains get the same treatment.
+    #[test]
+    fn attestations_are_canonicalised_too() {
+        let dir = tmp_dir("canon-attest");
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+        upsert_signature(&dir, rec.clone(), sign(&v1, &rec.submission_id)).unwrap();
+
+        for kind in [SigKind::Cancel, SigKind::Refund] {
+            let good = sign_kind(&v1, &rec.submission_id, kind);
+            let out =
+                upsert_attestation(&dir, &rec.submission_id, kind, malleate(&good)).unwrap();
+            let bucket = match kind {
+                SigKind::Cancel => &out.cancel_signatures,
+                SigKind::Refund => &out.refund_signatures,
+                SigKind::Transfer => unreachable!(),
+            };
+            assert_eq!(bucket[0].signature, good.signature, "{} attestation", kind.as_str());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Canonicalising must never change WHO signed — the keeper sorts by recovered
+    /// signer and the Gate dedupes on that ordering.
+    #[test]
+    fn canonicalising_preserves_the_recovered_signer() {
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+        let id = B256::from_str(&rec.submission_id).unwrap();
+        let good = sign(&v1, &rec.submission_id);
+
+        for variant in [good.clone(), malleate(&good), v_zero_one(&good)] {
+            let canonical = canonical_signature(&variant).unwrap();
+            assert_eq!(verify_signature(id, &canonical).unwrap(), v1.address());
+        }
+    }
+
+    /// A signature that is not 65 bytes (or carries an impossible `v`) has no
+    /// canonical form; it must error rather than be silently reshaped.
+    #[test]
+    fn canonicalising_refuses_a_malformed_signature() {
+        let short = SignerSig {
+            signer: format!("{:#x}", Address::repeat_byte(1)),
+            signature: "0xdeadbeef".into(),
+        };
+        assert!(canonical_signature(&short).is_err());
     }
 }

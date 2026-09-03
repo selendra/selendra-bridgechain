@@ -261,7 +261,14 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo "[api]"
       echo "bind = \"$(jq -r "($vjson).api.bind" "$CONFIG")\""
       tok="$(jq -r "($vjson).api.token // empty" "$CONFIG")"
-      [[ -n "$tok" ]] && echo "token = \"$tok\""
+      if [[ -n "$tok" ]]; then
+        echo "token = \"$tok\""
+      elif [[ "$(jq -r "($vjson).api.allow_unauthenticated // false" "$CONFIG")" == "true" ]]; then
+        # Opt-in only. Without a token (and without this) the validator serves
+        # read-only /status and leaves pause/resume/rescan unmounted, because an
+        # open halt button is a one-request denial of service on the signer set.
+        echo "allow_unauthenticated = true"
+      fi
     fi
     if [[ "$REFUND_ON" == "true" ]]; then
       # No [refund] block => this validator never votes on cancels/refunds, and

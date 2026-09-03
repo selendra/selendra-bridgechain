@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
             sources: runtimes.clone(),
             validator: format!("{signer_addr:#x}"),
             token: api.resolved_token(),
+            allow_unauthenticated: api.allow_unauthenticated,
         };
         let bind = api.bind.clone();
         tokio::spawn(async move {
@@ -251,6 +252,26 @@ async fn scan_source(
             };
             // Process in chain order so nonce sequencing is meaningful.
             logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
+
+            // A log the node has since orphaned. `block_confirmation` is the real
+            // defence — we read well behind the head precisely so this cannot
+            // happen — so seeing one means the reorg went DEEPER than the
+            // configured buffer, which is a security parameter having been set too
+            // low for this chain. Drop the event (never sign a transfer the chain
+            // has retracted) and say so loudly: nothing else in the system would
+            // ever mention it, and the operator needs to raise the buffer.
+            let before = logs.len();
+            logs.retain(|l| !l.removed);
+            if logs.len() != before {
+                warn!(
+                    chain_id = source.chain_id,
+                    dropped = before - logs.len(),
+                    block_confirmation = source.block_confirmation,
+                    "REORG DEEPER THAN block_confirmation — dropped orphaned logs. Raise \
+                     block_confirmation for this chain; a transfer signed from an orphaned \
+                     block would be attested against history that no longer exists."
+                );
+            }
 
             // Allowlist for this batch. In sig-store mode a fetch failure is
             // fail-closed (skip the batch) so we never sign a now-disallowed

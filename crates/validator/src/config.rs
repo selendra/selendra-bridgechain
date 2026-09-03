@@ -171,9 +171,14 @@ pub struct Api {
     /// e.g. "127.0.0.1:9090"
     pub bind: String,
     /// Bearer token guarding pause/resume/rescan. Falls back to the
-    /// `VALIDATOR_API_TOKEN` env var; unset on both => unauthenticated (dev).
+    /// `VALIDATOR_API_TOKEN` env var. Unset on both means the control routes are
+    /// not served at all unless `allow_unauthenticated` says otherwise.
     #[serde(default)]
     pub token: Option<String>,
+    /// Serve pause/resume/rescan with NO authentication when no token is set.
+    /// Dev only — those routes can halt this validator out of quorum.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 impl Api {

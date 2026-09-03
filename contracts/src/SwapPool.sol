@@ -71,6 +71,25 @@ contract SwapPool is ReentrancyGuard {
     /// @dev last repricing time per token (0 => never repriced since listing; the
     ///      first update is always allowed).
     mapping(address => uint256) public lastPriceUpdate;
+    /// @dev when a token's CURRENT price was established — set by `listToken` as
+    ///      well as `setPrice`, unlike `lastPriceUpdate`, which exists only to gate
+    ///      the repricing cooldown and deliberately stays zero until the first
+    ///      update so that update is free. Read only by the staleness guard.
+    mapping(address => uint256) public priceSetAt;
+    /// @dev how old a token's price may be before `quote`/`swap` refuse it.
+    ///      Zero disables the check.
+    ///
+    ///      THE RATE LIMITS DO NOT COVER THIS. `maxPriceDeviationBps` and
+    ///      `minPriceUpdateInterval` bound how fast a price may MOVE; neither
+    ///      bounds how OLD it may be. `swap` read `t.price` and never looked at
+    ///      `lastPriceUpdate`, so a stalled or halted oracle kept quoting its last
+    ///      figure indefinitely and every swap against it was arbitrage — running
+    ///      until the output reserve hit the lock, which is the drain bound, not a
+    ///      defence. The oracle role is separable from the owner precisely because
+    ///      it is expected to be lower-trust and more failure-prone, so its failure
+    ///      mode has to be "the pool stops", not "the pool pays out at yesterday's
+    ///      price".
+    uint256 public maxPriceAge;
 
     // --- events ---
     event TokenListed(address indexed token, uint256 price, uint8 decimals);
@@ -89,6 +108,7 @@ contract SwapPool is ReentrancyGuard {
     event FeeSet(uint16 feeBps);
     event MaxPriceDeviationSet(uint16 bps);
     event MinPriceUpdateIntervalSet(uint256 interval);
+    event MaxPriceAgeSet(uint256 maxAge);
     event OracleSet(address indexed oracle);
     // governance / pause (same shape as Gate.sol)
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
@@ -117,6 +137,9 @@ contract SwapPool is ReentrancyGuard {
     error PriceDeviationTooHigh(uint256 oldPrice, uint256 newPrice, uint16 maxBps);
     /// @dev setPrice() called again before the per-token cooldown elapsed.
     error PriceUpdateTooSoon(address token, uint256 nextAllowed);
+    /// @dev the token's price is older than {maxPriceAge}; the pool refuses to
+    ///      trade at a figure the oracle has stopped confirming.
+    error StalePrice(address token, uint256 setAt, uint256 maxAge);
     error ReserveNonZero();
     error FeeTooHigh();
     error DeviationTooHigh();
@@ -158,9 +181,19 @@ contract SwapPool is ReentrancyGuard {
         minPriceUpdateInterval = 1 hours;
         emit MinPriceUpdateIntervalSet(1 hours);
 
+        // Default staleness bound: a day. Deliberately non-zero, because the
+        // dangerous configuration should be the one an operator has to choose.
+        // Tune it to the oracle's real cadence via setMaxPriceAge.
+        maxPriceAge = 1 days;
+        emit MaxPriceAgeSet(1 days);
+
         stable = stable_;
         uint8 dec = IERC20Metadata(stable_).decimals();
         tokens[stable_] = TokenInfo({listed: true, decimals: dec, price: PRICE_ONE, reserve: 0});
+        // The stable is exempt from the staleness check (its peg is immutable, so
+        // there is nothing for an oracle to refresh), but stamp it anyway so the
+        // view reads consistently for every listed token.
+        priceSetAt[stable_] = block.timestamp;
         emit TokenListed(stable_, PRICE_ONE, dec);
     }
 
@@ -215,6 +248,29 @@ contract SwapPool is ReentrancyGuard {
         emit MinPriceUpdateIntervalSet(interval);
     }
 
+    /// @notice Set how old a token's price may be before the pool refuses to trade
+    ///         it. Zero disables the check — dev chains only, for the same reason
+    ///         {setMinPriceUpdateInterval} says.
+    /// @dev    Sized against the oracle's cadence: comfortably longer than a normal
+    ///         update interval, short enough that a dead feed stops the pool before
+    ///         the market moves far enough to be worth arbitraging.
+    function setMaxPriceAge(uint256 maxAge) external onlyOwner {
+        maxPriceAge = maxAge;
+        emit MaxPriceAgeSet(maxAge);
+    }
+
+    /// @dev Refuse a token whose price the oracle has stopped confirming.
+    ///
+    ///      The stable is exempt: its price is PRICE_ONE by construction and
+    ///      `setPrice` refuses to move it, so there is no feed that could go stale.
+    function _requireFreshPrice(address token) internal view {
+        if (maxPriceAge == 0 || token == stable) return;
+        uint256 setAt = priceSetAt[token];
+        if (block.timestamp - setAt > maxPriceAge) {
+            revert StalePrice(token, setAt, maxPriceAge);
+        }
+    }
+
     function pause() external {
         if (msg.sender != owner && msg.sender != guardian) revert NotAuthorizedToPause();
         if (!paused) {
@@ -266,6 +322,10 @@ contract SwapPool is ReentrancyGuard {
         t.listed = true;
         t.decimals = dec;
         t.price = price;
+        // A freshly listed price is a fresh price. Stamping here rather than
+        // reusing `lastPriceUpdate` keeps the cooldown's "first update is free"
+        // exemption intact while still giving the staleness clock a start.
+        priceSetAt[token] = block.timestamp;
         // `reserve` is left alone rather than zeroed: `delistToken` already
         // requires it to be zero and a never-listed token has none, so there is
         // nothing to reset — and writing a zero here would be the one place a
@@ -299,6 +359,7 @@ contract SwapPool is ReentrancyGuard {
 
         t.price = newPrice;
         lastPriceUpdate[token] = block.timestamp;
+        priceSetAt[token] = block.timestamp;
         emit PriceSet(token, oldPrice, newPrice);
     }
 
@@ -320,6 +381,9 @@ contract SwapPool is ReentrancyGuard {
         // re-listing (see listToken). `decimals` and `reserve` are both rewritten
         // or provably zero on the way back in.
         t.listed = false;
+        // Clear the staleness clock with the listing it belonged to; `listToken`
+        // restarts it. (`price` is deliberately KEPT — see above.)
+        delete priceSetAt[token];
         // Clear the repricing clock with the listing it belonged to. `setPrice`
         // exempts the FIRST update after listing via `last == 0`; leaving a stale
         // timestamp here would carry into a future re-listing and block that
@@ -375,6 +439,11 @@ contract SwapPool is ReentrancyGuard {
         TokenInfo storage to = tokens[tokenOut];
         if (!ti.listed) revert TokenNotListed(tokenIn);
         if (!to.listed) revert TokenNotListed(tokenOut);
+        // A quote at a stale price is a quote nobody should act on, and callers
+        // (SwapRouter's blocked-swap check among them) read this to decide whether
+        // a swap is possible right now.
+        _requireFreshPrice(tokenIn);
+        _requireFreshPrice(tokenOut);
         return _amountOut(amountIn, ti.price, ti.decimals, to.price, to.decimals, feeBps);
     }
 
@@ -395,6 +464,11 @@ contract SwapPool is ReentrancyGuard {
         TokenInfo storage tOut = tokens[tokenOut];
         if (!ti.listed) revert TokenNotListed(tokenIn);
         if (!tOut.listed) revert TokenNotListed(tokenOut);
+        // Before any funds move: refuse to trade a price the oracle has stopped
+        // confirming. Checked on BOTH sides — either one being stale misprices the
+        // pair, and it is the output side the arbitrage drains.
+        _requireFreshPrice(tokenIn);
+        _requireFreshPrice(tokenOut);
 
         // Pull first (fee-on-transfer safe) so pricing uses the amount actually
         // received. This is the only external call before we compute + book.

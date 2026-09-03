@@ -107,7 +107,9 @@ for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U bridge -d bridge >
 
 echo "=== boot Postgres-backed sig-store + 2 validators + keeper ==="
 # sig-store retries the DB connection, so it tolerates Postgres still warming up.
-SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" spawn "$ROOT/target/debug/sig-store" sig-store.log
+# --allow-unauthenticated: local demo on 127.0.0.1, no tokens to distribute.
+# The binary now refuses to serve an open store without being told to.
+SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" SIG_STORE_ALLOW_UNAUTHENTICATED=1 spawn "$ROOT/target/debug/sig-store" sig-store.log
 for _ in $(seq 1 40); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 
 # Each validator watches BOTH gates ([[sources]]), so either direction is signed.

@@ -475,4 +475,118 @@ contract SwapTest is Test {
     {
         (listed, dec, price, reserve) = pool.tokens(token);
     }
+
+    // ------------------------------------------------------------------
+    // Price staleness (the rate limits bound speed, not age)
+    // ------------------------------------------------------------------
+
+    /// THE regression. `maxPriceDeviationBps` and `minPriceUpdateInterval` bound
+    /// how fast a price may MOVE. Neither bounds how OLD it may be, and `swap`
+    /// never read `lastPriceUpdate` at all — so a stalled oracle kept quoting its
+    /// last figure forever and every swap against it was arbitrage, running until
+    /// the output reserve hit the lock.
+    function test_Swap_RefusesAStalePrice() public {
+        uint256 age = pool.maxPriceAge();
+        assertGt(age, 0, "a staleness bound must be on by default");
+
+        _fund(usd, user, 10_000e6);
+
+        // Just inside the window: still tradeable.
+        vm.warp(block.timestamp + age);
+        vm.prank(user);
+        pool.swap(address(usd), address(weth), 1_000e6, 0, user);
+
+        // One second past it: the pool stops rather than trades at a price the
+        // oracle has stopped confirming.
+        vm.warp(block.timestamp + 1);
+        vm.startPrank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SwapPool.StalePrice.selector, address(weth), pool.priceSetAt(address(weth)), age
+            )
+        );
+        pool.swap(address(usd), address(weth), 1_000e6, 0, user);
+        vm.stopPrank();
+    }
+
+    /// Either side going stale misprices the pair, so both are checked — it is the
+    /// OUTPUT side an arbitrageur drains, but a stale input is equally wrong.
+    function test_Swap_ChecksBothSidesForStaleness() public {
+        _fund(weth, user, 10e18);
+        vm.warp(block.timestamp + pool.maxPriceAge() + 1);
+        vm.startPrank(user);
+        vm.expectRevert(); // weth stale, whichever direction it is quoted in
+        pool.swap(address(weth), address(usd), 1e18, 0, user);
+        vm.stopPrank();
+    }
+
+    /// A quote is what callers act on (SwapRouter reads it to decide whether a
+    /// swap is possible right now), so it must refuse a stale price too.
+    function test_Quote_RefusesAStalePrice() public {
+        vm.warp(block.timestamp + pool.maxPriceAge() + 1);
+        vm.expectRevert();
+        pool.quote(address(usd), address(weth), 1_000e6);
+    }
+
+    /// A refreshed price re-opens the pool — the guard stops a DEAD feed, not a
+    /// live one.
+    function test_Swap_ResumesOnceTheOracleRefreshes() public {
+        _fund(usd, user, 10_000e6);
+        vm.warp(block.timestamp + pool.maxPriceAge() + 1);
+        vm.prank(oracle);
+        pool.setPrice(address(weth), 3180e18);
+
+        vm.prank(user);
+        pool.swap(address(usd), address(weth), 1_000e6, 0, user);
+    }
+
+    /// The stable is exempt: its price is PRICE_ONE by construction and `setPrice`
+    /// refuses to move it, so there is no feed that could go stale. A stable-only
+    /// pair must keep working however long the oracle has been quiet.
+    function test_Swap_TheStableIsNeverStale() public {
+        _fund(usd, user, 10_000e6);
+
+        // `tt` is repriced so only the stable's own age is in question.
+        vm.warp(block.timestamp + pool.maxPriceAge() * 3);
+        vm.prank(oracle);
+        pool.setPrice(address(tt), 1e18);
+
+        vm.prank(user);
+        pool.swap(address(usd), address(tt), 100e6, 0, user);
+    }
+
+    /// A freshly listed token is fresh. `lastPriceUpdate` stays zero until the
+    /// first repricing (so that repricing is free), so the staleness clock needs
+    /// its own stamp or every new listing would be born unswappable.
+    function test_ListToken_StartsTheStalenessClock() public {
+        MockERC20 nt = new MockERC20("New", "NEW", 18);
+        pool.listToken(address(nt), 5e18);
+        assertEq(pool.priceSetAt(address(nt)), block.timestamp, "clock not started at listing");
+        assertEq(pool.lastPriceUpdate(address(nt)), 0, "the first reprice must still be free");
+
+        nt.mint(address(this), 1_000e18);
+        nt.approve(address(pool), 1_000e18);
+        pool.seedLiquidity(address(nt), 1_000e18);
+        _fund(usd, user, 10_000e6);
+
+        vm.prank(user);
+        pool.swap(address(usd), address(nt), 100e6, 0, user); // must not revert
+    }
+
+    function test_SetMaxPriceAge_OnlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(SwapPool.NotOwner.selector);
+        pool.setMaxPriceAge(1 hours);
+    }
+
+    /// Zero disables the check, for dev chains — the same escape hatch
+    /// `minPriceUpdateInterval` has, and the same warning attached to it.
+    function test_SetMaxPriceAge_ZeroDisablesTheCheck() public {
+        _fund(usd, user, 10_000e6);
+        pool.setMaxPriceAge(0);
+        vm.warp(block.timestamp + 3650 days);
+        vm.prank(user);
+        pool.swap(address(usd), address(weth), 1_000e6, 0, user);
+    }
+
 }

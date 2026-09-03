@@ -96,6 +96,31 @@ impl RemoteStore {
         Ok(all)
     }
 
+    /// The keeper's target-side work queue for one destination chain: transfers
+    /// that may still need a `claim` or a `cancel` there, filtered server-side.
+    ///
+    /// The keeper used to poll [`load_all`] every tick and probe the chain for
+    /// every row it got back, so its per-tick cost grew with total history rather
+    /// than with outstanding work — see `bridge_db::Db::pending_claims`.
+    pub async fn pending_claims(
+        &self,
+        chain_id_to: u64,
+    ) -> Result<Vec<SubmissionRecord>, RemoteError> {
+        let url = format!("{}/submissions?pending=claims&chain_id_to={chain_id_to}", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
+    /// The keeper's source-side work queue for one origin chain: transfers that
+    /// carry a refund attestation and have not been repaid yet.
+    pub async fn pending_refunds(
+        &self,
+        chain_id_from: u64,
+    ) -> Result<Vec<SubmissionRecord>, RemoteError> {
+        let url =
+            format!("{}/submissions?pending=refunds&chain_id_from={chain_id_from}", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
     /// A single record by submissionId, if present.
     pub async fn load(&self, submission_id: &str) -> Result<Option<SubmissionRecord>, RemoteError> {
         let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);

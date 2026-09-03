@@ -418,6 +418,11 @@ impl Db {
         // (3) signature authenticity against the id we just verified.
         let computed = verify_binding(&record)?;
         store::verify_signature(computed, &sig)?;
+        // Store the encoding the Gate accepts, never the caller's. A high-`s`
+        // signature authenticates fine here (alloy normalises before recovering)
+        // and then reverts `ECDSA.recover` on-chain, taking the whole quorum array
+        // with it — see `store::canonical_signature`.
+        let sig = store::canonical_signature(&sig)?;
 
         let id = norm_id(&record.submission_id);
         let mut tx = self.pool.begin().await?;
@@ -590,6 +595,9 @@ impl Db {
         let parsed = alloy_primitives::B256::from_str(&existing.submission_id)
             .map_err(|_| StoreError::BadField("submission_id"))?;
         store::verify_attestation(parsed, kind, &sig)?;
+        // Cancel and refund hit the same on-chain verifier a claim does, so a
+        // non-canonical attestation would brick the recovery path too.
+        let sig = store::canonical_signature(&sig)?;
 
         sqlx::query(
             "INSERT INTO attestations (submission_id, kind, signer, signature) \
@@ -964,6 +972,73 @@ impl Db {
         // candidate: this list is polled by every validator's refund loop on
         // every tick, so the old per-row `load` was N+1 round trips per poll.
         // Scoped, because candidates are a small subset of the table.
+        self.attach_signatures(rows, true).await
+    }
+
+    /// The target-side WORK QUEUE for one destination chain: transfers that may
+    /// still need a `claim` or a `cancel` there.
+    ///
+    /// ## Why this exists
+    ///
+    /// The keeper used to call [`load_all`] every tick — an unbounded
+    /// `SELECT * FROM submissions` plus a join over every signature row ever
+    /// written — and then, because [`SubmissionRecord`] carries no lifecycle at
+    /// all, a DELIVERED transfer looked exactly like a pending one and fell
+    /// through to `gate.executed()`. One `eth_call` per historically-delivered
+    /// transfer, per poll interval, per target chain, forever. At a two-second
+    /// poll and 100k lifetime transfers that is ~50k `eth_call`/second against the
+    /// destination RPC: the keeper stops working long before the bridge does
+    /// anything wrong, and the keeper is also what relays cancels and refunds.
+    ///
+    /// The lifecycle columns the indexer already maintains answer it in SQL, on
+    /// indexed columns.
+    ///
+    /// ## What it is not
+    ///
+    /// A hint, not an authority. Every `try_*` still re-checks the chain before it
+    /// submits, so a row wrongly included costs one wasted read and a row wrongly
+    /// excluded is one the chain says is already settled. `status` only reaches
+    /// `'claimed'` from a claim this keeper made or one the indexer observed, so a
+    /// multi-keeper deployment running no indexer keeps re-probing rows another
+    /// keeper delivered — exactly today's behaviour, never worse.
+    pub async fn pending_claims(&self, chain_id_to: u64) -> Result<Vec<SubmissionRecord>, DbError> {
+        let rows: Vec<SubmissionRow> = sqlx::query_as(
+            "SELECT * FROM submissions \
+             WHERE chain_id_to = $1 AND status <> 'claimed' \
+               AND refund_status NOT IN ('cancelled','refunded') \
+             ORDER BY created_at",
+        )
+        .bind(chain_id_to as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        self.attach_signatures(rows, true).await
+    }
+
+    /// The source-side work queue for one origin chain: transfers that may still
+    /// need a `refund` paid out there.
+    ///
+    /// Keyed on "a validator has attested a refund for this", not on the
+    /// `refund_status` column, deliberately. A refund quorum only forms after the
+    /// validators independently observe the destination burn, so the attestation
+    /// is the precondition itself — and unlike `refund_status` it does not depend
+    /// on an indexer being deployed. See [`pending_claims`] for why the queue is a
+    /// hint rather than an authority.
+    pub async fn pending_refunds(
+        &self,
+        chain_id_from: u64,
+    ) -> Result<Vec<SubmissionRecord>, DbError> {
+        let rows: Vec<SubmissionRow> = sqlx::query_as(
+            "SELECT s.* FROM submissions s \
+             WHERE s.chain_id_from = $1 AND s.refund_status <> 'refunded' \
+               AND EXISTS ( \
+                 SELECT 1 FROM attestations a \
+                 WHERE a.submission_id = s.submission_id AND a.kind = 'refund' \
+               ) \
+             ORDER BY s.created_at",
+        )
+        .bind(chain_id_from as i64)
+        .fetch_all(&self.pool)
+        .await?;
         self.attach_signatures(rows, true).await
     }
 

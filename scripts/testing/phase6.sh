@@ -108,6 +108,10 @@ dir = "$STORE"
 
 [api]
 bind = "$API"
+# allow_unauthenticated: this harness drives pause/resume/rescan itself on
+# 127.0.0.1 with no token to distribute. The validator now leaves those routes
+# UNMOUNTED unless a token is set or this says otherwise.
+allow_unauthenticated = true
 EOF
 
 : > "$LOGS/validator-p6.log"

@@ -307,4 +307,36 @@ contract SecurityTest is Test {
         vm.expectRevert(Gate.NotOwner.selector);
         gate.setLocalToken(keccak256("x"), address(token));
     }
+
+    // ---- L-2: the packed preimage must not be ambiguous ----
+
+    /// `packedSubmission` ends `…, receiver, nonce` with `receiver` carrying no
+    /// length prefix, and the auto-params variant appends 160 more fixed bytes. A
+    /// no-auto preimage with a 180-byte receiver has the same length AND layout as
+    /// an auto preimage with a 20-byte one, so the two forms are told apart only by
+    /// a width invariant. That invariant lived in `send` alone, while `claim`,
+    /// `cancel` and `refund` hashed a caller-supplied receiver of any length first.
+    function test_IdComputation_RefusesAnAmbiguousReceiverWidth() public {
+        bytes memory long180 = new bytes(180);
+        bytes memory odd = new bytes(21);
+
+        for (uint256 i; i < 2; i++) {
+            bytes memory bad = i == 0 ? long180 : odd;
+            vm.expectRevert(Gate.BadReceiver.selector);
+            gate.computeSubmissionId(bytes32(0), 1, 1337, 1338, 0, bad, "", "");
+        }
+
+        // The two legitimate widths still hash, so nothing real is affected.
+        gate.computeSubmissionId(bytes32(0), 1, 1337, 1338, 0, new bytes(20), "", "");
+        gate.computeSubmissionId(bytes32(0), 1, 1337, 1338, 0, new bytes(32), "", "");
+    }
+
+    /// The same guard has to hold on the entry points that used to skip it — a
+    /// wrong-width `cancel` must not even reach signature verification.
+    function test_Cancel_RefusesAnAmbiguousReceiverWidth() public {
+        bytes[] memory none = new bytes[](0);
+        vm.expectRevert(Gate.BadReceiver.selector);
+        gate.cancel(bytes32(0), 1, 1337, 0, new bytes(180), "", "", none);
+    }
+
 }

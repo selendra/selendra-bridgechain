@@ -40,12 +40,15 @@ use std::sync::Arc;
 use async_graphql::http::GraphiQLSource;
 use async_graphql::{EmptyMutation, Schema};
 use async_graphql_axum::GraphQL;
+use axum::extract::DefaultBodyLimit;
+use axum::middleware;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post_service};
 use axum::Router;
 use bridge_core::backend::StoreBackend;
+use bridge_core::ratelimit::{enforce as rate_limit, RateLimit};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use chain::Chains;
 use schema::{ApiState, Mutation, Query};
@@ -87,6 +90,24 @@ struct Args {
     /// Expose the `submitSignature` mutation (off by default — read-only).
     #[arg(long, env = "GRAPHQL_ALLOW_MUTATIONS", default_value_t = false)]
     allow_mutations: bool,
+    /// Harden for a public deployment: no GraphiQL playground, no introspection.
+    ///
+    /// This is the only bridge service published to the internet. The playground
+    /// and a full introspection response are a development convenience that
+    /// hands a stranger the complete shape of the API; the depth and complexity
+    /// caps below bound abuse of a query, not enumeration of the schema.
+    #[arg(long, env = "GRAPHQL_PRODUCTION", default_value_t = false)]
+    production: bool,
+    /// Sustained requests per second, per credential (or shared, when
+    /// unauthenticated). Zero disables the limiter.
+    #[arg(long, env = "GRAPHQL_RATE_PER_SECOND", default_value_t = 25.0)]
+    rate_per_second: f64,
+    /// How many requests may arrive back to back before the limit bites.
+    #[arg(long, env = "GRAPHQL_RATE_BURST", default_value_t = 100)]
+    rate_burst: u32,
+    /// Largest accepted request body, in bytes.
+    #[arg(long, env = "GRAPHQL_MAX_BODY_BYTES", default_value_t = 128 * 1024)]
+    max_body_bytes: usize,
 }
 
 #[tokio::main]
@@ -162,24 +183,71 @@ async fn main() -> anyhow::Result<()> {
     // Depth/complexity caps so one request can't fan out to hundreds of store
     // loads or destination-gate RPCs (e.g. an alias bomb). Generous enough for
     // legit queries and GraphiQL's introspection, tight enough to stop abuse.
-    let router = if args.allow_mutations {
-        let schema = Schema::build(Query, Mutation, async_graphql::EmptySubscription)
+    //
+    // `production` additionally drops introspection and the playground. Those caps
+    // bound what one QUERY can cost; they do nothing about a stranger reading the
+    // whole schema off the most exposed service in the deployment.
+    // The two branches build different concrete `GraphQL<..>` types, so the
+    // routing is spelled out in each rather than shared through a binding.
+    //
+    // `production` drops introspection and the playground: the depth/complexity
+    // caps bound what one QUERY can cost, and do nothing about a stranger reading
+    // the whole schema off the most exposed service in the deployment. The
+    // playground is a GET on /graphql (and /), so in production the endpoint
+    // accepts POST only and there is nothing to serve a browser.
+    let mut router = if args.allow_mutations {
+        let mut schema = Schema::build(Query, Mutation, async_graphql::EmptySubscription)
             .limit_depth(15)
             .limit_complexity(1000)
-            .data(state)
-            .finish();
-        Router::new().route("/graphql", get(graphiql).post_service(GraphQL::new(schema)))
+            .data(state);
+        if args.production {
+            schema = schema.disable_introspection();
+        }
+        let service = GraphQL::new(schema.finish());
+        if args.production {
+            Router::new().route("/graphql", post_service(service))
+        } else {
+            Router::new()
+                .route("/graphql", get(graphiql).post_service(service))
+                .route("/", get(graphiql))
+        }
     } else {
-        let schema = Schema::build(Query, EmptyMutation, async_graphql::EmptySubscription)
+        let mut schema = Schema::build(Query, EmptyMutation, async_graphql::EmptySubscription)
             .limit_depth(15)
             .limit_complexity(1000)
-            .data(state)
-            .finish();
-        Router::new().route("/graphql", get(graphiql).post_service(GraphQL::new(schema)))
+            .data(state);
+        if args.production {
+            schema = schema.disable_introspection();
+        }
+        let service = GraphQL::new(schema.finish());
+        if args.production {
+            Router::new().route("/graphql", post_service(service))
+        } else {
+            Router::new()
+                .route("/graphql", get(graphiql).post_service(service))
+                .route("/", get(graphiql))
+        }
     };
 
+    if args.production {
+        warn!(
+            "production mode: GraphiQL and introspection are OFF. Note the `chains` \
+             query still returns each network's rpc_url verbatim — never put a \
+             provider API key in the chains registry."
+        );
+    }
+
+    // Same posture as the sig-store: bound what one caller can cost us. Keyed on
+    // the bearer token when there is one, shared otherwise — this service is
+    // usually unauthenticated and public, so the shared bucket is the common case.
+    if args.rate_per_second > 0.0 {
+        let limit = RateLimit::new(args.rate_burst, args.rate_per_second);
+        info!(burst = args.rate_burst, per_second = args.rate_per_second, "rate limit active");
+        router = router.route_layer(middleware::from_fn_with_state(limit, rate_limit));
+    }
+
     let app = router
-        .route("/", get(graphiql))
+        .layer(DefaultBodyLimit::max(args.max_body_bytes))
         .route("/health", get(|| async { "ok" }));
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
@@ -190,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
         mutations = args.allow_mutations,
         on_chain_status_for = ?chain_ids,
         swap_pools_for = ?swap_ids,
+        production = args.production,
         // History lives behind the sig-store's read scope, so a dir-backed run
         // has none — say so at startup rather than at the first query.
         history = args.store_url.is_some(),

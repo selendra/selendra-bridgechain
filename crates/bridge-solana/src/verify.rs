@@ -62,6 +62,83 @@ pub fn recover_evm_address(digest: &[u8; 32], sig65: &[u8]) -> Result<[u8; 20], 
     Ok(addr)
 }
 
+/// secp256k1 group order — the modulus the low-`s` rule is stated against.
+const SECP256K1_N: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
+/// Is `s` above `n/2`? Both the Solana `secp256k1_recover` syscall and OpenZeppelin's
+/// `ECDSA.recover` refuse such a signature; host-side recovery does not.
+fn is_high_s(s: &[u8; 32]) -> bool {
+    // n/2 is n >> 1; compare big-endian without a bignum dependency.
+    let mut half = [0u8; 32];
+    let mut carry = 0u8;
+    for i in 0..32 {
+        let byte = SECP256K1_N[i];
+        half[i] = (byte >> 1) | (carry << 7);
+        carry = byte & 1;
+    }
+    *s > half
+}
+
+/// Re-encode `sig65` in the only form the Solana gate (and the EVM one) accepts:
+/// low-`s`, with `v ∈ {27, 28}`.
+///
+/// ## Why relayers need this
+///
+/// `s` and `n - s` are both valid signatures from the same key over the same
+/// message, and host-side recovery accepts either — `k256::Signature::from_slice`
+/// checks for zero scalars, not for canonicality. The on-chain verifiers do not:
+/// `secp256k1_recover` refuses a high-`s` signature, and so does OpenZeppelin's
+/// `ECDSA.recover` on the EVM side.
+///
+/// A relayer that forwards the bytes it was handed therefore builds an instruction
+/// that fails wholesale on ONE bad entry, with the off-chain quorum still reading
+/// as satisfied — so the retry loop resubmits the same doomed instruction forever.
+/// One validator, or one honest validator whose ECDSA library does not normalise,
+/// could freeze every claim, cancel and refund that way.
+///
+/// The store canonicalises on the way in now, so this is the heal for rows written
+/// before that and for any store restored from an older backup. Returns `None` for
+/// bytes that are not a 65-byte signature at all.
+pub fn canonical_signature(sig65: &[u8]) -> Option<[u8; 65]> {
+    if sig65.len() != 65 {
+        return None;
+    }
+    let mut out = [0u8; 65];
+    out.copy_from_slice(sig65);
+
+    // Accept `v` in the two encodings that recover correctly, normalise to 27/28.
+    out[64] = match out[64] {
+        0 | 27 => 27,
+        1 | 28 => 28,
+        _ => return None,
+    };
+
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&out[32..64]);
+    if is_high_s(&s) {
+        // s := n - s, and flip the parity so the recovery id still selects the
+        // same public key.
+        let mut borrow = 0i16;
+        let mut low = [0u8; 32];
+        for i in (0..32).rev() {
+            let diff = SECP256K1_N[i] as i16 - s[i] as i16 - borrow;
+            if diff < 0 {
+                low[i] = (diff + 256) as u8;
+                borrow = 1;
+            } else {
+                low[i] = diff as u8;
+                borrow = 0;
+            }
+        }
+        out[32..64].copy_from_slice(&low);
+        out[64] = if out[64] == 27 { 28 } else { 27 };
+    }
+    Some(out)
+}
+
 /// Verify a threshold of distinct validator signatures over `submission_id`.
 ///
 /// Mirrors `Gate.sol::_verifySignatures` byte-for-byte: signatures MUST be sorted
@@ -98,4 +175,114 @@ pub fn verify_threshold(
         return Err(VerifyError::NotEnoughSignatures { got: count, want: threshold });
     }
     Ok(count)
+}
+
+
+#[cfg(all(test, feature = "recover"))]
+mod canonical_tests {
+    use super::*;
+
+    fn n_minus(s: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = SECP256K1_N[i] as i16 - s[i] as i16 - borrow;
+            if d < 0 {
+                out[i] = (d + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = d as u8;
+                borrow = 0;
+            }
+        }
+        out
+    }
+
+    /// A real signature, its malleated twin, and its `v ∈ {0,1}` variant must all
+    /// normalise to the same bytes — and to a form `recover_evm_address` accepts.
+    #[test]
+    fn every_accepted_encoding_normalises_to_the_same_bytes() {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let digest = eth_signed_digest(&[0x42u8; 32]);
+        let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash(&digest).unwrap();
+
+        let mut low = [0u8; 65];
+        low[..64].copy_from_slice(&sig.to_bytes());
+        low[64] = 27 + recid.to_byte();
+        assert_eq!(canonical_signature(&low).unwrap(), low, "already canonical");
+
+        // v in {0,1}
+        let mut v01 = low;
+        v01[64] -= 27;
+        assert_eq!(canonical_signature(&v01).unwrap(), low);
+
+        // high-s twin
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&low[32..64]);
+        assert!(!is_high_s(&s), "k256 signs low-s");
+        let mut high = low;
+        high[32..64].copy_from_slice(&n_minus(&s));
+        high[64] = if low[64] == 27 { 28 } else { 27 };
+        let mut hs = [0u8; 32];
+        hs.copy_from_slice(&high[32..64]);
+        assert!(is_high_s(&hs), "premise: the twin is high-s");
+
+        assert_eq!(
+            canonical_signature(&high).unwrap(),
+            low,
+            "the malleated twin must normalise back to the signer's own form"
+        );
+    }
+
+    /// Normalising must never change WHO signed.
+    #[test]
+    fn normalising_preserves_the_signer() {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let digest = eth_signed_digest(&[0xABu8; 32]);
+        let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash(&digest).unwrap();
+        let mut low = [0u8; 65];
+        low[..64].copy_from_slice(&sig.to_bytes());
+        low[64] = 27 + recid.to_byte();
+
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&low[32..64]);
+        let mut high = low;
+        high[32..64].copy_from_slice(&n_minus(&s));
+        high[64] = if low[64] == 27 { 28 } else { 27 };
+
+        let expected = recover_evm_address(&digest, &low).unwrap();
+        let healed = canonical_signature(&high).unwrap();
+        assert_eq!(recover_evm_address(&digest, &healed).unwrap(), expected);
+    }
+
+    #[test]
+    fn malformed_input_has_no_canonical_form() {
+        assert!(canonical_signature(&[0u8; 64]).is_none(), "wrong length");
+        let mut bad_v = [1u8; 65];
+        bad_v[64] = 99;
+        assert!(canonical_signature(&bad_v).is_none(), "impossible v");
+    }
+
+    #[test]
+    fn half_order_is_computed_correctly() {
+        // n/2 = 0x7FFFFFFF...5D576E7357A4501DDFE92F46681B20A0
+        let mut just_above = [0u8; 32];
+        just_above[..16].copy_from_slice(&[
+            0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF,
+        ]);
+        just_above[16..].copy_from_slice(&[
+            0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D, 0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B,
+            0x20, 0xA1,
+        ]);
+        assert!(is_high_s(&just_above), "one above n/2 is high");
+
+        let mut exactly = just_above;
+        exactly[31] = 0xA0;
+        assert!(!is_high_s(&exactly), "exactly n/2 is not high");
+    }
 }

@@ -215,8 +215,19 @@ async fn run_target(
             }
         };
 
-        let records = source.load_all().await.unwrap_or_default();
+        // The server-side work queue, not the whole table. Polling `load_all` cost
+        // one `eth_call` per historically-delivered transfer per tick, forever,
+        // because `SubmissionRecord` carries no lifecycle and a settled row is
+        // indistinguishable from a pending one until the chain is asked. See
+        // `bridge_db::Db::pending_claims`.
+        //
+        // Still only a hint: every `try_*` below re-checks the chain before it
+        // submits, so the filter can never cause a wrong claim — at worst it
+        // delays one until the row's lifecycle catches up.
+        let records = source.pending_claims(target.chain_id).await.unwrap_or_default();
         for rec in records {
+            // File-mode backends have no lifecycle to filter on and hand back
+            // everything, so the corridor check stays.
             if rec.chain_id_to != target.chain_id {
                 continue;
             }
@@ -308,7 +319,9 @@ async fn run_source_refunds(
 
     loop {
         view.refresh_if_stale(&gate).await;
-        let records = store.load_all().await.unwrap_or_default();
+        // Refunds that a validator quorum has actually attested — see
+        // `bridge_db::Db::pending_refunds`. Same reasoning as the claim loop.
+        let records = store.pending_refunds(src.chain_id).await.unwrap_or_default();
         for rec in records {
             if rec.chain_id_from != src.chain_id {
                 continue;
@@ -657,7 +670,17 @@ fn filter_members(
 }
 
 /// Signatures ordered by recovered signer ascending, as every Gate entry point
-/// requires (the ordering is what dedupes signers on-chain).
+/// requires (the ordering is what dedupes signers on-chain), each re-encoded in
+/// the only form the Gate accepts.
+///
+/// The canonicalisation is a HEAL, not the primary fix: the sig-store now stores
+/// low-`s`/`v∈{27,28}` bytes on the way in, but rows written before that change
+/// (and any store an operator restores from backup) can still hold a high-`s`
+/// entry. One of those in the array reverts `claim`, `cancel` AND `refund` with
+/// `ECDSAInvalidSignatureS`, and the off-chain quorum still reads as satisfied, so
+/// the tick retries the same doomed calldata forever. Normalising here costs
+/// nothing and cannot change which address a signature recovers to, so the
+/// ascending order the caller relies on is preserved.
 fn sorted_signatures(sigs: &[SignerSig]) -> anyhow::Result<Vec<Bytes>> {
     let mut sigs = sigs.to_vec();
     sigs.sort_by(|a, b| {
@@ -665,7 +688,22 @@ fn sorted_signatures(sigs: &[SignerSig]) -> anyhow::Result<Vec<Bytes>> {
         let bb = Address::from_str(&b.signer).unwrap_or(Address::ZERO);
         aa.cmp(&bb)
     });
-    sigs.iter().map(|s| bytes_of(&s.signature)).collect()
+    sigs.iter()
+        .map(|s| {
+            // Fall back to the stored bytes when they cannot be parsed at all: the
+            // store authenticates every signature on the way in, so this should be
+            // unreachable, and forwarding is exactly the old behaviour — the Gate
+            // gets the final say either way. Refusing here would let one
+            // unparseable row block a quorum that is otherwise fine.
+            match bridge_core::store::canonical_signature(s) {
+                Ok(canonical) => bytes_of(&canonical.signature),
+                Err(e) => {
+                    warn!(signer = %s.signer, error = %e, "signature has no canonical form; forwarding as stored");
+                    bytes_of(&s.signature)
+                }
+            }
+        })
+        .collect()
 }
 
 fn bytes_of(hex_str: &str) -> anyhow::Result<Bytes> {
@@ -765,6 +803,61 @@ mod tests {
         // And the encoded array the gate actually receives round-trips.
         let encoded = sorted_signatures(&kept).expect("valid hex signatures");
         assert_eq!(encoded.len(), 3);
+    }
+
+    /// The heal for rows written before the sig-store canonicalised on the way in.
+    ///
+    /// A high-`s` signature authenticates off-chain (alloy normalises before
+    /// recovering) and reverts `ECDSAInvalidSignatureS` in `ECDSA.recover`. Since
+    /// the whole quorum goes to the Gate as one array, one such entry reverted
+    /// `claim`, `cancel` and `refund` on every retry — the off-chain quorum still
+    /// read as satisfied, so the tick never gave up and never varied the calldata.
+    #[test]
+    fn calldata_is_canonical_even_when_the_store_holds_a_high_s_row() {
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::SignerSync;
+        use alloy::primitives::U256;
+
+        const N: U256 = U256::from_limbs([
+            0xBFD25E8CD0364141,
+            0xBAAEDCE6AF48A03B,
+            0xFFFFFFFFFFFFFFFE,
+            0xFFFFFFFFFFFFFFFF,
+        ]);
+        const HALF_N: U256 = U256::from_limbs([
+            0xDFE92F46681B20A0,
+            0x5D576E7357A4501D,
+            0xFFFFFFFFFFFFFFFF,
+            0x7FFFFFFFFFFFFFFF,
+        ]);
+
+        let signer = PrivateKeySigner::random();
+        let id = B256::repeat_byte(0x42);
+        let raw = bridge_core::signer::signature_bytes(
+            &signer.sign_message_sync(id.as_slice()).unwrap(),
+        );
+
+        // The malleated twin: same signer, `s -> n - s`, parity flipped.
+        let mut poisoned = raw;
+        let s_high = N - U256::from_be_slice(&raw[32..64]);
+        poisoned[32..64].copy_from_slice(&s_high.to_be_bytes::<32>());
+        poisoned[64] = if raw[64] == 27 { 28 } else { 27 };
+        assert!(
+            U256::from_be_slice(&poisoned[32..64]) > HALF_N,
+            "premise: the Gate reverts on this encoding"
+        );
+
+        let stored = SignerSig {
+            signer: format!("{:#x}", signer.address()),
+            signature: format!("0x{}", hex::encode(poisoned)),
+        };
+
+        let calldata = sorted_signatures(&[stored]).expect("canonicalises");
+        assert_eq!(
+            calldata[0].as_ref(),
+            &raw[..],
+            "the keeper must submit the low-`s` form, not the bytes it was handed"
+        );
     }
 
     /// A record carrying nothing but forged signatures must not reach quorum.

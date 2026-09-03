@@ -119,7 +119,14 @@ fn ordered_signatures(
     let digest = bridge_solana::verify::eth_signed_digest(digest_input);
     let mut with_addr: Vec<([u8; 20], Vec<u8>)> = raw
         .iter()
-        .filter_map(|s| recovered_address(&digest, s).map(|a| (a, s.clone())))
+        // Re-encode to low-`s` / v ∈ {27,28} first. `secp256k1_recover` refuses a
+        // high-`s` signature on-chain while host recovery accepts it, so
+        // forwarding one builds an instruction that fails wholesale — and since
+        // the off-chain quorum still reads as satisfied, the loop resubmits the
+        // same doomed bytes forever. The store canonicalises on the way in now;
+        // this heals rows written before that.
+        .filter_map(|s| bridge_solana::verify::canonical_signature(s).map(|c| c.to_vec()))
+        .filter_map(|s| recovered_address(&digest, &s).map(|a| (a, s)))
         // Junk from a throwaway key recovers fine — membership is the real filter.
         .filter(|(a, _)| cfg.validators.contains(a))
         .collect();

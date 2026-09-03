@@ -190,5 +190,14 @@ sol! {
             bool swapped
         );
         event FinalizeFallback(bytes32 indexed submissionId, address indexed finalReceiver, uint256 stableAmount);
+        /// The destination swap is blocked but still inside its grace window, so
+        /// nothing settled. Indexed so a stalled delivery is visible rather than
+        /// looking like a transfer nobody bothered to finalize.
+        event FinalizeDeferred(
+            bytes32 indexed submissionId,
+            address indexed finalReceiver,
+            address finalToken,
+            uint256 retryAfter
+        );
     }
 }

@@ -809,6 +809,22 @@ fn amount_word(v: u64) -> [u8; 32] {
     o
 }
 
+/// The submissionId, byte-identical to `BridgeHash.sol` and `bridge-core`.
+///
+/// ## The two fields this VM narrows (audit I-1)
+///
+/// The EVM gate hashes `amount` and `executionFee` as full 256-bit words; here
+/// they are a `u64` and a `u128` widened into those words, so their top halves are
+/// always zero. A transfer from an EVM chain with `amount >= 2^64` — or an
+/// `executionFee >= 2^128` — therefore produces an id this program can never
+/// reproduce, and its `claim` cannot even be expressed (`ClaimArgs::amount` is a
+/// `u64`).
+///
+/// That is safe rather than a divergence: it fails closed, and such a transfer
+/// routes into the existing cancel -> refund path and returns the deposit. Both
+/// ceilings are far above any realistic SPL amount — 2^64 raw units is ~18.4
+/// billion tokens at 9 decimals — but an operator registering a high-decimal
+/// asset should know where the wall is rather than meet it as a stuck transfer.
 #[allow(clippy::too_many_arguments)]
 fn submission_id(
     bridge_domain: &[u8; 32],

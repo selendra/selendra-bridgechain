@@ -34,6 +34,11 @@ pub mod backend;
 #[cfg(feature = "axum-auth")]
 pub mod auth;
 
+/// Per-credential rate limiting for the same HTTP surfaces `auth` guards. Shares
+/// the `axum-auth` feature because it is the same dependency and the same layer.
+#[cfg(feature = "axum-auth")]
+pub mod ratelimit;
+
 /// Domain-separating prefix, matching `BridgeHash.SUBMISSION_PREFIX` in Solidity.
 pub const SUBMISSION_PREFIX: u64 = 1;
 /// Prefix for a destination-side CANCEL attestation (`BridgeHash.CANCEL_PREFIX`).

@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS submissions (
     token           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_submissions_to     ON submissions (chain_id_to);
+-- The keeper's source-side work queue filters on chain_id_from every tick.
+CREATE INDEX IF NOT EXISTS idx_submissions_from   ON submissions (chain_id_from);
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions (status);
 CREATE INDEX IF NOT EXISTS idx_submissions_refund ON submissions (refund_status);
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS refund_status TEXT NOT NULL DEFAULT 'none';

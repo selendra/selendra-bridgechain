@@ -293,6 +293,190 @@ contract UpgradeTest is Test {
         gate.upgradeToAndCall(v2, "");
     }
 
+    // -----------------------------------------------------------------
+    // Governance timelock (the bypass the upgrade delay used to leave open)
+    // -----------------------------------------------------------------
+
+    /// THE regression. The upgrade timelock promises users a window to exit before
+    /// the owner can change the rules. It promised nothing while `setValidator` and
+    /// `setThreshold` were instant: add a key you control, drop the threshold to 1,
+    /// and you can sign a claim for every corridor — the same outcome a malicious
+    /// upgrade buys, with zero notice.
+    function test_Governance_OwnerCannotSeizeTheGateWithoutTheDelay() public {
+        vm.chainId(CHAIN_DST);
+        address[] memory three = new address[](3);
+        three[0] = v1;
+        three[1] = vm.addr(0xB0B);
+        three[2] = vm.addr(0xC0C);
+        Gate gate = GateDeployer.deploy(three, 2, DOMAIN_A);
+
+        uint256 attackerPk = 0xBADBEEF;
+        address attacker = vm.addr(attackerPk);
+
+        // Both halves of the one-transaction takeover are now refused.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.GovernanceNotScheduled.selector, gate.addValidatorActionId(attacker)
+            )
+        );
+        gate.setValidator(attacker, true);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.GovernanceNotScheduled.selector, gate.lowerThresholdActionId(1)
+            )
+        );
+        gate.setThreshold(1);
+
+        assertFalse(gate.isValidator(attacker), "set unchanged");
+        assertEq(gate.threshold(), 2, "threshold unchanged");
+    }
+
+    function test_Governance_AddingAValidatorRequiresTheDelayToElapse() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address newV = vm.addr(0xB0B);
+        bytes32 action = gate.addValidatorActionId(newV);
+
+        gate.scheduleGovernance(action);
+        uint256 readyAt = gate.governanceReadyAt(action);
+        assertEq(readyAt, block.timestamp + gate.GOVERNANCE_DELAY());
+
+        vm.warp(readyAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotReady.selector, action, readyAt));
+        gate.setValidator(newV, true);
+
+        vm.warp(readyAt);
+        gate.setValidator(newV, true);
+        assertTrue(gate.isValidator(newV));
+        assertEq(gate.validatorCount(), 2);
+    }
+
+    /// One approval, one change — exactly as `_authorizeUpgrade` burns its
+    /// schedule. Otherwise a matured action id is a standing instant-change right.
+    function test_Governance_ScheduleIsConsumedByTheChangeItAuthorised() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address newV = vm.addr(0xB0B);
+        bytes32 action = gate.addValidatorActionId(newV);
+
+        gate.scheduleGovernance(action);
+        vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
+        gate.setValidator(newV, true);
+        assertEq(gate.governanceReadyAt(action), 0, "schedule burned");
+
+        // Remove it again (instant), and re-adding needs a fresh schedule.
+        gate.setValidator(newV, false);
+        vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
+        gate.setValidator(newV, true);
+    }
+
+    /// The schedule commits to a concrete value, so a matured approval to lower the
+    /// threshold to 2 cannot be spent lowering it to 1.
+    function test_Governance_AThresholdScheduleIsBoundToItsValue() public {
+        address[] memory three = new address[](3);
+        three[0] = v1;
+        three[1] = vm.addr(0xB0B);
+        three[2] = vm.addr(0xC0C);
+        Gate gate = GateDeployer.deploy(three, 3, DOMAIN_A);
+
+        gate.scheduleGovernance(gate.lowerThresholdActionId(2));
+        vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.GovernanceNotScheduled.selector, gate.lowerThresholdActionId(1)
+            )
+        );
+        gate.setThreshold(1);
+
+        gate.setThreshold(2);
+        assertEq(gate.threshold(), 2);
+    }
+
+    /// The asymmetry is the whole design: every direction that SHRINKS the
+    /// attacker's reach stays immediate, because that is what incident response
+    /// needs. Only granting power waits.
+    function test_Governance_RemovalsAndThresholdRaisesStayImmediate() public {
+        address[] memory three = new address[](3);
+        three[0] = v1;
+        three[1] = vm.addr(0xB0B);
+        three[2] = vm.addr(0xC0C);
+        Gate gate = GateDeployer.deploy(three, 1, DOMAIN_A);
+
+        // Raising the bar: instant.
+        gate.setThreshold(3);
+        assertEq(gate.threshold(), 3);
+
+        // Evicting a compromised key: instant (once the threshold allows it).
+        gate.scheduleGovernance(gate.lowerThresholdActionId(2));
+        vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
+        gate.setThreshold(2);
+        gate.setValidator(three[2], false);
+        assertFalse(gate.isValidator(three[2]));
+        assertEq(gate.validatorCount(), 2);
+    }
+
+    function test_Governance_GuardianCanCancelAPendingValidatorAddition() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address guardian = address(0x6142D1A4);
+        address newV = vm.addr(0xB0B);
+        bytes32 action = gate.addValidatorActionId(newV);
+
+        gate.setGuardian(guardian);
+        gate.scheduleGovernance(action);
+
+        vm.prank(guardian);
+        gate.cancelScheduledGovernance(action);
+        assertEq(gate.governanceReadyAt(action), 0);
+
+        vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
+        vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
+        gate.setValidator(newV, true);
+    }
+
+    function test_Governance_OnlyOwnerCanSchedule() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        // Resolve the id BEFORE the prank: `vm.prank` binds to the next call, and
+        // `addValidatorActionId` is itself a call to the gate.
+        bytes32 action = gate.addValidatorActionId(address(0xBAD));
+        vm.prank(address(0xBAD));
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.scheduleGovernance(action);
+    }
+
+    /// A stranger must not be able to cancel a legitimate pending rotation.
+    function test_Governance_OnlyOwnerOrGuardianCanCancel() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        bytes32 action = gate.addValidatorActionId(vm.addr(0xB0B));
+        gate.scheduleGovernance(action);
+
+        vm.prank(address(0xBAD));
+        vm.expectRevert(Gate.NotAuthorizedToPause.selector);
+        gate.cancelScheduledGovernance(action);
+    }
+
+    /// The upgrade path must survive the extra slot: `governanceReadyAt` was
+    /// appended and `__gap` shrunk by one, so every pre-existing field has to read
+    /// back identically across an implementation swap.
+    function test_Governance_StorageLayoutSurvivesAnUpgrade() public {
+        vm.chainId(CHAIN_SRC);
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address newV = vm.addr(0xB0B);
+        bytes32 action = gate.addValidatorActionId(newV);
+        gate.scheduleGovernance(action);
+        uint256 readyAt = gate.governanceReadyAt(action);
+
+        address v2 = address(new GateV2());
+        gate.scheduleUpgrade(v2);
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+        gate.upgradeToAndCall(v2, "");
+
+        assertEq(gate.governanceReadyAt(action), readyAt, "pending action preserved");
+        assertEq(gate.bridgeDomain(), DOMAIN_A, "domain preserved");
+        assertEq(gate.threshold(), 1, "threshold preserved");
+        assertTrue(gate.isValidator(v1), "validator set preserved");
+        assertEq(gate.owner(), address(this), "owner preserved");
+    }
+
     /// The implementation must be permanently uninitializable, or anyone can own
     /// it and drive its own `upgradeToAndCall`.
     function test_Implementation_CannotBeInitialized() public {
